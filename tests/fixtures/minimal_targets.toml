@@ -1,0 +1,8 @@
+[meta]
+name = "minimal"
+
+[defaults]
+dir = "./out"
+
+[target.archive]
+format = "f32"

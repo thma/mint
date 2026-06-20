@@ -1,0 +1,44 @@
+[package]
+name = "mint"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.11"
+ebur128 = "0.1"
+glob = "0.3"
+hound = "3.5"
+log = "0.4"
+rand = "0.8"
+rayon = "1.10"
+# Pure-Rust fallback backend, used only for `--no-default-features` (no system deps).
+rubato = "0.16"
+# Reference-grade SRC via FFI to the system libsoxr (pkg-config). This is the *default*
+# backend (see [features]); it needs the C lib present at build time
+# (brew install libsoxr / apt install libsoxr-dev / vcpkg install soxr).
+libsoxr = { version = "0.2", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Pure-Rust FLAC encoder (no system dependency). Default features off: we batch targets
+# under our own rayon pool, so flacenc's `par` would nest/oversubscribe threads (and it
+# logs run stats); single-threaded per-file encode is the right fit here.
+flacenc = { version = "0.5", default-features = false }
+# MP3 encoding. Optional + feature-gated because it links/builds libmp3lame.
+mp3lame-encoder = { version = "0.2", optional = true }
+symphonia = { version = "0.5.5", features = ["wav", "aiff", "pcm"] }
+thiserror = "2.0"
+toml = "0.8"
+
+[features]
+# libsoxr is the default resample backend (reference-grade SRC). Build with
+# `--no-default-features` to fall back to the pure-Rust rubato backend (no system deps).
+default = ["soxr"]
+soxr = ["dep:libsoxr"]
+# MP3 output. Opt-in because mp3lame-sys compiles libmp3lame from vendored C source
+# (a build-time `cc`/`make` cost; no system library needed at runtime).
+mp3 = ["dep:mp3lame-encoder"]
+
+[dev-dependencies]
+approx = "0.5"

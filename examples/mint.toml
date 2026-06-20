@@ -1,0 +1,47 @@
+# Render one high-resolution master into several distribution targets.
+#
+# Each [target.NAME] describes a *deliverable* — the required DSP steps
+# (loudness, resample, limit, dither/quantize) are derived automatically from
+# the source file and the target spec. Field precedence, lowest to highest:
+#   built-in defaults  <  [defaults]  <  preset  <  explicit field
+
+[meta]
+name = "mint-masters"
+
+# Inherited by every target; any field is overridable per-target.
+[defaults]
+dir     = "./out"
+quality = "vhq"            # lq | mq | hq | vhq
+# naming defaults to "{target}/{stem}.wav"
+# placeholders: {stem} {ext} {target} {rate} {format}
+
+# Streaming master from the Apple Music preset (44.1k / s16 / -16 LUFS / -1 dBTP).
+[target.streaming]
+preset = "apple-music"
+
+# CD master: the `cd` preset fixes 44.1k / s16 / -0.1 dBTP but leaves loudness to
+# you (CD has no loudness standard).
+[target.cd]
+preset = "cd"
+lufs   = -12.0
+dither = "shaped"          # TPDF + noise shaping; engages only for s16 targets
+
+# 48 kHz delivery via the built-in preset (48k / s24 / -23 LUFS / -1 dBTP).
+[target.broadcast]
+preset = "broadcast-ebu-r128"   # 48k / s24 / -23 LUFS
+bwf    = true
+
+# High-resolution: (96k	/ s24 / -16 LUFS / -0.1 dBTP)
+[target.hires]
+preset = "hires"
+
+# FLAC (lossless @ 96k / s24  / -16 LUFS / -0.1 dBTP)
+[target.flac]
+preset = "hires"             # s24 / 96k
+codec  = "flac"              # -> song.flac (FLAC keeps the s24 depth)
+
+# MP3 (lossy) — codec is independent of bit depth.
+[target.mp3]
+codec       = "mp3"          # lossy: bit depth/dither not applicable
+mp3_bitrate = 320            # default 320; needs `--features mp3`
+lufs        = -14.0
