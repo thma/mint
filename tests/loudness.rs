@@ -1,8 +1,17 @@
 use std::path::PathBuf;
 
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
+use mint::config::LimiterCharacter;
 use mint::config::OnClipPolicy;
-use mint::ops::loudness;
+use mint::ops::{limiter, loudness};
+
+fn limiter_opts() -> limiter::LimiterOptions {
+    limiter::LimiterOptions {
+        character: LimiterCharacter::Balanced,
+        soft_clip: false,
+        link_channels: true,
+    }
+}
 
 fn sine_buffer(rate: u32, seconds: f64, hz: f64, amp: f64) -> AudioBuffer {
     let frames = (rate as f64 * seconds) as usize;
@@ -51,8 +60,9 @@ fn loudness_moves_towards_target() {
     let mut buffer = sine_buffer(48_000, 3.0, 997.0, 0.1);
     let target = -16.0;
 
-    let result = loudness::apply(&mut buffer, target, Some(-1.0), Some(OnClipPolicy::Warn))
-        .expect("loudness apply should succeed");
+    let result =
+        loudness::apply(&mut buffer, target, Some(-1.0), Some(OnClipPolicy::Warn), limiter_opts())
+            .expect("loudness apply should succeed");
 
     let before = (result.in_lufs - target).abs();
     let after = (result.out_lufs - target).abs();
@@ -110,8 +120,14 @@ fn limit_policy_reports_gain_reduction_when_squashing_to_target() {
     let mut buffer = sine_buffer(48_000, 3.0, 997.0, 0.9);
     let ceiling = -1.0;
 
-    let result = loudness::apply(&mut buffer, -1.0, Some(ceiling), Some(OnClipPolicy::Limit))
-        .expect("loudness apply should succeed");
+    let result = loudness::apply(
+        &mut buffer,
+        -1.0,
+        Some(ceiling),
+        Some(OnClipPolicy::Limit),
+        limiter_opts(),
+    )
+    .expect("loudness apply should succeed");
 
     assert!(
         result.limiter_gain_reduction_db > 0.0,
@@ -140,8 +156,14 @@ fn limit_policy_reports_zero_gain_reduction_when_within_ceiling() {
     // Quiet source raised by a few dB stays well under the ceiling: no limiting.
     let mut buffer = sine_buffer(48_000, 3.0, 997.0, 0.1);
 
-    let result = loudness::apply(&mut buffer, -20.0, Some(-1.0), Some(OnClipPolicy::Limit))
-        .expect("loudness apply should succeed");
+    let result = loudness::apply(
+        &mut buffer,
+        -20.0,
+        Some(-1.0),
+        Some(OnClipPolicy::Limit),
+        limiter_opts(),
+    )
+    .expect("loudness apply should succeed");
 
     assert_eq!(
         result.limiter_gain_reduction_db, 0.0,
@@ -159,6 +181,7 @@ fn reduce_gain_policy_caps_predicted_peak() {
         target,
         Some(-1.0),
         Some(OnClipPolicy::ReduceGain),
+        limiter_opts(),
     )
     .expect("loudness apply should succeed");
 
@@ -186,8 +209,13 @@ fn limiter_holds_ceiling_against_bs1770_meter_for_inter_sample_peaks() {
     let before = loudness::measure_true_peak_dbtp(&buffer).expect("measure");
     assert!(before > ceiling, "test needs a source above the ceiling (got {before:.2})");
 
-    let warnings = loudness::enforce_ceiling(&mut buffer, ceiling, OnClipPolicy::Limit)
-        .expect("enforce should succeed");
+    let warnings = loudness::enforce_ceiling(
+        &mut buffer,
+        ceiling,
+        OnClipPolicy::Limit,
+        limiter_opts(),
+    )
+    .expect("enforce should succeed");
     assert!(!warnings.is_empty(), "limiter ran; expected a warning");
 
     let after = loudness::measure_true_peak_dbtp(&buffer).expect("measure");
@@ -207,7 +235,7 @@ fn recheck_applies_limiter_when_ceiling_exceeded() {
     let mut buffer = sine_buffer(48_000, 3.0, 997.0, 0.1);
     buffer.channels[0][100] = ceiling_lin * 1.05;
 
-    let warn = loudness::recheck_and_limit_if_needed(&mut buffer, ceiling_dbtp)
+    let warn = loudness::recheck_and_limit_if_needed(&mut buffer, ceiling_dbtp, limiter_opts())
         .expect("recheck should succeed");
 
     assert!(!warn.is_empty(), "limiter was applied; must produce a warning");
@@ -226,8 +254,13 @@ fn enforce_ceiling_limits_transcode_without_loudness() {
     let mut buffer = sine_buffer(48_000, 1.0, 997.0, 0.1);
     buffer.channels[0][100] = ceiling_lin * 1.10;
 
-    let warnings = loudness::enforce_ceiling(&mut buffer, ceiling_dbtp, OnClipPolicy::Limit)
-        .expect("enforce should succeed");
+    let warnings = loudness::enforce_ceiling(
+        &mut buffer,
+        ceiling_dbtp,
+        OnClipPolicy::Limit,
+        limiter_opts(),
+    )
+    .expect("enforce should succeed");
 
     assert!(!warnings.is_empty(), "limiter ran; expected a warning");
     let max_sample = buffer.channels[0].iter().map(|s| s.abs()).fold(0.0, f64::max);
@@ -245,8 +278,13 @@ fn enforce_ceiling_warn_policy_leaves_samples_untouched() {
     buffer.channels[0][100] = ceiling_lin * 1.10;
     let before = buffer.channels[0][100];
 
-    let warnings = loudness::enforce_ceiling(&mut buffer, ceiling_dbtp, OnClipPolicy::Warn)
-        .expect("enforce should succeed");
+    let warnings = loudness::enforce_ceiling(
+        &mut buffer,
+        ceiling_dbtp,
+        OnClipPolicy::Warn,
+        limiter_opts(),
+    )
+    .expect("enforce should succeed");
 
     assert!(warnings.iter().any(|w| w.contains("on_clip=warn")));
     assert_eq!(buffer.channels[0][100], before, "warn must not alter samples");
@@ -257,7 +295,7 @@ fn recheck_leaves_buffer_unchanged_when_within_ceiling() {
     let mut buffer = sine_buffer(48_000, 3.0, 997.0, 0.5);
     let sum_before: f64 = buffer.channels[0].iter().sum();
 
-    let warn = loudness::recheck_and_limit_if_needed(&mut buffer, -1.0)
+    let warn = loudness::recheck_and_limit_if_needed(&mut buffer, -1.0, limiter_opts())
         .expect("recheck should succeed");
 
     assert!(warn.is_empty(), "no warning expected when signal is within ceiling");

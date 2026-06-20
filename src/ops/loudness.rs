@@ -35,6 +35,7 @@ pub fn apply(
     target_lufs: f64,
     true_peak_ceiling_dbtp: Option<f64>,
     on_clip: Option<OnClipPolicy>,
+    limiter_options: limiter::LimiterOptions,
 ) -> Result<LoudnessApplyResult> {
     let in_lufs = measure_lufs(buffer)?;
     let tp_in = measure_true_peak_dbtp(buffer)?;
@@ -81,7 +82,7 @@ pub fn apply(
     // the BS.1770 meter agrees the ceiling is held.
     let mut limiter_gain_reduction_db = 0.0;
     if matches!(policy, OnClipPolicy::Limit) && needs_ceiling_enforcement {
-        let (final_tp, passes) = limit_and_verify(buffer, ceiling)?;
+        let (final_tp, passes) = limit_and_verify(buffer, ceiling, limiter_options)?;
         // The loudest peak sat at `predicted_tp`; the limiter pulls it down to the
         // ceiling, so this is the maximum gain reduction applied anywhere in the file.
         limiter_gain_reduction_db = predicted_tp - ceiling;
@@ -243,12 +244,16 @@ pub fn analyze(buffer: &AudioBuffer) -> Result<LoudnessAnalysis> {
 /// strictly lowers the next pass's peak.
 ///
 /// Returns the final measured true peak (dBTP) and the number of passes taken.
-fn limit_and_verify(buffer: &mut AudioBuffer, ceiling_dbtp: f64) -> Result<(f64, usize)> {
+fn limit_and_verify(
+    buffer: &mut AudioBuffer,
+    ceiling_dbtp: f64,
+    limiter_options: limiter::LimiterOptions,
+) -> Result<(f64, usize)> {
     let mut internal_ceiling = ceiling_dbtp;
     let mut tp = f64::INFINITY;
 
     for pass in 1..=MAX_LIMIT_PASSES {
-        limiter::apply_true_peak_limit(buffer, internal_ceiling)?;
+        limiter::apply_true_peak_limit_with_options(buffer, internal_ceiling, limiter_options)?;
         tp = measure_true_peak_dbtp(buffer)?;
 
         let overshoot = tp - ceiling_dbtp;
@@ -275,6 +280,7 @@ pub fn enforce_ceiling(
     buffer: &mut AudioBuffer,
     ceiling_dbtp: f64,
     on_clip: OnClipPolicy,
+    limiter_options: limiter::LimiterOptions,
 ) -> Result<Vec<String>> {
     let tp = measure_true_peak_dbtp(buffer)?;
     if tp <= ceiling_dbtp {
@@ -283,7 +289,7 @@ pub fn enforce_ceiling(
 
     match on_clip {
         OnClipPolicy::Limit => {
-            let (final_tp, passes) = limit_and_verify(buffer, ceiling_dbtp)?;
+            let (final_tp, passes) = limit_and_verify(buffer, ceiling_dbtp, limiter_options)?;
             let mut warnings = vec![format!(
                 "true peak {tp:.2} dBTP exceeded ceiling {ceiling_dbtp:.2} dBTP; limiter applied"
             )];
@@ -325,12 +331,13 @@ pub fn enforce_ceiling(
 pub fn recheck_and_limit_if_needed(
     buffer: &mut AudioBuffer,
     ceiling_dbtp: f64,
+    limiter_options: limiter::LimiterOptions,
 ) -> Result<Vec<String>> {
     let tp = measure_true_peak_dbtp(buffer)?;
     if tp <= ceiling_dbtp {
         return Ok(Vec::new());
     }
-    let (final_tp, passes) = limit_and_verify(buffer, ceiling_dbtp)?;
+    let (final_tp, passes) = limit_and_verify(buffer, ceiling_dbtp, limiter_options)?;
     let mut warnings = vec![format!(
         "true peak {tp:.2} dBTP exceeded ceiling {ceiling_dbtp:.2} dBTP after SRC; limiter re-applied"
     )];

@@ -60,6 +60,9 @@ fn write_samples<W: std::io::Write + std::io::Seek>(
     buffer: &AudioBuffer,
 ) -> Result<()> {
     let format = buffer.out_format;
+    // Integer targets were already quantized in `ops::bitdepth`; here we only
+    // materialize those grid points as PCM integers for the container writer.
+    let int_grid = format.int_grid();
     let frames = buffer.frame_len();
     for i in 0..frames {
         for channel in &buffer.channels {
@@ -67,13 +70,18 @@ fn write_samples<W: std::io::Write + std::io::Seek>(
             match format {
                 OutputSampleFormat::F32 => writer.write_sample(sample as f32)?,
                 OutputSampleFormat::S16 => {
-                    let scaled = (sample.clamp(-1.0, 1.0) * i16::MAX as f64).round() as i32;
-                    writer.write_sample(scaled.clamp(i16::MIN as i32, i16::MAX as i32) as i16)?;
+                    let Some((max, min_i, max_i)) = int_grid else {
+                        unreachable!("S16 must have an integer grid")
+                    };
+                    let scaled = (sample * max).round() as i32;
+                    writer.write_sample(scaled.clamp(min_i, max_i) as i16)?;
                 }
                 OutputSampleFormat::S24 => {
-                    let max = 8_388_607_f64;
-                    let scaled = (sample.clamp(-1.0, 1.0) * max).round() as i32;
-                    writer.write_sample(scaled.clamp(-8_388_608, max as i32))?;
+                    let Some((max, min_i, max_i)) = int_grid else {
+                        unreachable!("S24 must have an integer grid")
+                    };
+                    let scaled = (sample * max).round() as i32;
+                    writer.write_sample(scaled.clamp(min_i, max_i))?;
                 }
             }
         }

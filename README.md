@@ -21,7 +21,9 @@ What it does:
 - Oversampled true-peak limiter with a band-limited (polyphase windowed-sinc) inter-sample
   peak detector; the configured ceiling is always enforced (even for a pure transcode with
   no loudness step), re-checked after every resample, and **verified against the BS.1770
-  meter** so the delivered file genuinely respects the ceiling.
+  meter** so the delivered file genuinely respects the ceiling. Limiter behavior is
+  configurable per target: adaptive `balanced`/`transient` release character,
+  optional soft clipping, and linked/unlinked channel envelopes.
 - Per-file metering report: integrated **LUFS**, **LRA** (loudness range), max
   **momentary**/**short-term**, **true peak**, and crest figures **PLR**/**PSR** — shown
   for both the source and the delivered signal so you can see what processing changed.
@@ -84,10 +86,11 @@ one with `preset = "NAME"`, then override any field on top of it.
 | `48k` | 48000 | s16 | -16 | -1.0 | Generic 48 kHz delivery. |
 | `hires` | 96000 | s24 | -16 | -0.1 | High-resolution master. |
 
-A preset sets **only those four fields.** Everything else (`on_clip`, `warn_limiting_db`,
-`quality`, `dither`, `dir`, `naming`, `overwrite`) comes from the built-in defaults or your
-`[defaults]` — so, e.g., dither stays `tpdf` and quality stays `vhq` unless you say
-otherwise.
+A preset sets **only those four fields.** Everything else (`on_clip`,
+`limiter_character`, `limiter_soft_clip`, `limiter_link_channels`,
+`warn_limiting_db`, `quality`, `dither`, `dir`, `naming`, `overwrite`) comes from
+the built-in defaults or your `[defaults]` — so, e.g., dither stays `tpdf` and
+quality stays `vhq` unless you say otherwise.
 
 > Streaming targets drift over time; treat these as sensible starting points, not gospel.
 > The authoritative table is `preset()` in `src/config.rs`.
@@ -102,6 +105,9 @@ When a field is set by neither a preset nor an explicit value, these apply:
 | `lufs` | *unset (skip loudness normalization)* |
 | `ceiling_dbtp` | -1.0 |
 | `on_clip` | `limit` |
+| `limiter_character` | `balanced` |
+| `limiter_soft_clip` | `false` |
+| `limiter_link_channels` | `true` |
 | `warn_limiting_db` | 1.0 |
 | `quality` | `vhq` |
 | `dither` | `tpdf` |
@@ -169,6 +175,13 @@ codec  = "flac"              # -> song.flac (FLAC keeps the s24 depth)
 codec       = "mp3"          # lossy: bit depth/dither not applicable
 mp3_bitrate = 320            # default 320; needs `--features mp3`
 lufs        = -14.0
+
+# 8. Limiter character controls (used when on_clip = "limit").
+[target.punchy]
+preset                = "spotify"
+limiter_character     = "transient"   # faster adaptive release
+limiter_soft_clip     = true
+limiter_link_channels = false          # independent L/R envelopes
 ```
 
 `codec` is `wav` (default), `flac`, or `mp3`; the default `naming` ends in `{cext}`, which
@@ -275,6 +288,18 @@ always resamples through libsoxr, a `--no-default-features` binary always uses r
 libsoxr does resampling only; dither, quantization, and noise shaping always stay in this
 tool.
 
+### Limiter behavior
+
+When `on_clip = "limit"`, limiter behavior is configurable per target:
+
+| Field | Values | Meaning |
+|---|---|---|
+| `limiter_character` | `balanced` (default), `transient` | Program-dependent release profile. `balanced` is smoother; `transient` recovers faster and preserves attack more aggressively. |
+| `limiter_soft_clip` | `true` / `false` (default) | Applies a gentle saturating curve near the ceiling after limiting to tame residual needles. |
+| `limiter_link_channels` | `true` (default), `false` | `true`: one shared gain envelope (stable stereo image). `false`: independent channel envelopes (can preserve more per-channel punch, but may shift image under heavy limiting). |
+
+These options are ignored unless `on_clip = "limit"`.
+
 ### Dither & noise shaping
 
 Reducing bit depth (say, a 24-bit master down to a 16-bit CD or streaming file) discards
@@ -301,6 +326,10 @@ Things worth knowing:
   `shaped` and `psychoacoustic` fall back to flat TPDF; at f32 there is no quantization to
   dither at all. The dry-run and report spell out what ran and name the curve — e.g.
   `quantize -> s16 + tpdf + noise-shaping (psychoacoustic)`.
+- **Quantization runs exactly once.** Integer outputs are quantized in the bit-depth step
+  (`ops/bitdepth`) using the shared grid in `OutputSampleFormat::int_grid()`. Container
+  writers (`audio/io_write`) do not apply a second independent quantizer; they only
+  materialize those already-quantized grid points as PCM integers.
 - **`psychoacoustic` is tuned for 44.1 kHz** (its notch sits at ~4 kHz) and deliberately
   concentrates noise near Nyquist. Apply it as the **final** step before delivery — not if
   the output will be resampled or lossy-encoded afterwards; prefer `shaped` or `tpdf`
@@ -327,20 +356,5 @@ Things worth knowing:
   [Audio quality](#audio-quality) above.
 
 
-## Room for improvement (ranked by impact)
 
-[X] A. The true-peak limiter's ISP detection is the one real DSP weakness. limiter.rs:94 uses 4× linear-interpolation upsampling for peak detection. Linear interpolation is a poor reconstruction filter — it systematically under-estimates inter-sample peaks, worst exactly where ISPs are worst (bright, high-frequency, near-Nyquist content). The code comment concedes "~0.1 dBTP for signals well below Nyquist," but on hot/dense masters the under-read can be several tenths of a dB or more.
 
-The consequence is subtle but important: your measurement (ebur128 true-peak) is proper BS.1770, but the limiter aims at the cruder linear-interp peak, and the pipeline never loops "measure → re-limit until ebur128 says we're under." So ceiling is always enforced is true against the limiter's own estimate, not against the true peak that Spotify/Apple/loudness-checkers will measure. A platform re-checking your file could find it a few tenths over your stated ceiling. Pro limiters (Ozone Maximizer, etc.) oversample detection 4–8× with a proper polyphase FIR.
-
-▎ Fix options, cheapest first: (1) iterate against ebur128's true-peak after limiting and apply a residual trim until under ceiling; (2) replace linear interp with a real oversampling FIR (or reuse libsoxr to 4× upsample for detection); (3) add a small safety offset. I'd do (1)+(2).
-
-[X] B. Loudness/metering breadth. You measure integrated LUFS and TP only. Pro tools also report LRA (loudness range), momentary/short-term max, PLR/PSR, and true-peak max — the numbers an engineer uses for QC. Two related gaps: no LRA-aware / dynamic processing (you hit the target with static gain + limiter only — fine, but tools like RX Loudness Control can compress to meet LUFS+TP simultaneously), and for >2 channels ebur128 isn't told channel roles, so BS.1770 surround channel weighting (+1.5 dB rear, LFE exclusion) isn't applied. Stereo is correct.
-
-[X] C. Output/format breadth. WAV/AIFF in, WAV out only. Missing: lossy encode (MP3/AAC) + a codec-preview path (Ozone's signature QC feature — hear/measure what lossy does to your true peaks), FLAC, and — notably for your broadcast-ebu-r128 preset — broadcast WAV bext chunk + loudness metadata. Right now that preset normalizes correctly but writes a plain WAV with no R128 metadata, which a broadcast deliverable usually requires. Also no metadata/marker passthrough.
-
-[ ] D. Limiter sophistication. Beyond the ISP issue: release is a single fixed exponential (30 dB/s, limiter.rs:10). Pros use program-dependent/adaptive release and offer multiple character modes (transient vs. balanced), optional soft-clip, and link/unlink. Your linked-only envelope is a good default for imaging, but it's the only option.
-
-[ ] E. Redundant quantization (code-quality, low risk). bitdepth.rs quantizes to the grid, then io_write.rs:29-40 quantizes again on write. It's idempotent today (so no audible double-dither), but it's two sources of truth for the grid — and they disagree on convention: bitdepth uses a symmetric grid (±32767) while io_write uses an asymmetric clamp (−32768..32767). Consolidate to one quantization point so a future change can't desync them.
-
-[X] F. No QC/verification output. No analysis dump (JSON of in/out LUFS, LRA, TP, GR per target), no before/after, no spectra. For an automation tool this would be a high-value, low-effort addition.

@@ -43,6 +43,12 @@ pub struct RawTarget {
     pub lufs: Option<f64>,
     pub ceiling_dbtp: Option<f64>,
     pub on_clip: Option<OnClipPolicy>,
+    /// Limiter behavior when `on_clip = "limit"`.
+    pub limiter_character: Option<LimiterCharacter>,
+    /// Optional post-limiter soft clipping near the ceiling.
+    pub limiter_soft_clip: Option<bool>,
+    /// Channel envelope linking in the limiter.
+    pub limiter_link_channels: Option<bool>,
     /// Warn when the loudness step's limiter applies more than this many dB of peak
     /// gain reduction to reach `lufs` under `ceiling_dbtp`. Surfaces the otherwise
     /// silent "source got crushed to hit the target" case (default 1.0 — conservative,
@@ -77,6 +83,13 @@ pub enum OnClipPolicy {
     Limit,
     ReduceGain,
     Warn,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum LimiterCharacter {
+    Balanced,
+    Transient,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -169,6 +182,9 @@ pub struct ResolvedTarget {
     pub lufs: Option<f64>,
     pub ceiling_dbtp: f64,
     pub on_clip: OnClipPolicy,
+    pub limiter_character: LimiterCharacter,
+    pub limiter_soft_clip: bool,
+    pub limiter_link_channels: bool,
     /// Limiter gain-reduction threshold (dB) above which a heavy-limiting warning fires.
     pub warn_limiting_db: f64,
     pub quality: ResampleQuality,
@@ -214,12 +230,22 @@ impl ResolvedTarget {
             Some(lufs) => steps.push(format!(
                 "loudness -> {lufs:.1} LUFS (ceiling {:.1} dBTP, {})",
                 self.ceiling_dbtp,
-                on_clip_tag(self.on_clip)
+                limiter_policy_tag(
+                    self.on_clip,
+                    self.limiter_character,
+                    self.limiter_soft_clip,
+                    self.limiter_link_channels,
+                )
             )),
             None => steps.push(format!(
                 "transcode (no loudness normalization); ceiling {:.1} dBTP enforced ({})",
                 self.ceiling_dbtp,
-                on_clip_tag(self.on_clip)
+                limiter_policy_tag(
+                    self.on_clip,
+                    self.limiter_character,
+                    self.limiter_soft_clip,
+                    self.limiter_link_channels,
+                )
             )),
         }
 
@@ -313,6 +339,9 @@ impl Config {
             lufs: merged.lufs,
             ceiling_dbtp: merged.ceiling_dbtp.unwrap(),
             on_clip: merged.on_clip.unwrap(),
+            limiter_character: merged.limiter_character.unwrap(),
+            limiter_soft_clip: merged.limiter_soft_clip.unwrap(),
+            limiter_link_channels: merged.limiter_link_channels.unwrap(),
             warn_limiting_db: merged.warn_limiting_db.unwrap(),
             quality: merged.quality.unwrap(),
             dither: merged.dither.unwrap(),
@@ -412,6 +441,9 @@ fn overlay(base: RawTarget, top: RawTarget) -> RawTarget {
         lufs: top.lufs.or(base.lufs),
         ceiling_dbtp: top.ceiling_dbtp.or(base.ceiling_dbtp),
         on_clip: top.on_clip.or(base.on_clip),
+        limiter_character: top.limiter_character.or(base.limiter_character),
+        limiter_soft_clip: top.limiter_soft_clip.or(base.limiter_soft_clip),
+        limiter_link_channels: top.limiter_link_channels.or(base.limiter_link_channels),
         warn_limiting_db: top.warn_limiting_db.or(base.warn_limiting_db),
         quality: top.quality.or(base.quality),
         dither: top.dither.or(base.dither),
@@ -433,6 +465,9 @@ fn builtin_fallback() -> RawTarget {
         lufs: None,
         ceiling_dbtp: Some(-1.0),
         on_clip: Some(OnClipPolicy::Limit),
+        limiter_character: Some(LimiterCharacter::Balanced),
+        limiter_soft_clip: Some(false),
+        limiter_link_channels: Some(true),
         warn_limiting_db: Some(1.0),
         quality: Some(ResampleQuality::Vhq),
         dither: Some(DitherMode::Tpdf),
@@ -528,6 +563,30 @@ fn on_clip_tag(policy: OnClipPolicy) -> &'static str {
         OnClipPolicy::Limit => "limit",
         OnClipPolicy::ReduceGain => "reduce_gain",
         OnClipPolicy::Warn => "warn",
+    }
+}
+
+fn limiter_character_tag(character: LimiterCharacter) -> &'static str {
+    match character {
+        LimiterCharacter::Balanced => "balanced",
+        LimiterCharacter::Transient => "transient",
+    }
+}
+
+fn limiter_policy_tag(
+    policy: OnClipPolicy,
+    character: LimiterCharacter,
+    soft_clip: bool,
+    link_channels: bool,
+) -> String {
+    match policy {
+        OnClipPolicy::Limit => format!(
+            "limit; {} release; {}; soft_clip={}",
+            limiter_character_tag(character),
+            if link_channels { "linked" } else { "unlinked" },
+            soft_clip
+        ),
+        _ => on_clip_tag(policy).to_string(),
     }
 }
 

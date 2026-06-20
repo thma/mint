@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::audio::buffer::AudioBuffer;
+use crate::config::LimiterCharacter;
 
 /// 4× oversampling for inter-sample peak detection.
 const OVERSAMPLE: usize = 4;
@@ -12,13 +13,55 @@ const OVERSAMPLE: usize = 4;
 /// interpolation under-reads worst and lets real peaks slip past the ceiling.
 const FIR_TAPS_PER_PHASE: usize = 12;
 
-/// Gain recovery speed after a limiting event (dB per second).
-/// 30 dB/s is a standard value that sounds transparent on most material.
-const RELEASE_DB_PER_SECOND: f64 = 30.0;
+/// Soft-clip knee starts at this fraction of the linear ceiling.
+const SOFT_CLIP_KNEE_RATIO: f64 = 0.97;
 
-/// Look-ahead window in milliseconds.
-/// Starting gain reduction 1 ms before the peak prevents audible transient clipping.
-const LOOK_AHEAD_MS: f64 = 1.0;
+#[derive(Debug, Clone, Copy)]
+pub struct LimiterOptions {
+    /// Transient-focused (faster release) vs. balanced (smoother release).
+    pub character: LimiterCharacter,
+    /// Apply a gentle post-limiter saturating curve near the ceiling.
+    pub soft_clip: bool,
+    /// When true, one shared envelope is applied across all channels.
+    pub link_channels: bool,
+}
+
+impl Default for LimiterOptions {
+    fn default() -> Self {
+        Self {
+            character: LimiterCharacter::Balanced,
+            soft_clip: false,
+            link_channels: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReleaseProfile {
+    /// Slow end of the adaptive release (heavy gain reduction).
+    base_db_per_second: f64,
+    /// Fast end of the adaptive release (light gain reduction).
+    fast_db_per_second: f64,
+    /// Look-ahead in milliseconds.
+    look_ahead_ms: f64,
+}
+
+fn release_profile(character: LimiterCharacter) -> ReleaseProfile {
+    match character {
+        // Smoother envelope movement, slightly longer look-ahead.
+        LimiterCharacter::Balanced => ReleaseProfile {
+            base_db_per_second: 18.0,
+            fast_db_per_second: 42.0,
+            look_ahead_ms: 1.2,
+        },
+        // Faster recovery and shorter look-ahead for a snappier feel.
+        LimiterCharacter::Transient => ReleaseProfile {
+            base_db_per_second: 30.0,
+            fast_db_per_second: 75.0,
+            look_ahead_ms: 0.6,
+        },
+    }
+}
 
 /// Apply an oversampled true-peak brickwall limiter in place.
 ///
@@ -31,6 +74,16 @@ const LOOK_AHEAD_MS: f64 = 1.0;
 /// 5. Downsample gain curve to original rate; apply uniformly across all channels to
 ///    preserve inter-channel balance.
 pub fn apply_true_peak_limit(buffer: &mut AudioBuffer, ceiling_dbtp: f64) -> Result<()> {
+    apply_true_peak_limit_with_options(buffer, ceiling_dbtp, LimiterOptions::default())
+}
+
+/// Apply an oversampled true-peak brickwall limiter with configurable character,
+/// optional soft clipping, and channel linking mode.
+pub fn apply_true_peak_limit_with_options(
+    buffer: &mut AudioBuffer,
+    ceiling_dbtp: f64,
+    options: LimiterOptions,
+) -> Result<()> {
     let n = buffer.frame_len();
     if n == 0 {
         return Ok(());
@@ -38,28 +91,59 @@ pub fn apply_true_peak_limit(buffer: &mut AudioBuffer, ceiling_dbtp: f64) -> Res
 
     let ceiling_lin = 10_f64.powf(ceiling_dbtp / 20.0);
     let over_rate = buffer.sample_rate as f64 * OVERSAMPLE as f64;
+    let profile = release_profile(options.character);
 
     // Oversampled-sample distance for the look-ahead.
-    let look_ahead = (over_rate * LOOK_AHEAD_MS / 1000.0).round() as usize;
-
-    // Gain recovery multiplier per oversampled sample.
-    // Derivation: gain goes from g to 1.0; each step multiplies by this.
-    let release_per_sample = 10_f64.powf(RELEASE_DB_PER_SECOND / (20.0 * over_rate));
+    let look_ahead = (over_rate * profile.look_ahead_ms / 1000.0).round() as usize;
 
     let n_over = n * OVERSAMPLE;
-
-    // Build the worst-case absolute peak across all channels at each oversampled position.
-    // Using a single combined envelope preserves inter-channel phase/balance. The
-    // polyphase kernels are level-preserving and built once, then reused per channel.
     let kernels = polyphase_kernels();
-    let mut envelope = vec![0.0_f64; n_over];
-    for channel in &buffer.channels {
-        let upsampled = upsample_fir_4x(channel, &kernels);
-        for (env, s) in envelope.iter_mut().zip(upsampled.iter()) {
-            *env = env.max(s.abs());
+
+    if options.link_channels {
+        // One combined envelope preserves inter-channel imaging.
+        let mut envelope = vec![0.0_f64; n_over];
+        for channel in &buffer.channels {
+            let upsampled = upsample_fir_4x(channel, &kernels);
+            for (env, s) in envelope.iter_mut().zip(upsampled.iter()) {
+                *env = env.max(s.abs());
+            }
+        }
+
+        let gains = build_gain_curve(&envelope, ceiling_lin, look_ahead.max(1), over_rate, profile);
+        for channel in &mut buffer.channels {
+            for (i, sample) in channel.iter_mut().enumerate() {
+                *sample *= gains[i * OVERSAMPLE];
+            }
+        }
+    } else {
+        // Independent envelopes can preserve more channel-specific transients at the
+        // cost of possible stereo image movement under heavy limiting.
+        for channel in &mut buffer.channels {
+            let upsampled = upsample_fir_4x(channel, &kernels);
+            let envelope: Vec<f64> = upsampled.iter().map(|s| s.abs()).collect();
+            let gains =
+                build_gain_curve(&envelope, ceiling_lin, look_ahead.max(1), over_rate, profile);
+            for (i, sample) in channel.iter_mut().enumerate() {
+                *sample *= gains[i * OVERSAMPLE];
+            }
         }
     }
 
+    if options.soft_clip {
+        apply_soft_clip(buffer, ceiling_lin);
+    }
+
+    Ok(())
+}
+
+/// Build a look-ahead brickwall gain curve with adaptive, program-dependent release.
+fn build_gain_curve(
+    envelope: &[f64],
+    ceiling_lin: f64,
+    look_ahead: usize,
+    over_rate: f64,
+    profile: ReleaseProfile,
+) -> Vec<f64> {
     // Instantaneous gain reduction: 1.0 when below ceiling, < 1.0 when exceeding.
     let g_inst: Vec<f64> = envelope
         .iter()
@@ -67,33 +151,50 @@ pub fn apply_true_peak_limit(buffer: &mut AudioBuffer, ceiling_dbtp: f64) -> Res
         .collect();
 
     // Look-ahead: sliding minimum over the next `look_ahead` oversampled frames.
-    // This ensures the gain is already low enough when the peak actually arrives.
-    let g_la = sliding_min_forward(&g_inst, look_ahead.max(1));
+    let g_la = sliding_min_forward(&g_inst, look_ahead);
 
-    // Forward pass: instant attack (brickwall), controlled release.
-    let mut g_smooth = vec![1.0_f64; n_over];
+    // Forward pass: instant attack, adaptive release.
+    let mut g_smooth = vec![1.0_f64; envelope.len()];
     g_smooth[0] = g_la[0];
-    for i in 1..n_over {
+    for i in 1..g_smooth.len() {
         let prev = g_smooth[i - 1];
         let target = g_la[i];
         if target <= prev {
-            // More reduction required — attack is instantaneous for a brickwall limiter.
             g_smooth[i] = target;
         } else {
-            // Signal is recovering — release at the configured rate.
-            g_smooth[i] = (prev * release_per_sample).min(1.0);
+            // Program-dependent release: when we're deep into gain reduction, recover
+            // slower; near unity gain, recover faster.
+            let gr_db = (-20.0 * prev.max(1e-12).log10()).max(0.0);
+            let heavy = (gr_db / 12.0).clamp(0.0, 1.0);
+            let rel_db_s = profile.fast_db_per_second
+                - (profile.fast_db_per_second - profile.base_db_per_second) * heavy;
+            let rel_mul = 10_f64.powf(rel_db_s / (20.0 * over_rate));
+            g_smooth[i] = (prev * rel_mul).min(1.0);
         }
     }
 
-    // Apply the gain curve to original samples.
-    // Each original sample i maps to oversampled position i*OVERSAMPLE.
+    g_smooth
+}
+
+fn apply_soft_clip(buffer: &mut AudioBuffer, ceiling_lin: f64) {
+    let knee = ceiling_lin * SOFT_CLIP_KNEE_RATIO;
+    if knee <= 0.0 || knee >= ceiling_lin {
+        return;
+    }
+    let tanh_norm = 1.0_f64.tanh();
+
     for channel in &mut buffer.channels {
-        for (i, sample) in channel.iter_mut().enumerate() {
-            *sample *= g_smooth[i * OVERSAMPLE];
+        for sample in channel {
+            let sign = sample.signum();
+            let a = sample.abs();
+            if a <= knee {
+                continue;
+            }
+            let t = ((a - knee) / (ceiling_lin - knee)).clamp(0.0, 1.0);
+            let shaped = knee + (ceiling_lin - knee) * (t.tanh() / tanh_norm);
+            *sample = sign * shaped.min(ceiling_lin);
         }
     }
-
-    Ok(())
 }
 
 /// Build the `OVERSAMPLE` polyphase kernels of a windowed-sinc fractional-delay

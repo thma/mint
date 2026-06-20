@@ -8,7 +8,7 @@ use crate::audio::io_read;
 use crate::audio::io_write;
 use crate::config::{OutputCodec, ResolvedTarget, format_tag};
 use crate::ops::loudness::LoudnessAnalysis;
-use crate::ops::{bitdepth, loudness, resample};
+use crate::ops::{bitdepth, limiter, loudness, resample};
 
 #[derive(Debug, Clone)]
 pub struct ProcessingReport {
@@ -62,6 +62,11 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     let mut buffer = io_read::read_audio(input)?;
     let source_rate = buffer.sample_rate;
     let ceiling = target.ceiling_dbtp;
+    let limiter_options = limiter::LimiterOptions {
+        character: target.limiter_character,
+        soft_clip: target.limiter_soft_clip,
+        link_channels: target.limiter_link_channels,
+    };
     let mut warnings = Vec::new();
     let mut limiter_gain_reduction = None;
 
@@ -73,7 +78,8 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     //    The loudness step applies a constant gain and (for on_clip=limit) runs
     //    the limiter, so it also enforces the ceiling on its own output.
     let loudness_ran = if let Some(lufs) = target.lufs {
-        let result = loudness::apply(&mut buffer, lufs, Some(ceiling), Some(target.on_clip))?;
+        let result =
+            loudness::apply(&mut buffer, lufs, Some(ceiling), Some(target.on_clip), limiter_options)?;
         warnings.extend(result.warnings);
 
         // Heavy-limiting check: hitting the LUFS target required squashing peaks.
@@ -107,14 +113,23 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     if out_rate != source_rate {
         resample::apply(&mut buffer, out_rate, Some(target.quality))?;
         // SRC can raise inter-sample peaks above the previously enforced ceiling.
-        warnings.extend(loudness::recheck_and_limit_if_needed(&mut buffer, ceiling)?);
+        warnings.extend(loudness::recheck_and_limit_if_needed(
+            &mut buffer,
+            ceiling,
+            limiter_options,
+        )?);
     }
 
     // 3. Ceiling enforcement for the pure-transcode path (no loudness step ran).
     //    When a loudness step ran, its policy + the post-resample re-check already
     //    hold the ceiling, so this is skipped to avoid duplicate handling.
     if !loudness_ran {
-        warnings.extend(loudness::enforce_ceiling(&mut buffer, ceiling, target.on_clip)?);
+        warnings.extend(loudness::enforce_ceiling(
+            &mut buffer,
+            ceiling,
+            target.on_clip,
+            limiter_options,
+        )?);
     }
 
     // Delivered metering for the report, measured before any quantization/encode.

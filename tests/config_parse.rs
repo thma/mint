@@ -318,3 +318,25 @@ fn output_path_uses_placeholders() {
         .unwrap();
     assert_eq!(path, Path::new("out/cd/song_44100.s16.wav"));
 }
+
+#[test]
+fn limiter_options_parse_and_appear_in_dry_run() {
+    let config = config_from_str(
+        r#"
+        [target.t]
+        format = "s16"
+        on_clip = "limit"
+        limiter_character = "transient"
+        limiter_soft_clip = true
+        limiter_link_channels = false
+        "#,
+    );
+
+    let t = config.resolve_target("t").unwrap();
+    assert!(t.limiter_soft_clip);
+    assert!(!t.limiter_link_channels);
+    let plan = t.describe(48_000).join(" | ");
+    assert!(plan.contains("transient"), "plan: {plan}");
+    assert!(plan.contains("unlinked"), "plan: {plan}");
+    assert!(plan.contains("soft_clip=true"), "plan: {plan}");
+}
