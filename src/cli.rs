@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -13,7 +14,7 @@ use crate::pipeline::{self, ProcessingReport, TaskFailure};
 #[command(name = "mint")]
 #[command(about = "Audio processing CLI: render masters into distribution targets.")]
 pub struct Args {
-    /// Path to the TOML configuration. Defaults to ./render.toml when present.
+    /// Path to the TOML configuration. Defaults to ./mint.toml (bootstrapped if missing).
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -177,9 +178,10 @@ pub fn run() -> Result<()> {
 
 /// Config file looked up in the working directory when `--config` is omitted.
 const DEFAULT_CONFIG: &str = "mint.toml";
+const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../examples/mint.toml");
 
 /// Pick the config path: the explicit `--config` if given, otherwise `./mint.toml`
-/// when it exists. Bail with guidance when neither is available.
+/// when it exists. If missing, bootstrap one from `examples/mint.toml`.
 fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
@@ -190,7 +192,17 @@ fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
         return Ok(default);
     }
 
-    bail!("no config given and {DEFAULT_CONFIG} not found in the working directory; pass --config <path>");
+    fs::write(&default, DEFAULT_CONFIG_TEMPLATE).with_context(|| {
+        format!(
+            "no config given and {DEFAULT_CONFIG} was missing; failed to create it from examples/mint.toml"
+        )
+    })?;
+
+    eprintln!(
+        "no {DEFAULT_CONFIG} found; created one from examples/mint.toml"
+    );
+
+    Ok(default)
 }
 
 /// Resolve the targets requested via `--target` (or all of them), applying the

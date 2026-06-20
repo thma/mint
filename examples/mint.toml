@@ -27,6 +27,20 @@ preset = "cd"
 lufs   = -12.0
 dither = "shaped"          # TPDF + noise shaping; engages only for s16 targets
 
+# Optional undithered 24-bit delivery: `dither = "none"` is allowed.
+# Many engineers consider 24-bit quantization error low enough for this use-case.
+[target.archive-s24-none]
+format = "s24"
+lufs   = -14.0
+dither = "none"
+
+# Undithered 16-bit is also allowed, but mint emits a warning because correlated
+# quantization distortion is more likely to be audible at s16.
+[target.cd-none]
+preset = "cd"
+lufs   = -12.0
+dither = "none"
+
 # 48 kHz delivery via the built-in preset (48k / s24 / -23 LUFS / -1 dBTP).
 [target.broadcast]
 preset = "broadcast-ebu-r128"   # 48k / s24 / -23 LUFS

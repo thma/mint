@@ -232,6 +232,10 @@ supported (libfdk-aac licensing).
 
 ## Run
 
+If `--config` is omitted, `mint` uses `./mint.toml`. When that file is missing,
+`mint` creates it from `examples/mint.toml` and uses it immediately (an existing
+`mint.toml` is never overwritten).
+
 Dry run (show derived chain + planned paths, process nothing):
 
     cargo run -- --config examples/distribution.toml --dry-run "masters/*.wav"
@@ -250,7 +254,7 @@ Render only specific targets (repeat `--target`):
 peak, PLR/PSR, applied limiting, warnings) plus any failures as JSON to stdout — the
 human-readable report and banners are suppressed so stdout is pure JSON for QC pipelines:
 
-    mint --config render.toml --json "masters/*.wav" | jq '.tasks[] | {target, lufs: .delivered.integrated_lufs}'
+    mint --config mint.toml --json "masters/*.wav" | jq '.tasks[] | {target, lufs: .delivered.integrated_lufs}'
 
 Non-finite meter values (silence, or clips shorter than a meter's window) serialize as
 `null`. A non-zero exit still signals failures, which also appear in the `failures` array.
