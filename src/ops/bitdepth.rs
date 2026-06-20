@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::audio::buffer::{AudioBuffer, OutputSampleFormat};
 use crate::config::DitherMode;
@@ -22,13 +22,9 @@ pub fn apply(
     let mode = dither_mode.unwrap_or(DitherMode::Tpdf);
     let reduced = is_reduction(*current, target);
 
-    if reduced && matches!(mode, DitherMode::None) {
-        bail!("dither='none' is not allowed when reducing bit depth");
-    }
-
     // `reduced` already implies an integer target (f32 is the top rank, so nothing
     // reduces *to* it), so no separate is-integer check is needed. Every mode but
-    // `None` dithers, and `None` was already rejected above on a reduction.
+    // `None` adds dither noise; `None` is an explicit undithered quantization choice.
     let dithered = reduced && !matches!(mode, DitherMode::None);
     // Shaping only helps at 16-bit; at s24 the noise floor is already inaudible, so
     // the shaped modes gracefully degrade to flat TPDF here (and to nothing for f32).

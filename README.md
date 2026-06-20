@@ -318,7 +318,7 @@ Set the mode per target with `dither`:
 | `tpdf` *(default)* | Flat TPDF dither — the textbook-correct, spectrally neutral choice. | Any integer output; the safe default and the only honest option at s24. |
 | `shaped` | TPDF + a gentle `(1−z⁻¹)²` high-pass shaping curve. | s16 deliverables, conservatively — a modest perceived-noise win that stays safe if the file gets processed again. |
 | `psychoacoustic` | TPDF + the published Lipshitz *minimally-audible* curve (deep notch at ~4 kHz). | Final s16 masters (CD, 16-bit streaming) — maximum perceived dynamic range; the POW-r / UV22-class option. |
-| `none` | Plain truncation, no dither. | Rare; **rejected** when it would reduce bit depth, because it degrades quality. |
+| `none` | Plain truncation, no dither. | Expert-only. Allowed on request; the tool warns when reducing to s16 without dither. |
 
 Things worth knowing:
 
@@ -330,6 +330,10 @@ Things worth knowing:
   (`ops/bitdepth`) using the shared grid in `OutputSampleFormat::int_grid()`. Container
   writers (`audio/io_write`) do not apply a second independent quantizer; they only
   materialize those already-quantized grid points as PCM integers.
+- **`dither = "none"` is allowed but guarded by warnings.** Undithered reductions are
+  accepted, and a warning is emitted for `* -> s16` with `dither = "none"` because
+  correlated quantization distortion is more likely to be audible there. Undithered
+  `* -> s24` is supported for users who prefer it.
 - **`psychoacoustic` is tuned for 44.1 kHz** (its notch sits at ~4 kHz) and deliberately
   concentrates noise near Nyquist. Apply it as the **final** step before delivery — not if
   the output will be resampled or lossy-encoded afterwards; prefer `shaped` or `tpdf`

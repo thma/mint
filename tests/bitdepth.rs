@@ -19,20 +19,43 @@ fn mk_buffer(samples: &[f64]) -> AudioBuffer {
 }
 
 #[test]
-fn reduction_without_dither_is_rejected() {
+fn reduction_without_dither_is_allowed_for_s16() {
     let mut buffer = mk_buffer(&[0.0, 0.2, -0.2]);
     let mut current = OutputSampleFormat::F32;
 
-    let err = bitdepth::apply(
+    let result = bitdepth::apply(
         &mut buffer,
         &mut current,
         OutputSampleFormat::S16,
         Some(DitherMode::None),
         Some(1),
     )
-    .expect_err("reduction with dither none must fail");
+    .expect("reduction with dither none should succeed");
 
-    assert!(err.to_string().contains("not allowed"));
+    assert!(result.reduced);
+    assert!(!result.dithered);
+    assert!(!result.shaped);
+    assert_eq!(current, OutputSampleFormat::S16);
+}
+
+#[test]
+fn reduction_without_dither_is_allowed_for_s24() {
+    let mut buffer = mk_buffer(&[0.0, 0.2, -0.2]);
+    let mut current = OutputSampleFormat::F32;
+
+    let result = bitdepth::apply(
+        &mut buffer,
+        &mut current,
+        OutputSampleFormat::S24,
+        Some(DitherMode::None),
+        Some(1),
+    )
+    .expect("reduction to s24 with dither none should succeed");
+
+    assert!(result.reduced);
+    assert!(!result.dithered);
+    assert!(!result.shaped);
+    assert_eq!(current, OutputSampleFormat::S24);
 }
 
 #[test]

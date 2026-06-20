@@ -4,6 +4,7 @@
 # (loudness, resample, limit, dither/quantize) are derived automatically from
 # the source file and the target spec. Field precedence, lowest to highest:
 #   built-in defaults  <  [defaults]  <  preset  <  explicit field
+# All available settings are documented in README.md
 
 [meta]
 name = "mint-masters"
@@ -45,3 +46,10 @@ codec  = "flac"              # -> song.flac (FLAC keeps the s24 depth)
 codec       = "mp3"          # lossy: bit depth/dither not applicable
 mp3_bitrate = 320            # default 320; needs `--features mp3`
 lufs        = -14.0
+
+# 8. Limiter character controls (used when on_clip = "limit").
+[target.punchy]
+preset                = "spotify"
+limiter_character     = "transient"   # faster adaptive release
+limiter_soft_clip     = true
+limiter_link_channels = false          # independent L/R envelopes

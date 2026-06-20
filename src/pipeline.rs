@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use crate::audio::buffer::OutputSampleFormat;
 use crate::audio::io_read;
 use crate::audio::io_write;
-use crate::config::{OutputCodec, ResolvedTarget, format_tag};
+use crate::config::{DitherMode, OutputCodec, ResolvedTarget, format_tag};
 use crate::ops::loudness::LoudnessAnalysis;
 use crate::ops::{bitdepth, limiter, loudness, resample};
 
@@ -164,6 +164,7 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
         codec => {
             // WAV and FLAC quantize the full-precision buffer exactly once, with dither.
             let mut current = OutputSampleFormat::F32;
+            let in_format = current;
             let bd =
                 bitdepth::apply(&mut buffer, &mut current, target.format, Some(target.dither), seed)?;
             dithered = bd.dithered;
@@ -171,6 +172,17 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
             // `shaped` ⟹ the mode has a curve, so this resolves to Some when shaping ran.
             shaping_curve =
                 bd.shaped.then(|| target.dither.shaping_curve().map(|c| c.tag())).flatten();
+
+            if bd.reduced
+                && matches!(target.dither, DitherMode::None)
+                && matches!(target.format, OutputSampleFormat::S16)
+            {
+                warnings.push(format!(
+                    "undithered bit-depth reduction {} -> s16 requested (dither=none); this can introduce correlated quantization distortion on low-level material",
+                    format_tag(in_format)
+                ));
+            }
+
             format_tag_str = format_tag(target.format).to_string();
 
             match codec {
