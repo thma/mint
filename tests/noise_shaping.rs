@@ -5,6 +5,7 @@ use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
 use mint::config::DitherMode;
 use mint::dither::mbit_plus::MbitPlusStrength;
 use mint::dither::psychoacoustic::{PsychoacousticAnalysis, FRAME_SIZE, HOP_SIZE};
+use mint::dither::adaptive_mbit::AdaptiveShaper;
 use mint::ops::bitdepth;
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
@@ -565,4 +566,123 @@ fn psychoacoustic_analysis_threshold_clamps_gracefully() {
     let a = PsychoacousticAnalysis::analyze(&sig, 44_100);
     let t = a.threshold_for_sample(usize::MAX);
     assert_eq!(t.len(), a.num_bins);
+}
+
+// ─── Phase 4.2: Adaptive noise shaping with minimal-phase design ────────────
+
+/// Phase 4.2: A shaper designed from a psychoacoustic analysis has the right
+/// number of frames and order.
+#[test]
+fn adaptive_shaper_from_analysis_has_correct_structure() {
+    let sr = 44_100u32;
+    let sig = sine_signal(1_000.0, sr as usize / 2, sr);
+    let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
+    let shaper = AdaptiveShaper::from_analysis(&analysis, 7);
+
+    assert_eq!(
+        shaper.num_frames(),
+        analysis.num_frames(),
+        "shaper should have one entry per analysis frame"
+    );
+    assert_eq!(shaper.order(), 7, "FIR order should match the request");
+}
+
+/// Phase 4.2: Coefficients are linearly interpolated between frames, producing
+/// smooth transitions without zipper artifacts.
+#[test]
+fn adaptive_shaper_coefficients_interpolate_smoothly() {
+    let sr = 44_100u32;
+    let sig = sine_signal(1_000.0, sr as usize / 2, sr);
+    let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
+    let shaper = AdaptiveShaper::from_analysis(&analysis, 5);
+
+    // Collect coefficients over one hop period. They should vary smoothly,
+    // not jump discontinuously.
+    let mut prev_coeffs = shaper.coeffs_for_sample(0);
+    let mut max_delta = 0.0f64;
+
+    for sample in (0..HOP_SIZE).step_by(HOP_SIZE / 100) {
+        let curr_coeffs = shaper.coeffs_for_sample(sample);
+        for (i, &curr) in curr_coeffs.iter().enumerate() {
+            let delta = (curr - prev_coeffs[i]).abs();
+            max_delta = max_delta.max(delta);
+        }
+        prev_coeffs = curr_coeffs;
+    }
+
+    // The maximum change over the hop should be bounded (smooth transition).
+    assert!(
+        max_delta < 0.5,
+        "coefficient changes should be smooth, got max delta {max_delta:.3}"
+    );
+}
+
+/// Phase 4.2: At frame boundaries, coefficients should match the frame's design
+/// (frame 0 at sample 0, frame 1 at sample HOP_SIZE, etc.).
+#[test]
+fn adaptive_shaper_frame_boundaries_exact() {
+    let sr = 44_100u32;
+    let sig = sine_signal(1_000.0, sr as usize, sr);
+    let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
+    let shaper = AdaptiveShaper::from_analysis(&analysis, 5);
+
+    // At the start of each frame (sample = k * HOP_SIZE), the shaper should
+    // return exactly the frame's coefficients.
+    for frame in 0..shaper.num_frames().min(3) {
+        let sample = frame * HOP_SIZE;
+        let c_shaper = shaper.coeffs_for_sample(sample);
+        let c_frame = &shaper.frame_coeffs()[frame];
+        for (i, &cs) in c_shaper.iter().enumerate() {
+            assert!(
+                (cs - c_frame[i]).abs() < 1e-10,
+                "shaper({}) should match frame {} coeff {}",
+                sample,
+                frame,
+                i
+            );
+        }
+    }
+}
+
+/// Phase 4.2: All FIR coefficients should be finite and of reasonable magnitude
+/// (no NaN, inf, or wildly large values that would destabilize the quantizer).
+#[test]
+fn adaptive_shaper_coefficients_are_stable() {
+    let sr = 44_100u32;
+    let sig = sine_signal(1_000.0, sr as usize / 2, sr);
+    let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
+    let shaper = AdaptiveShaper::from_analysis(&analysis, 9);
+
+    for (frame_idx, frame_coeffs_vec) in shaper.frame_coeffs().iter().enumerate() {
+        for (tap_idx, &coeff) in frame_coeffs_vec.iter().enumerate() {
+            assert!(
+                coeff.is_finite(),
+                "frame {} tap {} must be finite, got {}",
+                frame_idx,
+                tap_idx,
+                coeff
+            );
+            assert!(
+                coeff.abs() < 100.0,
+                "frame {} tap {} magnitude should stay bounded, got {}",
+                frame_idx,
+                tap_idx,
+                coeff
+            );
+        }
+    }
+}
+
+/// Phase 4.2: Interpolation should handle boundary cases gracefully.
+#[test]
+fn adaptive_shaper_bounds_checking() {
+    let sr = 44_100u32;
+    let sig = sine_signal(440.0, sr as usize / 4, sr);
+    let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
+    let shaper = AdaptiveShaper::from_analysis(&analysis, 7);
+
+    // Very large sample indices should not panic or return garbage.
+    let c_large = shaper.coeffs_for_sample(1_000_000_000);
+    assert_eq!(c_large.len(), 7, "should return a full coefficient vector");
+    assert!(c_large.iter().all(|c| c.is_finite()), "all coefficients must be finite");
 }

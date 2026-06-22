@@ -6,6 +6,8 @@ use crate::audio::buffer::AudioBuffer;
 pub mod mbit_plus;
 /// Phase 4.1 psychoacoustic analysis pass (STFT → Bark → spreading → ATH).
 pub mod psychoacoustic;
+/// Phase 4.2 adaptive minimal-phase filter design with coefficient interpolation.
+pub mod adaptive_mbit;
 
 pub struct TpdfDither {
     rng: StdRng,
