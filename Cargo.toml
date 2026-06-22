@@ -30,6 +30,9 @@ mp3lame-encoder = { version = "0.2", optional = true }
 symphonia = { version = "0.5.5", features = ["wav", "aiff", "pcm"] }
 thiserror = "2.0"
 toml = "0.8"
+# Pure-Rust FFT for Phase 4.1 psychoacoustic analysis (runtime) and Phase 3 NTF
+# validation tests (dev). Single crate covers both roles.
+rustfft = "6.2"
 
 [features]
 # libsoxr is the default resample backend (reference-grade SRC). Build with

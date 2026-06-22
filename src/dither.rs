@@ -4,6 +4,8 @@ use rand::{Rng, SeedableRng};
 use crate::audio::buffer::AudioBuffer;
 
 pub mod mbit_plus;
+/// Phase 4.1 psychoacoustic analysis pass (STFT → Bark → spreading → ATH).
+pub mod psychoacoustic;
 
 pub struct TpdfDither {
     rng: StdRng,

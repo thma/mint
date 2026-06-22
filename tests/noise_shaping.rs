@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
 use mint::config::DitherMode;
 use mint::dither::mbit_plus::MbitPlusStrength;
+use mint::dither::psychoacoustic::{PsychoacousticAnalysis, FRAME_SIZE, HOP_SIZE};
 use mint::ops::bitdepth;
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
@@ -439,4 +440,129 @@ fn mbit_plus_fft_ntf_rate_tables_move_the_notch() {
     assert!((f48 - 3_600.0).abs() < 1_500.0, "48k notch should stay in the same perceptual zone, got {f48:.0} Hz");
     assert!((f882 - 7_000.0).abs() < 1_500.0, "88.2k notch should move upward with the rate table, got {f882:.0} Hz");
     assert!((f96 - 7_200.0).abs() < 1_500.0, "96k notch should move upward with the rate table, got {f96:.0} Hz");
+}
+
+// ─── Phase 4.1: Psychoacoustic Analysis integration tests ────────────────────
+
+/// A sine at a given frequency (normalized –1..1).
+fn sine_signal(freq_hz: f64, n: usize, sample_rate: u32) -> Vec<f64> {
+    (0..n)
+        .map(|i| (2.0 * PI * freq_hz * i as f64 / sample_rate as f64).sin())
+        .collect()
+}
+
+/// Phase 4.1: Analysis of a 1-second buffer returns a sensible frame count.
+#[test]
+fn psychoacoustic_analysis_frame_count_matches_hop_size() {
+    let sr = 44_100u32;
+    let sig = sine_signal(997.0, sr as usize, sr);
+    let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
+
+    // Expected frames: ceil((n - FRAME_SIZE) / HOP_SIZE) + 1 ≈ 1723 for 1 s @ 44.1 kHz.
+    let expected = (sig.len() - FRAME_SIZE) / HOP_SIZE + 1;
+    assert!(
+        (analysis.num_frames() as isize - expected as isize).abs() <= 2,
+        "frame count should be ~{expected}, got {}",
+        analysis.num_frames()
+    );
+    assert_eq!(
+        analysis.num_bins, FRAME_SIZE / 2 + 1,
+        "num_bins should equal FRAME_SIZE / 2 + 1"
+    );
+}
+
+/// Phase 4.1: A loud tone raises the masking threshold in its own frequency region.
+#[test]
+fn psychoacoustic_analysis_loud_tone_raises_threshold() {
+    let sr = 44_100u32;
+    let loud = sine_signal(1_000.0, sr as usize, sr); // 0 dBFS 1 kHz
+    let silent = vec![0.0f64; sr as usize];
+
+    let a_loud = PsychoacousticAnalysis::analyze(&loud, sr);
+    let a_silent = PsychoacousticAnalysis::analyze(&silent, sr);
+
+    // Sample in the middle of the signal to avoid transient onset effects.
+    let t_loud = a_loud.threshold_for_sample(sr as usize / 2);
+    let t_silent = a_silent.threshold_for_sample(sr as usize / 2);
+
+    let bin_1k = (1_000.0 * (FRAME_SIZE / 2) as f64 / (sr as f64 / 2.0)).round() as usize;
+    assert!(
+        t_loud[bin_1k] > t_silent[bin_1k],
+        "loud 1 kHz tone should raise the masking threshold at 1 kHz"
+    );
+}
+
+/// Phase 4.1: Spreading — a 1 kHz tone elevates the threshold in neighboring
+/// Bark bands, not just in its own bin.
+#[test]
+fn psychoacoustic_analysis_spreading_elevates_adjacent_bark_bands() {
+    let sr = 44_100u32;
+    let sig = sine_signal(1_000.0, sr as usize, sr);
+    let silent = vec![0.0f64; sr as usize];
+
+    let a_sig = PsychoacousticAnalysis::analyze(&sig, sr);
+    let a_sil = PsychoacousticAnalysis::analyze(&silent, sr);
+
+    let t_sig = a_sig.threshold_for_sample(sr as usize / 2);
+    let t_sil = a_sil.threshold_for_sample(sr as usize / 2);
+
+    // Bins within one Bark band of 1 kHz (900–1200 Hz) should see elevated thresholds.
+    let bin = |f: f64| -> usize {
+        (f * (FRAME_SIZE / 2) as f64 / (sr as f64 / 2.0)).round() as usize
+    };
+    assert!(
+        t_sig[bin(900.0)] > t_sil[bin(900.0)],
+        "spreading should elevate threshold near 900 Hz"
+    );
+    assert!(
+        t_sig[bin(1_200.0)] > t_sil[bin(1_200.0)],
+        "spreading should elevate threshold near 1.2 kHz"
+    );
+}
+
+/// Phase 4.1: Masking is weaker far from the masker than near it (spreading
+/// function rolls off with Bark-distance).
+#[test]
+fn psychoacoustic_analysis_masking_rolls_off_with_bark_distance() {
+    let sr = 44_100u32;
+    let sig = sine_signal(1_000.0, sr as usize, sr);
+    let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
+
+    let t = analysis.threshold_for_sample(sr as usize / 2);
+
+    let bin = |f: f64| -> usize {
+        (f * (FRAME_SIZE / 2) as f64 / (sr as f64 / 2.0)).round() as usize
+    };
+
+    // Threshold near the masker (1 kHz) should be much higher than far away (8 kHz).
+    assert!(
+        t[bin(1_000.0)] > t[bin(8_000.0)] * 2.0,
+        "masking should roll off with Bark distance from the 1 kHz masker"
+    );
+}
+
+/// Phase 4.1: All thresholds must be positive (≥ ATH > 0 everywhere).
+#[test]
+fn psychoacoustic_analysis_all_thresholds_positive() {
+    let sr = 44_100u32;
+    let sig = sine_signal(440.0, sr as usize / 4, sr);
+    let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
+
+    for (fi, frame) in analysis.thresholds.iter().enumerate() {
+        for (bi, &t) in frame.iter().enumerate() {
+            assert!(
+                t > 0.0,
+                "threshold must be > 0 everywhere (frame {fi}, bin {bi})"
+            );
+        }
+    }
+}
+
+/// Phase 4.1: `threshold_for_sample` must not panic on out-of-range indices.
+#[test]
+fn psychoacoustic_analysis_threshold_clamps_gracefully() {
+    let sig = vec![0.1f64; 2048];
+    let a = PsychoacousticAnalysis::analyze(&sig, 44_100);
+    let t = a.threshold_for_sample(usize::MAX);
+    assert_eq!(t.len(), a.num_bins);
 }
