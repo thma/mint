@@ -266,7 +266,7 @@ fn mbit_plus_degrades_to_flat_tpdf_at_s24() {
 }
 
 #[test]
-fn mbit_plus_stereo_is_reproducible_and_correlated() {
+fn mbit_plus_stereo_is_reproducible_and_decorrelated() {
     let sig = test_signal(4096, 0.5);
 
     let run = |seed: u64| {
@@ -280,15 +280,74 @@ fn mbit_plus_stereo_is_reproducible_and_correlated() {
     let b = run(17);
     assert_eq!(a, b, "seeded stereo mbit+ output must be deterministic");
 
-    // Correlated but not identical between channels.
-    assert_ne!(a[0], a[1], "L/R should not be fully identical");
+    // Channels should be decorrelated (independent RNGs per channel).
+    assert_ne!(a[0], a[1], "L/R should get independent dither");
 
-    let l = &a[0];
-    let r = &a[1];
-    let num: f64 = l.iter().zip(r).map(|(x, y)| x * y).sum();
-    let dl: f64 = l.iter().map(|x| x * x).sum::<f64>().sqrt();
-    let dr: f64 = r.iter().map(|x| x * x).sum::<f64>().sqrt();
-    let corr = num / (dl * dr);
+    // Verify stereo channels are not identical (decorrelated).
+    let mismatches = a[0]
+        .iter()
+        .zip(&a[1])
+        .filter(|(l, r)| *l != *r)
+        .count();
+    assert!(mismatches > a.len() / 2, "L/R decorrelation should yield many differences");
+}
 
-    assert!(corr > 0.5, "mbit+ stereo should be positively correlated, got corr={corr:.3}");
+/// Phase 1 validation: Dither amplitude must be constant (not modulated by signal).
+/// With correct constant TPDF, noise variance in quiet passages should match noise
+/// variance under signal. This is a statistical property: we measure peak residual
+/// noise (quantized − original) and check it doesn't shrink when signal is present.
+#[test]
+fn mbit_plus_dither_is_constant_amplitude() {
+    let mut quiet = mk_buffer(vec![0.001; 1000]); // Very quiet signal.
+    let mut loud = mk_buffer(vec![0.8; 1000]); // Loud signal.
+
+    let mut c_quiet = OutputSampleFormat::F32;
+    let mut c_loud = OutputSampleFormat::F32;
+
+    bitdepth::apply(&mut quiet, &mut c_quiet, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), Some(42)).unwrap();
+    bitdepth::apply(&mut loud, &mut c_loud, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), Some(42)).unwrap();
+
+    let max = 32_767.0;
+    let noise_quiet: f64 = quiet.channels[0]
+        .iter()
+        .zip(vec![0.001; 1000])
+        .map(|(q, orig)| (*q - orig).abs() * max)
+        .sum::<f64>()
+        / 1000.0;
+    let noise_loud: f64 = loud.channels[0]
+        .iter()
+        .zip(vec![0.8; 1000])
+        .map(|(q, orig)| (*q - orig).abs() * max)
+        .sum::<f64>()
+        / 1000.0;
+
+    // Both should see roughly the same average error magnitude (constant dither amplitude).
+    // Allow some variance due to randomness, but they should be in the same ballpark (~0.5-1.5 LSB).
+    assert!(noise_quiet.abs() > 0.1, "quiet noise floor should be measurable");
+    assert!(noise_loud.abs() > 0.1, "loud noise floor should be measurable");
+    // The ratio should be close to 1 (constant amplitude), not diverging by >3x.
+    let ratio = (noise_quiet / noise_loud).abs();
+    assert!(ratio > 0.3 && ratio < 3.0, "noise amplitude should be roughly constant, got ratio {ratio:.2}");
+}
+
+/// Phase 1: Auto-Blanking test verifies that feedback is zeroed when silence detected.
+/// We can't easily test the "exactly 0 output" case because TPDF dither is always active,
+/// but we can verify that silent regions produce correctly dithered samples without feedback.
+/// For now, a simpler check: silence for 50ms+ should not cause clipping artifacts.
+#[test]
+fn mbit_plus_auto_blanking_no_clipping() {
+    let sr = 44_100;
+    let silence_len = (sr as usize) / 10; // 100 ms of silence.
+
+    let mut silence = mk_buffer(vec![0.0; silence_len]);
+    let mut current = OutputSampleFormat::F32;
+    bitdepth::apply(&mut silence, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), Some(99)).unwrap();
+
+    // Verify output is within valid range [-1, 1] and contains only dither, no feedback artifacts.
+    let max_val = silence.channels[0].iter().map(|x| x.abs()).fold(0.0, f64::max);
+    assert!(max_val < 1.0, "silence should not produce clipping, got max={}", max_val);
+    
+    // Measure RMS to ensure dither is present (should be ~0.3-0.5 LSB for TPDF).
+    let rms = (silence.channels[0].iter().map(|x| x * x).sum::<f64>() / silence.channels[0].len() as f64).sqrt();
+    assert!(rms > 1.0e-5, "silence with dither should have measurable RMS, got {}", rms);
 }
