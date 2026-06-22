@@ -539,6 +539,7 @@ dependencies = [
  "rand",
  "rayon",
  "rubato",
+ "rustfft",
  "serde",
  "serde_json",
  "symphonia",

@@ -34,6 +34,10 @@ impl MbitPlusStrength {
         }
     }
 
+    pub fn coeffs_for_rate(self, sample_rate: u32) -> &'static [f64] {
+        self.coeffs(sample_rate)
+    }
+
     /// FIR-Koeffizienten für diese Stärke @ 44.1 kHz.
     fn coeffs_441(&self) -> &'static [f64] {
         match self {
@@ -166,6 +170,15 @@ pub fn quantize(
 
             // Auto-blanking: when silent long enough, shut off dither and feedback.
             if state.should_blank(x) {
+                buffer.channels[ch][n] = 0.0;
+                state.reset();
+                continue;
+            }
+
+            // True digital silence stays silent. We still keep the blanking counter
+            // updated above so a near-silent tail can trigger the same reset path,
+            // but once the input is exactly zero there is no reason to add dither.
+            if x == 0.0 {
                 buffer.channels[ch][n] = 0.0;
                 state.reset();
                 continue;

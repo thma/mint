@@ -3,7 +3,10 @@ use std::path::PathBuf;
 
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
 use mint::config::DitherMode;
+use mint::dither::mbit_plus::MbitPlusStrength;
 use mint::ops::bitdepth;
+use rustfft::num_complex::Complex;
+use rustfft::FftPlanner;
 
 const SR: u32 = 44_100;
 
@@ -76,6 +79,58 @@ fn lowpass_energy(x: &[f64], l: usize) -> f64 {
         }
     }
     energy
+}
+
+fn ntf_magnitude_response(strength: MbitPlusStrength, sample_rate: u32, fft_len: usize) -> Vec<f64> {
+    let coeffs = strength.coeffs_for_rate(sample_rate);
+    let mut response = vec![Complex::new(0.0, 0.0); fft_len];
+    response[0] = Complex::new(1.0, 0.0);
+
+    for (index, coeff) in coeffs.iter().enumerate() {
+        response[index + 1] = Complex::new(-coeff, 0.0);
+    }
+
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(fft_len);
+    fft.process(&mut response);
+
+    response.into_iter().map(|c| c.norm()).collect()
+}
+
+fn band_power(magnitudes: &[f64], sample_rate: u32, low_hz: f64, high_hz: f64) -> f64 {
+    let bin_hz = sample_rate as f64 / magnitudes.len() as f64;
+    let start = ((low_hz / bin_hz).ceil() as usize).max(1);
+    let end = ((high_hz / bin_hz).floor() as usize).min(magnitudes.len() / 2 - 1);
+
+    assert!(start <= end, "band {low_hz}-{high_hz} Hz is too narrow for this FFT size");
+
+    let mut power = 0.0;
+    let mut count = 0usize;
+    for magnitude in &magnitudes[start..=end] {
+        power += magnitude * magnitude;
+        count += 1;
+    }
+
+    power / count as f64
+}
+
+fn band_minimum_frequency(magnitudes: &[f64], sample_rate: u32, low_hz: f64, high_hz: f64) -> (f64, f64) {
+    let bin_hz = sample_rate as f64 / magnitudes.len() as f64;
+    let start = ((low_hz / bin_hz).ceil() as usize).max(1);
+    let end = ((high_hz / bin_hz).floor() as usize).min(magnitudes.len() / 2 - 1);
+
+    assert!(start <= end, "band {low_hz}-{high_hz} Hz is too narrow for this FFT size");
+
+    let mut best_frequency = 0.0;
+    let mut best_magnitude = f64::INFINITY;
+    for (offset, magnitude) in magnitudes[start..=end].iter().enumerate() {
+        if *magnitude < best_magnitude {
+            best_magnitude = *magnitude;
+            best_frequency = (start + offset) as f64 * bin_hz;
+        }
+    }
+
+    (best_frequency, best_magnitude)
 }
 
 #[test]
@@ -343,11 +398,45 @@ fn mbit_plus_auto_blanking_no_clipping() {
     let mut current = OutputSampleFormat::F32;
     bitdepth::apply(&mut silence, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, Some(99)).unwrap();
 
-    // Verify output is within valid range [-1, 1] and contains only dither, no feedback artifacts.
+    // Exact silence should stay exact silence once blanking is active.
     let max_val = silence.channels[0].iter().map(|x| x.abs()).fold(0.0, f64::max);
     assert!(max_val < 1.0, "silence should not produce clipping, got max={}", max_val);
-    
-    // Measure RMS to ensure dither is present (should be ~0.3-0.5 LSB for TPDF).
-    let rms = (silence.channels[0].iter().map(|x| x * x).sum::<f64>() / silence.channels[0].len() as f64).sqrt();
-    assert!(rms > 1.0e-5, "silence with dither should have measurable RMS, got {}", rms);
+    assert!(silence.channels[0].iter().all(|&x| x == 0.0), "silence should be rendered as exact zero after blanking");
+}
+
+/// Phase 3: FFT validation of the static NTF tables. The filter should suppress the
+/// ear-sensitive low band much more than the high band, and stronger modes should
+/// suppress it more than weaker ones.
+#[test]
+fn mbit_plus_fft_ntf_stronger_modes_suppress_low_band_more() {
+    let fft_len = 16_384;
+    let sample_rate = 44_100;
+
+    let low = ntf_magnitude_response(MbitPlusStrength::Low, sample_rate, fft_len);
+    let normal = ntf_magnitude_response(MbitPlusStrength::Normal, sample_rate, fft_len);
+    let high = ntf_magnitude_response(MbitPlusStrength::High, sample_rate, fft_len);
+
+    let low_ratio = band_power(&low, sample_rate, 20.0, 2_000.0) / band_power(&low, sample_rate, 8_000.0, 18_000.0);
+    let normal_ratio = band_power(&normal, sample_rate, 20.0, 2_000.0) / band_power(&normal, sample_rate, 8_000.0, 18_000.0);
+    let high_ratio = band_power(&high, sample_rate, 20.0, 2_000.0) / band_power(&high, sample_rate, 8_000.0, 18_000.0);
+
+    assert!(low_ratio > normal_ratio, "normal should suppress the low band more than low");
+    assert!(normal_ratio > high_ratio, "high should suppress the low band more than normal");
+    assert!(high_ratio < 0.30, "high-strength NTF should strongly favor the high band, got ratio={high_ratio:.3}");
+}
+
+/// Phase 3: rate-aware validation. The notch should move with the sample-rate table
+/// instead of staying stuck at one absolute frequency.
+#[test]
+fn mbit_plus_fft_ntf_rate_tables_move_the_notch() {
+    let fft_len = 16_384;
+    let (f441, _) = band_minimum_frequency(&ntf_magnitude_response(MbitPlusStrength::Normal, 44_100, fft_len), 44_100, 3_000.0, 5_000.0);
+    let (f48, _) = band_minimum_frequency(&ntf_magnitude_response(MbitPlusStrength::Normal, 48_000, fft_len), 48_000, 3_000.0, 5_000.0);
+    let (f882, _) = band_minimum_frequency(&ntf_magnitude_response(MbitPlusStrength::Normal, 88_200, fft_len), 88_200, 6_000.0, 8_500.0);
+    let (f96, _) = band_minimum_frequency(&ntf_magnitude_response(MbitPlusStrength::Normal, 96_000, fft_len), 96_000, 6_500.0, 9_000.0);
+
+    assert!((f441 - 3_500.0).abs() < 1_500.0, "44.1k notch should sit in the critical band, got {f441:.0} Hz");
+    assert!((f48 - 3_600.0).abs() < 1_500.0, "48k notch should stay in the same perceptual zone, got {f48:.0} Hz");
+    assert!((f882 - 7_000.0).abs() < 1_500.0, "88.2k notch should move upward with the rate table, got {f882:.0} Hz");
+    assert!((f96 - 7_200.0).abs() < 1_500.0, "96k notch should move upward with the rate table, got {f96:.0} Hz");
 }

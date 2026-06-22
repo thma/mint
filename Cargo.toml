@@ -42,3 +42,4 @@ mp3 = ["dep:mp3lame-encoder"]
 
 [dev-dependencies]
 approx = "0.5"
+rustfft = "6.2"
