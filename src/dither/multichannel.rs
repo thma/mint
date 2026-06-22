@@ -67,62 +67,54 @@ impl MultiChannelDither {
     /// Generate TPDF dither samples for all channels.
     ///
     /// Returns a vector of `num_channels` dither values, each in range [-1, 1] LSB.
+    /// Allocating convenience wrapper; the per-sample quantizer loop should call
+    /// [`sample_lsb_all_into`](Self::sample_lsb_all_into) with a reused buffer.
     pub fn sample_lsb_all(&mut self) -> Vec<f64> {
+        let mut out = Vec::with_capacity(self.num_channels);
+        self.sample_lsb_all_into(&mut out);
+        out
+    }
+
+    /// Fill `out` (cleared first) with one dither value per channel — same RNG draw
+    /// order as [`sample_lsb_all`], without allocating on the hot path.
+    pub fn sample_lsb_all_into(&mut self, out: &mut Vec<f64>) {
+        out.clear();
         match self.correlation {
-            DitherCorrelation::Decorrelated => self.sample_decorrelated(),
-            DitherCorrelation::Correlated => self.sample_correlated(),
-            DitherCorrelation::MidSide => self.sample_mid_side(),
+            DitherCorrelation::Decorrelated => self.fill_decorrelated(out),
+            DitherCorrelation::Correlated => {
+                let a = self.shared_rng.gen_range(-0.5_f64..0.5_f64);
+                let b = self.shared_rng.gen_range(-0.5_f64..0.5_f64);
+                out.resize(self.num_channels, a + b);
+            }
+            DitherCorrelation::MidSide => {
+                // True M-S only defined for stereo; otherwise decorrelated fallback.
+                if self.num_channels != 2 {
+                    self.fill_decorrelated(out);
+                    return;
+                }
+                let m = {
+                    let a = self.per_ch_rngs[0].gen_range(-0.5_f64..0.5_f64);
+                    let b = self.per_ch_rngs[0].gen_range(-0.5_f64..0.5_f64);
+                    a + b
+                };
+                let s = {
+                    let a = self.per_ch_rngs[1].gen_range(-0.5_f64..0.5_f64);
+                    let b = self.per_ch_rngs[1].gen_range(-0.5_f64..0.5_f64);
+                    a + b
+                };
+                out.push((m + s) / 2.0);
+                out.push((m - s) / 2.0);
+            }
         }
     }
 
-    /// Decorrelated mode: each channel gets independent TPDF.
-    fn sample_decorrelated(&mut self) -> Vec<f64> {
-        self.per_ch_rngs
-            .iter_mut()
-            .map(|rng| {
-                let a = rng.gen_range(-0.5_f64..0.5_f64);
-                let b = rng.gen_range(-0.5_f64..0.5_f64);
-                a + b
-            })
-            .collect()
-    }
-
-    /// Correlated mode: all channels share the same dither.
-    fn sample_correlated(&mut self) -> Vec<f64> {
-        let a = self.shared_rng.gen_range(-0.5_f64..0.5_f64);
-        let b = self.shared_rng.gen_range(-0.5_f64..0.5_f64);
-        let shared_dither = a + b;
-        vec![shared_dither; self.num_channels]
-    }
-
-    /// Mid-Side mode: dither applied to M and S channels, then reconstructed.
-    ///
-    /// For stereo (2 channels):
-    /// - M = L + R, S = L - R
-    /// - Generate two independent TPDF samples for M and S
-    /// - Reconstruct: L_out = (M + S) / 2, R_out = (M - S) / 2
-    ///
-    /// For >2 channels: falls back to decorrelated (true M-S only defined for stereo).
-    fn sample_mid_side(&mut self) -> Vec<f64> {
-        if self.num_channels != 2 {
-            // Multi-channel M-S not defined; use decorrelated fallback.
-            return self.sample_decorrelated();
+    /// Decorrelated mode: each channel gets independent TPDF (writes into `out`).
+    fn fill_decorrelated(&mut self, out: &mut Vec<f64>) {
+        for rng in self.per_ch_rngs.iter_mut() {
+            let a = rng.gen_range(-0.5_f64..0.5_f64);
+            let b = rng.gen_range(-0.5_f64..0.5_f64);
+            out.push(a + b);
         }
-
-        // Generate independent dither for mid and side.
-        let m_a = self.per_ch_rngs[0].gen_range(-0.5_f64..0.5_f64);
-        let m_b = self.per_ch_rngs[0].gen_range(-0.5_f64..0.5_f64);
-        let m_dither = m_a + m_b;
-
-        let s_a = self.per_ch_rngs[1].gen_range(-0.5_f64..0.5_f64);
-        let s_b = self.per_ch_rngs[1].gen_range(-0.5_f64..0.5_f64);
-        let s_dither = s_a + s_b;
-
-        // Reconstruct to L and R.
-        let l_dither = (m_dither + s_dither) / 2.0;
-        let r_dither = (m_dither - s_dither) / 2.0;
-
-        vec![l_dither, r_dither]
     }
 }
 

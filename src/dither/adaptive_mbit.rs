@@ -15,7 +15,9 @@
 //! - Oppenheim & Schafer (1989), "Discrete-Time Signal Processing", Chapter 13 (cepstrum)
 //! - Blauert & Laws (1978), "Group Delay Distortions in Electroacoustics", JAES
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use std::sync::Arc;
+
+use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
 use crate::dither::psychoacoustic::PsychoacousticAnalysis;
 use crate::audio::buffer::AudioBuffer;
@@ -26,6 +28,18 @@ use crate::dither::multichannel::MultiChannelDither;
 /// across many bands) with computational cost and numerical stability. Typical range
 /// is 5-15 taps for s16 quantization.
 pub const MAX_FILTER_ORDER: usize = 9;
+
+/// NTF magnitude swing cap (dB) for the **masking-adaptive** per-frame curve. Tight
+/// enough that a low-order FIR tracks the spiky masking threshold without wasting
+/// taps chasing its band edges (the ATH rise near Nyquist alone spans 40+ dB).
+/// ±9 dB maximizes the noise-to-mask improvement on the verification harness.
+const MASK_CLAMP_DB: f64 = 9.0;
+
+/// NTF magnitude swing cap (dB) for the **fixed ATH-optimal floor**. The ATH curve
+/// is smooth, so a larger swing is well-conditioned and reproduces the deep ~4 kHz
+/// notch; ±16 dB matches/exceeds the published Lipshitz curve on the idle floor.
+/// (Beyond ~18 dB the low-order cepstral reconstruction destabilizes.)
+const FLOOR_CLAMP_DB: f64 = 16.0;
 
 /// An adaptive noise-shaper built from psychoacoustic masking thresholds.
 ///
@@ -57,19 +71,58 @@ pub struct AdaptiveShaper {
 impl AdaptiveShaper {
     /// Design an adaptive shaper from a complete psychoacoustic analysis.
     ///
+    /// Each frame gets the perceptually better of two candidates, judged against
+    /// that frame's own masking threshold:
+    /// - a **masking-adaptive** curve (tracks the threshold; exploits masking when
+    ///   the program is loud), and
+    /// - a **fixed ATH-optimal floor** (best when the program does not mask).
+    ///
+    /// The per-frame selection guarantees the result is never more audible than the
+    /// fixed floor on any frame — so in quiet/exposed passages the adaptive path is
+    /// never worse than a fixed shaper, while loud passages still gain from masking.
+    ///
     /// # Arguments
     /// - `analysis`: per-frame masking thresholds from Phase 4.1
     /// - `target_order`: desired FIR order (≤ `MAX_FILTER_ORDER`)
-    ///
-    /// Returns a shaper ready to interpolate coefficients during quantization.
     pub fn from_analysis(analysis: &PsychoacousticAnalysis, target_order: usize) -> Self {
         let target_order = target_order.min(MAX_FILTER_ORDER);
-        let mut coeffs_per_frame = Vec::new();
 
-        for threshold_spectrum in &analysis.thresholds {
-            let coeffs = design_minimal_phase_fir(threshold_spectrum, target_order);
-            coeffs_per_frame.push(coeffs);
-        }
+        // Plan the FFTs once and reuse them across every per-frame design — the
+        // analysis can have thousands of frames, so per-call planning would dominate.
+        let n_fft = (analysis.num_bins - 1) * 2;
+        let mut planner = FftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(n_fft);
+        let ifft = planner.plan_fft_inverse(n_fft);
+
+        // Fixed ATH-optimal floor, designed once. The safety net (see doc above).
+        let ath = crate::dither::psychoacoustic::ath_amplitude(analysis.sample_rate, analysis.num_bins);
+        let floor = design_minimal_phase_fir(&ath, target_order, FLOOR_CLAMP_DB, &fft, &ifft);
+
+        // Precompute cos/sin of (i+1)·ω_k once: the per-frame selection evaluates
+        // |NTF(ω_k)|² over hundreds of bins for thousands of frames, so the trig
+        // must not live in that loop. `trig[k] = (cos[i], sin[i])` for i<order.
+        let trig = ntf_eval_tables(analysis.num_bins, target_order);
+
+        let mut inv_thr_sq = vec![0.0f64; analysis.num_bins];
+        let coeffs_per_frame = analysis
+            .thresholds
+            .iter()
+            .map(|thr| {
+                for (w, &t) in inv_thr_sq.iter_mut().zip(thr.iter()) {
+                    let t = t.max(1e-30);
+                    *w = 1.0 / (t * t);
+                }
+                let adaptive = design_minimal_phase_fir(thr, target_order, MASK_CLAMP_DB, &fft, &ifft);
+                // Keep whichever is less audible against THIS frame's threshold.
+                if perceptual_noise(&adaptive, &inv_thr_sq, &trig)
+                    <= perceptual_noise(&floor, &inv_thr_sq, &trig)
+                {
+                    adaptive
+                } else {
+                    floor.clone()
+                }
+            })
+            .collect();
 
         AdaptiveShaper {
             coeffs_per_frame,
@@ -81,36 +134,43 @@ impl AdaptiveShaper {
 
     /// Get the interpolated feedback coefficients for sample index `n`.
     ///
-    /// Returns a vector of length = designed FIR order. For a given sample, the
-    /// coefficients are linearly interpolated between the two surrounding analysis
-    /// frames, ensuring smooth transitions without audible discontinuities.
+    /// Convenience wrapper that allocates; the per-sample quantizer loop should use
+    /// [`coeffs_for_sample_into`](Self::coeffs_for_sample_into) with a reused buffer.
     pub fn coeffs_for_sample(&self, n: usize) -> Vec<f64> {
+        let mut out = Vec::new();
+        self.coeffs_for_sample_into(n, &mut out);
+        out
+    }
+
+    /// Write the interpolated feedback coefficients for sample index `n` into `out`
+    /// (cleared first). For a given sample, the coefficients are linearly
+    /// interpolated between the two surrounding analysis frames — smooth transitions
+    /// without zipper artifacts — without allocating on the hot path.
+    pub fn coeffs_for_sample_into(&self, n: usize, out: &mut Vec<f64>) {
+        out.clear();
         if self.coeffs_per_frame.is_empty() {
-            return vec![0.0; MAX_FILTER_ORDER];
+            out.resize(MAX_FILTER_ORDER, 0.0);
+            return;
         }
 
         let frame_n = n / self.hop_size;
-        let sample_in_frame = n % self.hop_size;
-        let alpha = sample_in_frame as f64 / self.hop_size as f64;
+        let last = self.coeffs_per_frame.len() - 1;
+        let coeffs_cur = &self.coeffs_per_frame[frame_n.min(last)];
 
-        // Current frame coefficients.
-        let coeffs_cur = &self.coeffs_per_frame[frame_n.min(self.coeffs_per_frame.len() - 1)];
-        let len = coeffs_cur.len();
-
-        // If at the last frame, no interpolation needed.
-        if frame_n + 1 >= self.coeffs_per_frame.len() {
-            return coeffs_cur.clone();
+        // At (or past) the last frame there is nothing to interpolate toward.
+        if frame_n >= last {
+            out.extend_from_slice(coeffs_cur);
+            return;
         }
 
         // Linear interpolation between this frame and the next.
         let coeffs_next = &self.coeffs_per_frame[frame_n + 1];
-        (0..len)
-            .map(|k| {
-                let c_cur = coeffs_cur.get(k).copied().unwrap_or(0.0);
-                let c_next = coeffs_next.get(k).copied().unwrap_or(0.0);
-                c_cur * (1.0 - alpha) + c_next * alpha
-            })
-            .collect()
+        let alpha = (n % self.hop_size) as f64 / self.hop_size as f64;
+        out.extend((0..coeffs_cur.len()).map(|k| {
+            let c_cur = coeffs_cur[k];
+            let c_next = coeffs_next.get(k).copied().unwrap_or(0.0);
+            c_cur * (1.0 - alpha) + c_next * alpha
+        }));
     }
 
     /// Number of adaptive frames (one per analysis frame).
@@ -131,87 +191,115 @@ impl AdaptiveShaper {
 
 // ─── Minimal-phase filter design ──────────────────────────────────────────────
 
-/// Design a minimal-phase FIR of a given order from a target amplitude spectrum.
+/// Design the error-feedback taps of a **monic, minimal-phase** noise-transfer
+/// function whose magnitude tracks the masking threshold: `|NTF(f)| ∝ threshold(f)`.
 ///
-/// The algorithm:
-/// 1. Compute the target squared magnitude: S = |target|²
-/// 2. Real cepstral analysis: log-FFT of S, truncate to get the real cepstrum
-/// 3. Exponential lift + spectral factorization → minimal-phase response
-/// 4. Extract FIR coefficients (impulse response)
-/// 5. Normalize to prevent instability
+/// This is the perceptually optimal shape — minimizing the masked noise power
+/// `∫ |NTF|²/threshold² df` subject to the Gerzon–Craven constraint
+/// `∫ ln|NTF| df = 0` yields exactly `|NTF| ∝ threshold` (Lagrange). The minimal
+/// phase + monic (`ntf[0] = 1`) form is the realizable, stable error-feedback loop.
+///
+/// Algorithm (Oppenheim & Schafer, complex-cepstrum minimal-phase reconstruction):
+/// 1. log-magnitude of the target, deviations clamped to ±`MAX_NTF_SHAPE_DB`
+///    (overload safety — bounds the loop's peak gain).
+/// 2. real cepstrum `c = IDFT(log|target|)`.
+/// 3. causal lifter with the DC term **zeroed** ⇒ geometric mean 1 ⇒ `ntf[0] = 1`
+///    (monic) and Gerzon–Craven satisfied automatically.
+/// 4. `NTF = exp(DFT(ĉ))`, then `ntf = IDFT(NTF)`.
+/// 5. feedback taps `coeffs[k] = −ntf[k+1]`, since the loop runs
+///    `NTF(z) = 1 − Σ coeffs[k]·z^-(k+1)`.
 ///
 /// # Arguments
-/// - `target_spectrum`: target amplitude response (linear scale, one-sided FFT)
-/// - `order`: desired FIR length
-///
-/// Returns FIR coefficients ordered as `[h_0, h_1, ..., h_{order-1}]`, normalized
-/// to maximum magnitude ≤ 1.0 for numerical stability.
-fn design_minimal_phase_fir(target_spectrum: &[f64], order: usize) -> Vec<f64> {
-    let n_fft = (target_spectrum.len() - 1) * 2; // Reconstruct the FFT size.
-    let order = order.min(n_fft / 2).max(1);
+/// - `target_spectrum`: desired `|NTF|` shape (one-sided, length `FRAME_SIZE/2+1`).
+/// - `order`: number of feedback taps (≤ `MAX_FILTER_ORDER`).
+/// - `max_shape_db`: cap on the NTF magnitude swing (see `MASK_CLAMP_DB` / `FLOOR_CLAMP_DB`).
+/// - `fft`, `ifft`: pre-planned size-`n_fft` transforms (shared across frames).
+fn design_minimal_phase_fir(
+    target_spectrum: &[f64],
+    order: usize,
+    max_shape_db: f64,
+    fft: &Arc<dyn Fft<f64>>,
+    ifft: &Arc<dyn Fft<f64>>,
+) -> Vec<f64> {
+    let n_bins = target_spectrum.len();
+    let n_fft = (n_bins - 1) * 2; // Reconstruct the FFT size.
+    let order = order.min(MAX_FILTER_ORDER).max(1);
 
-    // Step 1: Squared magnitude spectrum with regularization to prevent log blow-up.
-    // Clamp to [1e-6, ∞) to avoid log of very small numbers.
-    let s_mag: Vec<f64> = target_spectrum
-        .iter()
-        .map(|&m| (m * m).max(1e-6).min(1e6))
-        .collect();
-
-    // Step 2: Real cepstral analysis via log-FFT.
-    let mut log_s = vec![Complex::new(0.0, 0.0); n_fft];
-    for k in 0..s_mag.len() {
-        log_s[k] = Complex::new(s_mag[k].ln(), 0.0);
+    // Step 1: log-magnitude, with deviations from the geometric mean clamped so the
+    // resulting NTF cannot demand an unbounded peak gain. The exact monic
+    // normalization is enforced in step 3 (DC of the cepstrum zeroed), so here we
+    // only need the mean to center the clamp window.
+    let max_ln = max_shape_db * std::f64::consts::LN_10 / 20.0;
+    let mut logmag: Vec<f64> = target_spectrum.iter().map(|&m| m.max(1e-12).ln()).collect();
+    // Two-sided mean of the log magnitude (DC & Nyquist count once, the rest twice).
+    let mean = (logmag[0]
+        + logmag[n_bins - 1]
+        + 2.0 * logmag[1..n_bins - 1].iter().sum::<f64>())
+        / n_fft as f64;
+    for v in logmag.iter_mut() {
+        *v = (*v - mean).clamp(-max_ln, max_ln);
     }
 
-    // Inverse FFT to get real cepstrum.
-    let mut planner = FftPlanner::<f64>::new();
-    let ifft = planner.plan_fft_inverse(n_fft);
-    ifft.process(&mut log_s);
-
-    // Step 3: Truncate to minimal-phase (keep only causal part: bins 0 … order/2).
-    // Double the DC and fold the Nyquist (if present) for energy preservation.
-    let mut min_phase_cepstrum = vec![Complex::new(0.0, 0.0); n_fft];
-    min_phase_cepstrum[0] = log_s[0] * Complex::new(2.0, 0.0); // DC doubled.
-    for n in 1..=(order / 2).min(n_fft / 2 - 1) {
-        min_phase_cepstrum[n] = log_s[n] * Complex::new(2.0, 0.0);
+    // Step 2: build the even, two-sided log-magnitude spectrum and IDFT it to the
+    // real cepstrum. (rustfft is unnormalized, so divide the inverse by n_fft.)
+    let mut spec = vec![Complex::new(0.0, 0.0); n_fft];
+    spec[0] = Complex::new(logmag[0], 0.0);
+    spec[n_fft / 2] = Complex::new(logmag[n_bins - 1], 0.0);
+    for k in 1..n_bins - 1 {
+        spec[k] = Complex::new(logmag[k], 0.0);
+        spec[n_fft - k] = Complex::new(logmag[k], 0.0); // mirror for an even spectrum
     }
 
-    // FFT back to frequency domain.
-    let fft = planner.plan_fft_forward(n_fft);
-    let mut log_h_min = min_phase_cepstrum;
-    fft.process(&mut log_h_min);
+    ifft.process(&mut spec);
+    let cep: Vec<f64> = spec.iter().map(|c| c.re / n_fft as f64).collect();
 
-    // Exponentiate to get the minimum-phase magnitude response.
-    let h_min: Vec<f64> = log_h_min
-        .iter()
-        .map(|&c| (c.re / n_fft as f64).exp().max(1e-10))
-        .collect();
-
-    // Step 4: Inverse FFT to get the impulse response (FIR coefficients).
-    let mut h_coeffs = h_min
-        .iter()
-        .map(|&m| Complex::new(m, 0.0))
-        .collect::<Vec<_>>();
-
-    let ifft2 = planner.plan_fft_inverse(n_fft);
-    ifft2.process(&mut h_coeffs);
-
-    // Extract the first `order` real parts (causal taps).
-    let mut coeffs: Vec<f64> = h_coeffs
-        .iter()
-        .take(order)
-        .map(|c| c.re / n_fft as f64)
-        .collect();
-
-    // Step 5: Normalize to prevent runaway amplification. Scale so that the maximum
-    // coefficient magnitude is at most 1.0, or slightly less to preserve dynamics.
-    let max_coeff = coeffs.iter().map(|c| c.abs()).fold(0.0, f64::max);
-    if max_coeff > 1.0 {
-        let scale = 0.9 / (max_coeff + 1e-10);
-        coeffs.iter_mut().for_each(|c| *c *= scale);
+    // Step 3: minimal-phase complex cepstrum — causal lifter, DC zeroed for a monic
+    // NTF (ĉ[0]=0 ⇒ ntf[0]=exp(0)=1).
+    let mut mp = vec![Complex::new(0.0, 0.0); n_fft];
+    for n in 1..n_fft / 2 {
+        mp[n] = Complex::new(2.0 * cep[n], 0.0);
     }
+    mp[n_fft / 2] = Complex::new(cep[n_fft / 2], 0.0);
 
-    coeffs
+    // Step 4: log NTF = DFT(ĉ); NTF = exp(·); ntf impulse response = IDFT(NTF).
+    fft.process(&mut mp);
+    let mut ntf_spec: Vec<Complex<f64>> = mp.iter().map(|c| c.exp()).collect();
+    ifft.process(&mut ntf_spec);
+    let ntf: Vec<f64> = ntf_spec.iter().map(|c| c.re / n_fft as f64).collect();
+
+    // Step 5: feedback taps coeffs[k] = −ntf[k+1] (ntf[0] ≈ 1, the monic term).
+    (0..order).map(|k| -ntf[k + 1]).collect()
+}
+
+/// Per-bin `(cos((i+1)ω_k), sin((i+1)ω_k))` for i in 0..order, ω_k = π·k/(n_bins-1).
+/// Built once per shaper so the per-frame NTF evaluation carries no trig.
+fn ntf_eval_tables(n_bins: usize, order: usize) -> Vec<Vec<(f64, f64)>> {
+    (0..n_bins)
+        .map(|k| {
+            let w = std::f64::consts::PI * k as f64 / (n_bins - 1) as f64;
+            (0..order).map(|i| ((((i + 1) as f64) * w).cos(), (((i + 1) as f64) * w).sin())).collect()
+        })
+        .collect()
+}
+
+/// Perceptually-weighted noise of an NTF: `Σ_k |NTF(ω_k)|²·inv_thr_sq_k`
+/// (a noise-to-mask proxy; lower = less audible), using the precomputed trig
+/// tables. Drives the per-frame choice between the masking-adaptive curve and the
+/// fixed ATH floor in `from_analysis`.
+fn perceptual_noise(coeffs: &[f64], inv_thr_sq: &[f64], trig: &[Vec<(f64, f64)>]) -> f64 {
+    inv_thr_sq
+        .iter()
+        .zip(trig)
+        .map(|(&w, row)| {
+            // |NTF(ω_k)|² for NTF = 1 − Σ coeffs[i]·z^-(i+1).
+            let (mut re, mut im) = (1.0f64, 0.0f64);
+            for (&c, &(cos, sin)) in coeffs.iter().zip(row) {
+                re -= c * cos;
+                im += c * sin;
+            }
+            (re * re + im * im) * w
+        })
+        .sum()
 }
 
 // ─── Phase 4.3: Adaptive quantization with time-varying coefficients ───────
@@ -283,10 +371,12 @@ pub fn quantize_adaptive(
     // Create multi-channel dither generator with selected correlation mode.
     let mut dither_gen = MultiChannelDither::new(ch_count, correlation, seed);
     let mut dither_samples = vec![0.0; ch_count];
+    // Reused across all samples — avoids a per-sample heap allocation.
+    let mut coeffs: Vec<f64> = Vec::with_capacity(max_coeffs_len);
 
     for n in 0..buffer.frame_len() {
         // Get adaptive coefficients for this sample (linearly interpolated between frames).
-        let coeffs = shaper.coeffs_for_sample(n);
+        shaper.coeffs_for_sample_into(n, &mut coeffs);
 
         for ch in 0..ch_count {
             let x = buffer.channels[ch][n];
@@ -320,7 +410,7 @@ pub fn quantize_adaptive(
 
             // Generate dither samples for all channels at this sample index.
             if ch == 0 {
-                dither_samples = dither_gen.sample_lsb_all();
+                dither_gen.sample_lsb_all_into(&mut dither_samples);
             }
 
             // Get dither sample for this channel.
@@ -361,10 +451,19 @@ mod tests {
             .collect()
     }
 
+    /// Test convenience: build the FFT plans and call the real designer.
+    fn design(target: &[f64], order: usize, clamp: f64) -> Vec<f64> {
+        let n_fft = (target.len() - 1) * 2;
+        let mut p = FftPlanner::<f64>::new();
+        let fft = p.plan_fft_forward(n_fft);
+        let ifft = p.plan_fft_inverse(n_fft);
+        design_minimal_phase_fir(target, order, clamp, &fft, &ifft)
+    }
+
     #[test]
     fn minimal_phase_fir_has_correct_length() {
         let spectrum = flat_spectrum(513);
-        let fir = design_minimal_phase_fir(&spectrum, 7);
+        let fir = design(&spectrum, 7, MASK_CLAMP_DB);
         assert_eq!(fir.len(), 7, "FIR should have requested order");
     }
 
@@ -372,7 +471,7 @@ mod tests {
     fn minimal_phase_fir_respects_max_order() {
         let spectrum = flat_spectrum(513);
         for target_order in [1, 5, 15, 100] {
-            let fir = design_minimal_phase_fir(&spectrum, target_order);
+            let fir = design(&spectrum, target_order, MASK_CLAMP_DB);
             assert!(
                 fir.len() <= target_order && fir.len() > 0,
                 "FIR length {} should be at most {}",
@@ -461,19 +560,40 @@ mod tests {
         );
     }
 
+    /// The real contract: the designed NTF magnitude must track the target shape.
+    /// For a lowpass target (more weight at DC than Nyquist), the reconstructed
+    /// `|NTF|` must likewise be larger at DC than at Nyquist.
     #[test]
-    fn minimal_phase_fir_preserves_positivity() {
-        // A valid spectrum should produce positive (or very small) FIR values on average.
+    fn minimal_phase_fir_reconstructs_target_shape() {
         let spectrum = lowpass_spectrum(513);
-        let fir = design_minimal_phase_fir(&spectrum, 9);
+        let coeffs = design(&spectrum, 9, MASK_CLAMP_DB);
 
-        // First coefficient should be the largest (typical for a lowpass shaper).
+        // |NTF(z)| at z = ±1 (DC / Nyquist): NTF = 1 − Σ coeffs[k]·z^-(k+1).
+        let ntf_mag = |z_sign: f64| {
+            (1.0 - coeffs
+                .iter()
+                .enumerate()
+                .map(|(k, c)| c * z_sign.powi(k as i32 + 1))
+                .sum::<f64>())
+            .abs()
+        };
+        let dc = ntf_mag(1.0);
+        let nyq = ntf_mag(-1.0);
         assert!(
-            fir[0] > 0.0,
-            "minimal-phase FIR should have positive leading tap"
+            dc > nyq,
+            "lowpass target ⇒ NTF should emphasize DC over Nyquist (dc={dc:.3}, nyq={nyq:.3})"
         );
-        // Total energy (L1 norm) should be positive.
-        let energy: f64 = fir.iter().map(|&x| x.abs()).sum();
-        assert!(energy > 0.0, "FIR should have nonzero energy");
+
+        // Monic: the leading NTF tap is 1, so the feedback design must be nonzero.
+        let energy: f64 = coeffs.iter().map(|x| x.abs()).sum();
+        assert!(energy > 0.0, "non-flat target must yield nonzero feedback taps");
+    }
+
+    /// A flat target needs no shaping: `|NTF| = 1`, i.e. all feedback taps ≈ 0.
+    #[test]
+    fn minimal_phase_fir_flat_target_is_passthrough() {
+        let coeffs = design(&flat_spectrum(513), 9, MASK_CLAMP_DB);
+        let max = coeffs.iter().map(|c| c.abs()).fold(0.0, f64::max);
+        assert!(max < 1e-6, "flat target should produce ~zero feedback (got {max:.2e})");
     }
 }

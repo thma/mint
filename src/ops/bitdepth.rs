@@ -3,7 +3,9 @@ use anyhow::Result;
 use crate::audio::buffer::{AudioBuffer, OutputSampleFormat};
 use crate::config::{DitherMode, DitherStrength, DitherCorrelation};
 use crate::dither::{NoiseShaper, ShapingCurve, TpdfDither};
-use crate::dither::mbit_plus::{self, MbitPlusStrength};
+use crate::dither::mbit_plus::MbitPlusStrength;
+use crate::dither::psychoacoustic::PsychoacousticAnalysis;
+use crate::dither::adaptive_mbit::{AdaptiveShaper, quantize_adaptive};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BitDepthApplyResult {
@@ -63,6 +65,23 @@ fn is_mbit_plus(mode: DitherMode, target: OutputSampleFormat) -> bool {
     matches!(mode, DitherMode::MbitPlus) && matches!(target, OutputSampleFormat::S16)
 }
 
+/// Equal-weight mono mixdown for the shared psychoacoustic analysis. Cheap and
+/// good enough: the masking shape used to design the NTF is similar across
+/// channels for typical material, and a single shared design keeps the loop simple.
+fn mono_mix(channels: &[Vec<f64>]) -> Vec<f64> {
+    match channels.len() {
+        0 => Vec::new(),
+        1 => channels[0].clone(),
+        ch => {
+            let n = channels.iter().map(|c| c.len()).max().unwrap_or(0);
+            let inv = 1.0 / ch as f64;
+            (0..n)
+                .map(|i| channels.iter().map(|c| c.get(i).copied().unwrap_or(0.0)).sum::<f64>() * inv)
+                .collect()
+        }
+    }
+}
+
 fn is_reduction(current: OutputSampleFormat, target: OutputSampleFormat) -> bool {
     bit_depth_rank(target) < bit_depth_rank(current)
 }
@@ -93,7 +112,20 @@ fn quantize_in_place(
 
     if is_mbit_plus(mode, target) {
         let strength = MbitPlusStrength::from_config(dither_strength.unwrap_or(DitherStrength::Normal));
-        mbit_plus::quantize(buffer, max, min_i, max_i, strength, correlation, seed);
+        // Strength → FIR order: more taps track the perceptual target more sharply.
+        let order = match strength {
+            MbitPlusStrength::Low => 5,
+            MbitPlusStrength::Normal => 7,
+            MbitPlusStrength::High => 9,
+        };
+        // One psychoacoustic analysis on a mono mixdown drives a single shared NTF
+        // design across channels; the dither itself stays per-channel/decorrelated
+        // inside `quantize_adaptive`. The whole file is in RAM, so this is a
+        // zero-latency offline pass.
+        let mix = mono_mix(&buffer.channels);
+        let analysis = PsychoacousticAnalysis::analyze(&mix, buffer.sample_rate);
+        let shaper = AdaptiveShaper::from_analysis(&analysis, order);
+        quantize_adaptive(buffer, max, min_i, max_i, &shaper, correlation, seed);
         return;
     }
 

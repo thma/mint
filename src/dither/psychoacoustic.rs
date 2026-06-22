@@ -118,13 +118,16 @@ impl PsychoacousticAnalysis {
             let tonality = bark_tonality(&bark_power);
             let spread = spreading_function(&bark_power);
 
-            // Per-band masking threshold: spread masker minus perceptual offset.
-            // NMT ≈ 5.5 dB (tonal masker), TMN ≈ 6.5 dB (noise masker).
-            // The mix is driven by the SFM-derived tonality index.
+            // Per-band masking threshold: spread masker power minus perceptual
+            // offset. NMT ≈ 5.5 dB (tonal masker), TMN ≈ 6.5 dB (noise masker);
+            // the mix is driven by the SFM-derived tonality index. The offset is a
+            // power-level subtraction (÷10). Finally `sqrt` converts the masking
+            // *power* to an *amplitude* threshold, matching ATH's units so the
+            // `max(threshold, ATH)` in `bark_to_bins` compares like with like.
             let bark_threshold: Vec<f64> = (0..NUM_BARK_BANDS)
                 .map(|z| {
                     let offset_db = tonality[z] * 5.5 + (1.0 - tonality[z]) * 6.5;
-                    spread[z] * db_to_linear(-offset_db)
+                    (spread[z] * db_to_power(-offset_db)).sqrt()
                 })
                 .collect();
 
@@ -179,6 +182,14 @@ fn hann_window(n: usize) -> Vec<f64> {
         .collect()
 }
 
+/// Absolute Threshold of Hearing as a per-bin amplitude curve (normalized FS).
+///
+/// Exposed so the adaptive shaper (Phase 4.2) can design a fixed ATH-optimal
+/// fallback curve for quiet frames, independently of any program masker.
+pub fn ath_amplitude(sample_rate: u32, num_bins: usize) -> Vec<f64> {
+    build_ath(sample_rate, num_bins)
+}
+
 /// Absolute Threshold of Hearing (ATH) per FFT bin, as a linear amplitude
 /// relative to normalized full scale (0 dBFS = 96 dBSPL for s16).
 ///
@@ -204,9 +215,18 @@ fn build_ath(sample_rate: u32, num_bins: usize) -> Vec<f64> {
         .collect()
 }
 
+/// dB → linear **amplitude** ratio (÷20). Use for level↔amplitude conversions.
 #[inline]
 fn db_to_linear(db: f64) -> f64 {
     10.0_f64.powf(db / 20.0)
+}
+
+/// dB → linear **power** ratio (÷10). Use when the quantity being scaled is a
+/// power/energy (e.g. the spreading function and masking offsets, which act on
+/// masker *power*, not amplitude).
+#[inline]
+fn db_to_power(db: f64) -> f64 {
+    10.0_f64.powf(db / 10.0)
 }
 
 /// Map FFT bin `k` to its Bark band index (0 … NUM_BARK_BANDS-1).
@@ -295,9 +315,11 @@ fn spreading_function(bark_power: &[f64]) -> Vec<f64> {
         for z in 0..n {
             let dz = z as f64 - z_m as f64;
             let dz_s = dz + 0.474;
-            // Spreading function in dB, converted to linear multiplier.
+            // Schroeder spreading in dB. It is a *power*-level spreading, so it
+            // scales the masker power via the power-domain conversion (÷10), not
+            // the amplitude one. `spread[z]` therefore stays in power units.
             let sf_db = 15.81 + 7.5 * dz_s - 17.5 * (1.0 + dz_s * dz_s).sqrt();
-            spread[z] += p_m * db_to_linear(sf_db);
+            spread[z] += p_m * db_to_power(sf_db);
         }
     }
 

@@ -153,9 +153,12 @@ pub enum DitherMode {
     /// a stronger, ear-weighted shaper than `Shaped` (deep notch at ~4 kHz). Same
     /// s16-only gating and graceful degradation.
     Psychoacoustic,
-    /// MBIT+-style adaptive dither: psychoacoustic + temporal masking driven,
-    /// adaptive spectral redistribution, and stereo-correlated noise. This mode is
-    /// tuned for s16 delivery and gracefully degrades to flat TPDF above s16.
+    /// MBIT+-style adaptive dither: a per-frame psychoacoustic analysis (MPEG-1
+    /// model-1 masking) designs a minimal-phase noise-shaping curve whose noise sits
+    /// under the program's masking threshold, with a per-frame fallback to a fixed
+    /// ATH-optimal curve so quiet/exposed passages are never worse than a fixed
+    /// shaper. Per-channel decorrelated noise. s16-only; degrades to flat TPDF above.
+    /// (Frequency/simultaneous masking only — no temporal pre/post-masking model yet.)
     #[serde(rename = "mbit_plus")]
     MbitPlus,
 }

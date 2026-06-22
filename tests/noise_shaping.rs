@@ -793,25 +793,36 @@ fn phase_4_3_adaptive_quantization_stereo_is_decorrelated() {
     );
 }
 
-/// Phase 4.3: Pre-masking look-ahead means we can see future frame thresholds
-/// (zero-latency because entire signal is in RAM). Verify that the adaptive
-/// coefficients reflect this.
+/// Phase 4.3: the design adapts to the program. A near-silent region snaps to the
+/// fixed ATH-optimal floor; a loud *broadband* region (real masking across the
+/// critical band) switches to the masking-adaptive curve. The two must therefore
+/// differ. (A loud pure tone would NOT trigger this — it doesn't mask the critical
+/// band — which is exactly the safeguard working: adaptation only where it helps.)
 #[test]
 fn phase_4_3_premaske_look_ahead_uses_future_frames() {
     let sr = 44_100u32;
+    let quarter = sr as usize / 4;
 
-    // Create a signal with transient: quiet then loud.
-    let mut sig = vec![0.01f64; sr as usize / 4]; // Quiet tail
-    sig.extend(vec![0.5f64; sr as usize / 4]); // Loud onset
+    // Quiet tail → loud broadband onset (sum of decorrelated partials).
+    let mut sig = vec![0.0001f64; quarter];
+    let broadband: Vec<f64> = (0..quarter)
+        .map(|i| {
+            [220.0, 660.0, 1_500.0, 3_300.0, 7_000.0, 11_000.0]
+                .iter()
+                .enumerate()
+                .map(|(p, &f)| (2.0 * PI * f * i as f64 / sr as f64 + p as f64).sin())
+                .sum::<f64>()
+                * 0.12
+        })
+        .collect();
+    sig.extend(broadband);
 
     let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
     let shaper = AdaptiveShaper::from_analysis(&analysis, 5);
 
-    // Coefficients should vary across the signal boundary (quiet → loud).
-    let c_quiet = shaper.coeffs_for_sample(sr as usize / 8); // Middle of quiet region
-    let c_loud = shaper.coeffs_for_sample(3 * sr as usize / 8); // Middle of loud region
+    let c_quiet = shaper.coeffs_for_sample(quarter / 2); // middle of the quiet region
+    let c_loud = shaper.coeffs_for_sample(quarter + quarter / 2); // middle of the loud region
 
-    // The coefficients should be noticeably different due to look-ahead.
     let coeff_diff = c_quiet
         .iter()
         .zip(c_loud.iter())
@@ -820,7 +831,7 @@ fn phase_4_3_premaske_look_ahead_uses_future_frames() {
 
     assert!(
         coeff_diff > 0.01,
-        "adaptive coefficients should reflect masking differences between quiet and loud regions"
+        "coeffs should differ between the ATH-floored quiet region and the masking-adaptive loud region (diff={coeff_diff:.4})"
     );
 }
 

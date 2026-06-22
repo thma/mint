@@ -1,8 +1,18 @@
-//! MBIT+ Phase 1: Static, gehörgewichtete Error-Feedback-Quantisierung.
+//! MBIT+ Phase 1: Statische Error-Feedback-Quantisierung mit Hochpass-Shaping.
 //!
-//! Dieses Modul implementiert eine stabile, minimalphasige Noise-Shaping für 16-Bit,
-//! tuned nach psychoakustischem ATH/F-Gewichtungs-Modell. Die Shaping-Kurven sind
-//! als Offline-Designs offline berechnet und eingecheckt, nicht zur Laufzeit adaptiert.
+//! HINWEIS: Dies ist NICHT mehr der Produktionspfad. `DitherMode::MbitPlus` läuft
+//! seit dem Verdrahten des adaptiven Pfads über `psychoacoustic.rs` +
+//! `adaptive_mbit.rs` (siehe `ops::bitdepth`). Dieses Modul bleibt als Referenz-
+//! /Vergleichsimplementierung und für die NTF-Tabellen-Tests erhalten.
+//!
+//! Dieses Modul implementiert ein stabiles Noise-Shaping für 16-Bit über feste,
+//! eingecheckte Error-Feedback-Koeffizienten (nicht zur Laufzeit adaptiert).
+//!
+//! Ehrlichkeits-Hinweis: Die Koeffizienten sind *breitbandige Hochpass*-NTFs
+//! (tiefster Punkt bei DC, monoton steigend zum Nyquist) — KEIN auf das
+//! 2–5-kHz-Sensitivitätstal getuntes, gehörrichtiges Design. Sie sind perzeptiv
+//! wirksam (gemessen, siehe `tests/dither_verification.rs`), aber das eigentlich
+//! gehörgewichtete, adaptive Design lebt in `psychoacoustic.rs` + `adaptive_mbit.rs`.
 //!
 //! **Phase 1 Fokus**: Korrektheit und Stabilität.
 //! - Konstantes TPDF-Dither (2 LSB pp, ±1 LSB).
@@ -17,13 +27,17 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 /// MBIT+ Stärke-Stufe: bestimmt die Agressivität des Noise-Shaping.
+///
+/// Die dB-Angaben sind *gemessen* (siehe `tests/dither_verification.rs`, NTF-Tabelle
+/// @ 44.1 kHz), nicht geschätzt. „totales Rauschen" = mittlere NTF-Leistung über
+/// das Band; „perzeptiv" = ATH-gewichtete Verbesserung ggü. flachem TPDF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MbitPlusStrength {
-    /// Sanft: 3-Tap, minimale Verzerrung, ~7.8 dB totales Rauschen.
+    /// Sanft (NTF 3-Tap): +4.7 dB totales Rauschen, +7.1 dB perzeptiv.
     Low,
-    /// Ausgewogen (Default): 5-Tap, hörbarer Effekt, ~10.5 dB totales Rauschen.
+    /// Ausgewogen (Default, NTF 5-Tap): +8.7 dB totales Rauschen, +10.4 dB perzeptiv.
     Normal,
-    /// Aggressiv: 7-Tap, stärkste Noise-Shaping, ~13 dB totales Rauschen.
+    /// Aggressiv (NTF 7-Tap): +11.2 dB totales Rauschen, +12.1 dB perzeptiv.
     High,
 }
 
@@ -41,22 +55,34 @@ impl MbitPlusStrength {
     }
 
     /// FIR-Koeffizienten für diese Stärke @ 44.1 kHz.
+    ///
+    /// WICHTIG (gemessen, nicht behauptet): Dies sind *breitbandige Hochpass*-NTFs.
+    /// Ihr tiefster Punkt liegt bei DC (0 Hz), die NTF steigt monoton zum Nyquist —
+    /// es gibt KEINEN getunten Notch bei 3.5/4 kHz. Das ist trotzdem perzeptiv
+    /// wirksam (Rauschen landet im unempfindlichen HF-Bereich), aber es ist NICHT
+    /// gehörrichtig im Sinne eines auf das 2–5-kHz-Sensitivitätstal optimierten
+    /// Designs (das leistet der adaptive Phase-4-Pfad bzw. die Lipshitz-Kurve).
     fn coeffs_441(&self) -> &'static [f64] {
         match self {
-            // 3-Tap: Spektrumfaktorisierung von H_target für minimale Totale Leistung
-            // bei schwachem High-Pass (Null bei ~400 Hz, −3 dB @ ~2 kHz).
+            // NTF 1 − 1.330z⁻¹ + 0.410z⁻². Monotoner Hochpass: −21.9 dB @ DC,
+            // −9.2 dB @ 4 kHz, +8.8 dB @ Nyquist. +4.7 dB totale Leistung.
             MbitPlusStrength::Low => &[1.330, -0.410],
-            // 5-Tap: Standard MBIT+-Level, deep notch at ~3.5 kHz (Lipshitz-inspired
-            // aber hier auf Phase-Response optimiert für Minimalphasigkeit).
+            // Default-Stärke. −28 dB @ DC, −11.5 dB @ 3.5 kHz, +14.4 dB @ Nyquist,
+            // +8.7 dB totale Leistung. (Das letzte 0.0-Tap ist wirkungslos.)
             MbitPlusStrength::Normal => &[1.850, -1.530, 0.760, -0.120, 0.0],
-            // 7-Tap: Aggressive, notch even deeper, side-lobes tighter.
-            // (Hier placeholder; später von realfft-Design-Skript gefüllt.)
+            // Aggressiv: stärkstes HF-Dumping. −20 dB @ DC, −14.8 dB @ 3.5 kHz,
+            // +18.1 dB @ Nyquist, +11.2 dB totale Leistung. (Letztes 0.0-Tap unnütz.)
             MbitPlusStrength::High => &[2.050, -2.140, 1.620, -0.890, 0.310, -0.050, 0.0],
         }
     }
 
     /// FIR-Koeffizienten für diese Stärke @ 48 kHz.
-    /// (Notch zentriert immer noch bei ~3.5 kHz, Frequenz-Warping berücksichtigt.)
+    ///
+    /// Hinweis: Die Per-Rate-Tabellen unterscheiden sich nur um ±0.02 von den
+    /// 44.1-kHz-Werten — sie verschieben den Notch NICHT (er bleibt bei DC). Ein
+    /// fester FIR shaped ohnehin bei einem festen Bruchteil der Nyquist-Frequenz,
+    /// d.h. die Hochpass-Ecke wandert bei höheren Raten automatisch in Hz mit.
+    /// Die separaten Tabellen sind daher weitgehend kosmetisch.
     fn coeffs_48(&self) -> &'static [f64] {
         match self {
             MbitPlusStrength::Low => &[1.300, -0.395],
