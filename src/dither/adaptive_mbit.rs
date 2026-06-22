@@ -16,8 +16,11 @@
 //! - Blauert & Laws (1978), "Group Delay Distortions in Electroacoustics", JAES
 
 use rustfft::{num_complex::Complex, FftPlanner};
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
 
 use crate::dither::psychoacoustic::PsychoacousticAnalysis;
+use crate::audio::buffer::AudioBuffer;
 
 /// Maximum FIR order for adaptive filters. Balances expressiveness (ability to shape
 /// across many bands) with computational cost and numerical stability. Typical range
@@ -209,6 +212,140 @@ fn design_minimal_phase_fir(target_spectrum: &[f64], order: usize) -> Vec<f64> {
     }
 
     coeffs
+}
+
+// ─── Phase 4.3: Adaptive quantization with time-varying coefficients ───────
+
+/// Per-channel error history for adaptive quantization.
+#[derive(Debug, Clone)]
+struct AdaptiveChannelState {
+    error_hist: Vec<f64>,
+    blanking_count: usize,
+}
+
+impl AdaptiveChannelState {
+    fn new(max_order: usize) -> Self {
+        Self {
+            error_hist: vec![0.0; max_order],
+            blanking_count: 0,
+        }
+    }
+
+    fn push_error(&mut self, e: f64) {
+        self.error_hist.rotate_right(1);
+        self.error_hist[0] = e;
+    }
+
+    fn reset(&mut self) {
+        self.error_hist.fill(0.0);
+        self.blanking_count = 0;
+    }
+}
+
+/// Apply adaptive MBIT+ quantization using per-frame designed coefficients with zero-latency
+/// pre-masking look-ahead.
+///
+/// This function extends Phase 1 error-feedback quantization with time-varying FIR
+/// coefficients from Phase 4.2's `AdaptiveShaper`. The shaper provides interpolated
+/// coefficients for each sample, allowing frequency-adaptive noise shaping that
+/// respects masking thresholds computed in a single analysis pass.
+///
+/// **Pre-Masking Look-Ahead:**
+/// Since the entire signal is in memory, we can use future frames' masking information
+/// to design coefficients at the current position. This replaces ad-hoc slope extrapolation
+/// with principled predictive shaping.
+///
+/// # Arguments
+/// - `buffer`: audio buffer to quantize (in-place)
+/// - `max`: max amplitude scale (e.g., 32767.0 for s16)
+/// - `min_i`: min quantized value (e.g., -32768 for s16)
+/// - `max_i`: max quantized value (e.g., 32767 for s16)
+/// - `shaper`: adaptive shaper with per-frame FIR coefficients
+/// - `seed`: optional RNG seed for reproducibility
+pub fn quantize_adaptive(
+    buffer: &mut AudioBuffer,
+    max: f64,
+    min_i: i32,
+    max_i: i32,
+    shaper: &AdaptiveShaper,
+    seed: Option<u64>,
+) {
+    if buffer.channels.is_empty() || buffer.frame_len() == 0 {
+        return;
+    }
+
+    let ch_count = buffer.channels_count();
+    let max_coeffs_len = shaper.order();
+    let mut states = vec![AdaptiveChannelState::new(max_coeffs_len); ch_count];
+    let blanking_threshold = (buffer.sample_rate as usize) / 20; // 50 ms
+
+    // Import needed for TPDF and per_channel_seed (these are in mbit_plus module).
+    // We'll use inline implementations since we don't want to expose them publicly.
+    let mut rng = StdRng::seed_from_u64(seed.unwrap_or_else(|| 0x_FEED_B00B_DEADBEEF_u64));
+    let mut per_ch_rngs = (0..ch_count)
+        .map(|ch| {
+            let per_ch_seed = seed.map(|s| s ^ (ch as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            StdRng::seed_from_u64(per_ch_seed.unwrap_or_else(|| 0x_CAFE_F00D_u64 ^ ch as u64))
+        })
+        .collect::<Vec<_>>();
+
+    for n in 0..buffer.frame_len() {
+        // Get adaptive coefficients for this sample (linearly interpolated between frames).
+        let coeffs = shaper.coeffs_for_sample(n);
+
+        for ch in 0..ch_count {
+            let x = buffer.channels[ch][n];
+            let state = &mut states[ch];
+
+            // Auto-blanking: zero out sustained silence.
+            if x.abs() < 0.5 / 32_767.0 {
+                state.blanking_count += 1;
+                if state.blanking_count > blanking_threshold {
+                    buffer.channels[ch][n] = 0.0;
+                    state.reset();
+                    continue;
+                }
+            } else {
+                state.blanking_count = 0;
+            }
+
+            // Exact zero: no dither, no feedback.
+            if x == 0.0 {
+                buffer.channels[ch][n] = 0.0;
+                state.reset();
+                continue;
+            }
+
+            // Feedback term: apply time-varying FIR to error history.
+            let fb = coeffs
+                .iter()
+                .zip(state.error_hist.iter())
+                .map(|(c, e)| c * e)
+                .sum::<f64>();
+
+            // Constant TPDF dither (±0.5 LSB per source, total ±1 LSB).
+            let dither = if ch == 0 {
+                let a = rng.gen_range(-0.5..0.5);
+                let b = rng.gen_range(-0.5..0.5);
+                a + b
+            } else {
+                let a = per_ch_rngs[ch].gen_range(-0.5..0.5);
+                let b = per_ch_rngs[ch].gen_range(-0.5..0.5);
+                a + b
+            };
+
+            // Quantize: shaped input + dither → round → clamp.
+            let s = x.clamp(-1.0, 1.0) * max;
+            let u = s - fb;
+            let w = u + dither;
+            let y = (w.round() as i32).clamp(min_i, max_i);
+
+            // Update error history.
+            state.push_error(y as f64 - u);
+
+            buffer.channels[ch][n] = y as f64 / max;
+        }
+    }
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────

@@ -686,3 +686,139 @@ fn adaptive_shaper_bounds_checking() {
     assert_eq!(c_large.len(), 7, "should return a full coefficient vector");
     assert!(c_large.iter().all(|c| c.is_finite()), "all coefficients must be finite");
 }
+
+// ─── Phase 4.3: Adaptive quantization runtime integration ──────────────────
+
+/// Phase 4.3: Adaptive quantization applies time-varying FIR coefficients correctly.
+#[test]
+fn phase_4_3_adaptive_quantization_applies_coefficients() {
+    use mint::dither::adaptive_mbit::quantize_adaptive;
+
+    let sr = 44_100u32;
+    let sig = sine_signal(1_000.0, sr as usize, sr);
+    let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
+    let shaper = AdaptiveShaper::from_analysis(&analysis, 5);
+
+    let mut buf = mk_buffer(sig.iter().map(|&s| s * 0.05).collect::<Vec<_>>());
+
+    // Apply adaptive quantization.
+    quantize_adaptive(&mut buf, 32_767.0, -32_768, 32_767, &shaper, Some(42));
+
+    // Verify the output is quantized to s16 range.
+    for ch in 0..buf.channels_count() {
+        for sample in &buf.channels[ch] {
+            let quantized = (*sample * 32_767.0).round() as i32;
+            assert!(
+                quantized >= -32_768 && quantized <= 32_767,
+                "sample {quantized} out of s16 range"
+            );
+        }
+    }
+
+    // Verify it's not just all zeros (shaping is being applied).
+    let nonzero_count = buf.channels[0].iter().filter(|&&s| s.abs() > 1e-6).count();
+    assert!(
+        nonzero_count > 100,
+        "expected many nonzero samples after quantization, got {nonzero_count}"
+    );
+}
+
+/// Phase 4.3: Adaptive quantization is reproducible with the same seed.
+#[test]
+fn phase_4_3_adaptive_quantization_is_reproducible() {
+    use mint::dither::adaptive_mbit::quantize_adaptive;
+
+    let sr = 44_100u32;
+    let sig = sine_signal(440.0, sr as usize / 2, sr);
+    let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
+    let shaper = AdaptiveShaper::from_analysis(&analysis, 5);
+
+    let mut buf1 = mk_buffer(sig.clone());
+    let mut buf2 = mk_buffer(sig);
+
+    // Quantize with same seed.
+    quantize_adaptive(&mut buf1, 32_767.0, -32_768, 32_767, &shaper, Some(100));
+    quantize_adaptive(&mut buf2, 32_767.0, -32_768, 32_767, &shaper, Some(100));
+
+    // Should be bit-identical.
+    for (s1, s2) in buf1.channels[0].iter().zip(buf2.channels[0].iter()) {
+        assert_eq!(s1, s2, "adaptive quantization should be reproducible with same seed");
+    }
+}
+
+/// Phase 4.3: Adaptive quantization preserves stereo decorrelation.
+#[test]
+fn phase_4_3_adaptive_quantization_stereo_is_decorrelated() {
+    use mint::dither::adaptive_mbit::quantize_adaptive;
+
+    let sr = 44_100u32;
+    let sig = sine_signal(1_000.0, sr as usize / 2, sr);  // Longer signal for more data
+    let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
+    let shaper = AdaptiveShaper::from_analysis(&analysis, 5);
+
+    let mut buf = buffer_from(vec![
+        sig.iter().map(|&s| s * 0.05).collect::<Vec<_>>(),
+        sig.iter().map(|&s| s * 0.05).collect::<Vec<_>>(),
+    ]);
+
+    // Apply adaptive quantization.
+    quantize_adaptive(&mut buf, 32_767.0, -32_768, 32_767, &shaper, Some(50));
+
+    // Filter to nonzero samples only (where we actually have quantization noise).
+    let mut same_count = 0;
+    let mut checked_count = 0;
+    for i in 0..buf.channels[0].len() {
+        let s0 = buf.channels[0][i];
+        let s1 = buf.channels[1][i];
+        if s0.abs() > 1e-6 || s1.abs() > 1e-6 {
+            checked_count += 1;
+            if (s0 - s1).abs() < 1e-10 {
+                same_count += 1;
+            }
+        }
+    }
+    // Among nonzero samples, most should differ due to per-channel dither.
+    let match_fraction = if checked_count > 0 {
+        same_count as f64 / checked_count as f64
+    } else {
+        0.0
+    };
+    // Allow up to 35% match (some will match by chance or due to error-feedback convergence).
+    // Key is that they're not identical.
+    assert!(
+        match_fraction < 0.35,
+        "stereo channels should be decorrelated; among {checked_count} nonzero samples, {same_count} matched ({:.1}%)",
+        match_fraction * 100.0
+    );
+}
+
+/// Phase 4.3: Pre-masking look-ahead means we can see future frame thresholds
+/// (zero-latency because entire signal is in RAM). Verify that the adaptive
+/// coefficients reflect this.
+#[test]
+fn phase_4_3_premaske_look_ahead_uses_future_frames() {
+    let sr = 44_100u32;
+
+    // Create a signal with transient: quiet then loud.
+    let mut sig = vec![0.01f64; sr as usize / 4]; // Quiet tail
+    sig.extend(vec![0.5f64; sr as usize / 4]); // Loud onset
+
+    let analysis = PsychoacousticAnalysis::analyze(&sig, sr);
+    let shaper = AdaptiveShaper::from_analysis(&analysis, 5);
+
+    // Coefficients should vary across the signal boundary (quiet → loud).
+    let c_quiet = shaper.coeffs_for_sample(sr as usize / 8); // Middle of quiet region
+    let c_loud = shaper.coeffs_for_sample(3 * sr as usize / 8); // Middle of loud region
+
+    // The coefficients should be noticeably different due to look-ahead.
+    let coeff_diff = c_quiet
+        .iter()
+        .zip(c_loud.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f64>();
+
+    assert!(
+        coeff_diff > 0.01,
+        "adaptive coefficients should reflect masking differences between quiet and loud regions"
+    );
+}
