@@ -27,6 +27,11 @@ preset = "cd"
 lufs   = -12.0
 dither = "shaped"          # TPDF + noise shaping; engages only for s16 targets
 
+[target.cd-mbit]
+preset = "cd"
+lufs   = -12.0
+dither = "mbit_plus"       # adaptive psychoacoustic + temporal masking mode
+
 # Optional undithered 24-bit delivery: `dither = "none"` is allowed.
 # Many engineers consider 24-bit quantization error low enough for this use-case.
 [target.archive-s24-none]

@@ -30,8 +30,8 @@ pub struct ProcessingReport {
     pub dithered: bool,
     /// True when error-feedback noise shaping ran (implies `dithered`).
     pub shaped: bool,
-    /// Name of the noise-shaping curve when shaping ran ("gentle" |
-    /// "psychoacoustic"); `None` otherwise. Mirrors the dry-run label.
+    /// Name of the shaping family when shaping ran ("gentle" |
+    /// "psychoacoustic" | "mbit+"); `None` otherwise. Mirrors the dry-run label.
     pub shaping_curve: Option<&'static str>,
     /// Output container/codec: "wav" | "flac" | "mp3".
     pub codec: String,
@@ -169,9 +169,7 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
                 bitdepth::apply(&mut buffer, &mut current, target.format, Some(target.dither), seed)?;
             dithered = bd.dithered;
             shaped = bd.shaped;
-            // `shaped` ⟹ the mode has a curve, so this resolves to Some when shaping ran.
-            shaping_curve =
-                bd.shaped.then(|| target.dither.shaping_curve().map(|c| c.tag())).flatten();
+            shaping_curve = bd.shaping_tag;
 
             if bd.reduced
                 && matches!(target.dither, DitherMode::None)

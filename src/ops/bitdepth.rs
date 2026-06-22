@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::audio::buffer::{AudioBuffer, OutputSampleFormat};
 use crate::config::DitherMode;
-use crate::dither::{NoiseShaper, ShapingCurve, TpdfDither};
+use crate::dither::{NoiseShaper, ShapingCurve, TpdfDither, quantize_mbit_plus};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BitDepthApplyResult {
@@ -10,6 +10,8 @@ pub struct BitDepthApplyResult {
     pub dithered: bool,
     /// True when error-feedback noise shaping ran (a strict subset of `dithered`).
     pub shaped: bool,
+    /// Human-readable shaping family used by quantization, if any.
+    pub shaping_tag: Option<&'static str>,
 }
 
 pub fn apply(
@@ -30,17 +32,31 @@ pub fn apply(
     // the shaped modes gracefully degrade to flat TPDF here (and to nothing for f32).
     // The gate (`DitherMode::shapes`) is shared with the dry-run summary so they can't
     // drift; `shaping_curve` then selects which curve to run.
-    let shaped = dithered && mode.shapes(target);
+    let shaped = (dithered && mode.shapes(target)) || (dithered && is_mbit_plus(mode, target));
     let curve = shaped.then(|| mode.shaping_curve()).flatten();
+    let shaping_tag = if is_mbit_plus(mode, target) {
+        Some("mbit+")
+    } else {
+        curve.map(ShapingCurve::tag)
+    };
 
     if reduced {
-        quantize_in_place(buffer, target, dithered, curve, seed);
+        quantize_in_place(buffer, target, mode, dithered, curve, seed);
     }
 
     *current = target;
     buffer.out_format = target;
 
-    Ok(BitDepthApplyResult { reduced, dithered, shaped })
+    Ok(BitDepthApplyResult {
+        reduced,
+        dithered,
+        shaped,
+        shaping_tag,
+    })
+}
+
+fn is_mbit_plus(mode: DitherMode, target: OutputSampleFormat) -> bool {
+    matches!(mode, DitherMode::MbitPlus) && matches!(target, OutputSampleFormat::S16)
 }
 
 fn is_reduction(current: OutputSampleFormat, target: OutputSampleFormat) -> bool {
@@ -58,6 +74,7 @@ fn bit_depth_rank(format: OutputSampleFormat) -> u8 {
 fn quantize_in_place(
     buffer: &mut AudioBuffer,
     target: OutputSampleFormat,
+    mode: DitherMode,
     use_dither: bool,
     curve: Option<ShapingCurve>,
     seed: Option<u64>,
@@ -67,6 +84,11 @@ fn quantize_in_place(
     let Some((max, min_i, max_i)) = target.int_grid() else {
         return;
     };
+
+    if is_mbit_plus(mode, target) {
+        quantize_mbit_plus(buffer, max, min_i, max_i, seed);
+        return;
+    }
 
     if let Some(curve) = curve {
         // One shaper per channel: the error-feedback history must stay per-channel,

@@ -28,8 +28,10 @@ What it does:
   **momentary**/**short-term**, **true peak**, and crest figures **PLR**/**PSR** — shown
   for both the source and the delivered signal so you can see what processing changed.
 - Bit-depth conversion with seeded TPDF dither, quantizing the f64 buffer exactly once;
-  optional error-feedback **noise shaping** for s16 deliverables — gentle
-  (`dither = "shaped"`) or the published psychoacoustic curve (`dither = "psychoacoustic"`).
+  optional s16-focused enhancement modes: gentle error-feedback shaping
+  (`dither = "shaped"`), published psychoacoustic shaping (`dither = "psychoacoustic"`),
+  or adaptive MBIT+-style dithering (`dither = "mbit_plus"`) with psychoacoustic and
+  temporal masking plus stereo-correlated noise.
 - Output formats: **WAV** (f32/s16/s24) — optionally **Broadcast WAV** (`bwf = true`,
   a `bext` chunk carrying real EBU R128 loudness metadata measured from the delivery) —
   **FLAC** (lossless, pure-Rust), and **MP3** (`--features mp3`, libmp3lame built from
@@ -57,6 +59,11 @@ preset = "apple-music"     # -> 44100 / s16 / -16 LUFS / -1 dBTP
 preset = "cd"              # -> 44100 / s16 / -0.1 dBTP
 lufs   = -12.0             # CD has no loudness standard; you choose
 dither = "shaped"          # optional: TPDF + noise shaping (s16 only)
+
+[target.cd-mbit]
+preset = "cd"
+lufs   = -12.0
+dither = "mbit_plus"       # adaptive MBIT+-style mode (s16 only)
 
 [target.archive]
 format = "f32"             # no preset: keep rate, no quantization, just normalize
@@ -154,6 +161,11 @@ ceiling_dbtp = -1.5
 preset = "cd"                # -> 44100 / s16 / -0.1 dBTP
 lufs   = -12.0
 dither = "shaped"            # explicit -> overrides the [defaults] psychoacoustic
+
+[target.cd-mbit]
+preset = "cd"
+lufs   = -12.0
+dither = "mbit_plus"         # adaptive psychoacoustic + temporal mode
 
 # 5. No preset at all — set the fields directly.
 [target.archive]

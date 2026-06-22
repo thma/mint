@@ -221,6 +221,38 @@ fn psychoacoustic_dither_parses_and_dry_run_names_the_curve() {
     );
 }
 
+#[test]
+fn mbit_plus_parses_and_dry_run_reflects_s16_gating() {
+    let config = config_from_str(
+        r#"
+        [target.cd]
+        preset = "cd"            # s16
+        dither = "mbit_plus"
+
+        [target.archive]
+        preset = "hires"         # s24
+        dither = "mbit_plus"
+        "#,
+    );
+
+    let cd = config.resolve_target("cd").unwrap();
+    assert!(
+        cd.describe(44_100)
+            .iter()
+            .any(|s| s.contains("mbit+ adaptive dither")),
+        "s16 dry-run should advertise mbit+ mode"
+    );
+
+    let archive = config.resolve_target("archive").unwrap();
+    assert!(
+        archive
+            .describe(96_000)
+            .iter()
+            .any(|s| s.contains("mbit+ skipped")),
+        "s24 dry-run should note that mbit+ was skipped"
+    );
+}
+
 /// Round-trip a config that is expected to be *rejected*; returns the error string.
 fn config_err(toml: &str) -> String {
     let path = config_temp_path(toml);

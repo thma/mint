@@ -231,3 +231,64 @@ fn psychoacoustic_is_stronger_than_gentle() {
     let p_psy: f64 = e_psy.iter().map(|v| v * v).sum();
     assert!(p_psy > p_gentle, "psychoacoustic moves more total noise than gentle: psy={p_psy:.0}, gentle={p_gentle:.0}");
 }
+
+#[test]
+fn mbit_plus_flag_tracks_target_format() {
+    let probe = || mk_buffer(vec![0.1, -0.1, 0.2, -0.3]);
+
+    let mut c = OutputSampleFormat::F32;
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), Some(1)).unwrap();
+    assert!(r.shaped && r.dithered, "mbit+ shaping must engage at s16");
+
+    let mut c = OutputSampleFormat::F32;
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::MbitPlus), Some(1)).unwrap();
+    assert!(!r.shaped && r.dithered, "mbit+ must degrade to flat tpdf at s24");
+
+    let mut c = OutputSampleFormat::F32;
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::MbitPlus), Some(1)).unwrap();
+    assert!(!r.shaped && !r.dithered, "f32 has no quantization to dither or shape");
+}
+
+#[test]
+fn mbit_plus_is_reproducible_with_seed() {
+    let sig = test_signal(4096, 0.5);
+    let a = quantize(&sig, DitherMode::MbitPlus, OutputSampleFormat::S16, 123);
+    let b = quantize(&sig, DitherMode::MbitPlus, OutputSampleFormat::S16, 123);
+    assert_eq!(a, b, "seeded mbit+ output must be deterministic");
+}
+
+#[test]
+fn mbit_plus_degrades_to_flat_tpdf_at_s24() {
+    let sig = test_signal(4096, 0.5);
+    let mb = quantize(&sig, DitherMode::MbitPlus, OutputSampleFormat::S24, 99);
+    let tpdf = quantize(&sig, DitherMode::Tpdf, OutputSampleFormat::S24, 99);
+    assert_eq!(mb, tpdf, "mbit+ must be byte-identical to flat tpdf at s24");
+}
+
+#[test]
+fn mbit_plus_stereo_is_reproducible_and_correlated() {
+    let sig = test_signal(4096, 0.5);
+
+    let run = |seed: u64| {
+        let mut buf = buffer_from(vec![sig.clone(), sig.clone()]);
+        let mut current = OutputSampleFormat::F32;
+        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), Some(seed)).unwrap();
+        buf.channels
+    };
+
+    let a = run(17);
+    let b = run(17);
+    assert_eq!(a, b, "seeded stereo mbit+ output must be deterministic");
+
+    // Correlated but not identical between channels.
+    assert_ne!(a[0], a[1], "L/R should not be fully identical");
+
+    let l = &a[0];
+    let r = &a[1];
+    let num: f64 = l.iter().zip(r).map(|(x, y)| x * y).sum();
+    let dl: f64 = l.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let dr: f64 = r.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let corr = num / (dl * dr);
+
+    assert!(corr > 0.5, "mbit+ stereo should be positively correlated, got corr={corr:.3}");
+}

@@ -105,6 +105,11 @@ pub enum DitherMode {
     /// a stronger, ear-weighted shaper than `Shaped` (deep notch at ~4 kHz). Same
     /// s16-only gating and graceful degradation.
     Psychoacoustic,
+    /// MBIT+-style adaptive dither: psychoacoustic + temporal masking driven,
+    /// adaptive spectral redistribution, and stereo-correlated noise. This mode is
+    /// tuned for s16 delivery and gracefully degrades to flat TPDF above s16.
+    #[serde(rename = "mbit_plus")]
+    MbitPlus,
 }
 
 impl DitherMode {
@@ -116,7 +121,7 @@ impl DitherMode {
         match self {
             DitherMode::Shaped => Some(ShapingCurve::Gentle),
             DitherMode::Psychoacoustic => Some(ShapingCurve::Psychoacoustic),
-            DitherMode::Tpdf | DitherMode::None => None,
+            DitherMode::Tpdf | DitherMode::None | DitherMode::MbitPlus => None,
         }
     }
 
@@ -596,12 +601,21 @@ fn dither_tag(dither: DitherMode) -> &'static str {
         DitherMode::None => "none",
         DitherMode::Shaped => "shaped",
         DitherMode::Psychoacoustic => "psychoacoustic",
+        DitherMode::MbitPlus => "mbit_plus",
     }
 }
 
 /// Dry-run label that reflects what the quantizer will *actually* do, including
 /// the s16-only downgrade of the shaped modes to flat TPDF at higher bit depths.
 fn effective_dither_tag(dither: DitherMode, format: OutputSampleFormat) -> String {
+    if matches!(dither, DitherMode::MbitPlus) {
+        return if matches!(format, OutputSampleFormat::S16) {
+            "mbit+ adaptive dither (psychoacoustic + temporal + stereo-correlated)".to_string()
+        } else {
+            "tpdf dither (mbit+ skipped: s16 only)".to_string()
+        };
+    }
+
     if let Some(curve) = dither.shaping_curve() {
         return if dither.shapes(format) {
             format!("tpdf + noise-shaping ({})", curve.tag())
