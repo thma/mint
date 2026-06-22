@@ -228,10 +228,12 @@ fn mbit_plus_parses_and_dry_run_reflects_s16_gating() {
         [target.cd]
         preset = "cd"            # s16
         dither = "mbit_plus"
+        dither_strength = "high"
 
         [target.archive]
         preset = "hires"         # s24
         dither = "mbit_plus"
+        dither_strength = "low"
         "#,
     );
 
@@ -239,8 +241,8 @@ fn mbit_plus_parses_and_dry_run_reflects_s16_gating() {
     assert!(
         cd.describe(44_100)
             .iter()
-            .any(|s| s.contains("mbit+ adaptive dither")),
-        "s16 dry-run should advertise mbit+ mode"
+            .any(|s| s.contains("mbit+ high dither")),
+        "s16 dry-run should advertise the selected mbit+ strength"
     );
 
     let archive = config.resolve_target("archive").unwrap();
@@ -248,7 +250,7 @@ fn mbit_plus_parses_and_dry_run_reflects_s16_gating() {
         archive
             .describe(96_000)
             .iter()
-            .any(|s| s.contains("mbit+ skipped")),
+            .any(|s| s.contains("mbit+") && s.contains("skipped") && s.contains("low")),
         "s24 dry-run should note that mbit+ was skipped"
     );
 }

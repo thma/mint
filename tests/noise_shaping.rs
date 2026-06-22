@@ -37,7 +37,7 @@ fn test_signal(n: usize, amp: f64) -> Vec<f64> {
 fn quantize(signal: &[f64], mode: DitherMode, target: OutputSampleFormat, seed: u64) -> Vec<f64> {
     let mut buf = mk_buffer(signal.to_vec());
     let mut current = OutputSampleFormat::F32;
-    bitdepth::apply(&mut buf, &mut current, target, Some(mode), Some(seed)).expect("apply");
+    bitdepth::apply(&mut buf, &mut current, target, Some(mode), None, Some(seed)).expect("apply");
     buf.channels.into_iter().next().unwrap()
 }
 
@@ -83,15 +83,15 @@ fn shaped_flag_tracks_target_format() {
     let probe = || mk_buffer(vec![0.1, -0.1, 0.2, -0.3]);
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::Shaped), Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::Shaped), None, Some(1)).unwrap();
     assert!(r.shaped && r.dithered, "shaping must engage at s16");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::Shaped), Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::Shaped), None, Some(1)).unwrap();
     assert!(!r.shaped && r.dithered, "shaped must degrade to flat tpdf at s24");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::Shaped), Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::Shaped), None, Some(1)).unwrap();
     assert!(!r.shaped && !r.dithered, "f32 has no quantization to dither or shape");
 }
 
@@ -119,7 +119,7 @@ fn shaped_stereo_is_reproducible_and_per_channel() {
     let run = |seed: u64| {
         let mut buf = buffer_from(vec![sig.clone(), sig.clone()]);
         let mut current = OutputSampleFormat::F32;
-        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::Shaped), Some(seed)).unwrap();
+        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::Shaped), None, Some(seed)).unwrap();
         buf.channels
     };
 
@@ -172,15 +172,15 @@ fn psychoacoustic_flag_tracks_target_format() {
     let probe = || mk_buffer(vec![0.1, -0.1, 0.2, -0.3]);
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::Psychoacoustic), Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::Psychoacoustic), None, Some(1)).unwrap();
     assert!(r.shaped && r.dithered, "psychoacoustic shaping must engage at s16");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::Psychoacoustic), Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::Psychoacoustic), None, Some(1)).unwrap();
     assert!(!r.shaped && r.dithered, "psychoacoustic must degrade to flat tpdf at s24");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::Psychoacoustic), Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::Psychoacoustic), None, Some(1)).unwrap();
     assert!(!r.shaped && !r.dithered, "f32 has no quantization to dither or shape");
 }
 
@@ -237,15 +237,15 @@ fn mbit_plus_flag_tracks_target_format() {
     let probe = || mk_buffer(vec![0.1, -0.1, 0.2, -0.3]);
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, Some(1)).unwrap();
     assert!(r.shaped && r.dithered, "mbit+ shaping must engage at s16");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::MbitPlus), Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::MbitPlus), None, Some(1)).unwrap();
     assert!(!r.shaped && r.dithered, "mbit+ must degrade to flat tpdf at s24");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::MbitPlus), Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::MbitPlus), None, Some(1)).unwrap();
     assert!(!r.shaped && !r.dithered, "f32 has no quantization to dither or shape");
 }
 
@@ -272,7 +272,7 @@ fn mbit_plus_stereo_is_reproducible_and_decorrelated() {
     let run = |seed: u64| {
         let mut buf = buffer_from(vec![sig.clone(), sig.clone()]);
         let mut current = OutputSampleFormat::F32;
-        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), Some(seed)).unwrap();
+        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, Some(seed)).unwrap();
         buf.channels
     };
 
@@ -304,8 +304,8 @@ fn mbit_plus_dither_is_constant_amplitude() {
     let mut c_quiet = OutputSampleFormat::F32;
     let mut c_loud = OutputSampleFormat::F32;
 
-    bitdepth::apply(&mut quiet, &mut c_quiet, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), Some(42)).unwrap();
-    bitdepth::apply(&mut loud, &mut c_loud, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), Some(42)).unwrap();
+    bitdepth::apply(&mut quiet, &mut c_quiet, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, Some(42)).unwrap();
+    bitdepth::apply(&mut loud, &mut c_loud, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, Some(42)).unwrap();
 
     let max = 32_767.0;
     let noise_quiet: f64 = quiet.channels[0]
@@ -341,7 +341,7 @@ fn mbit_plus_auto_blanking_no_clipping() {
 
     let mut silence = mk_buffer(vec![0.0; silence_len]);
     let mut current = OutputSampleFormat::F32;
-    bitdepth::apply(&mut silence, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), Some(99)).unwrap();
+    bitdepth::apply(&mut silence, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, Some(99)).unwrap();
 
     // Verify output is within valid range [-1, 1] and contains only dither, no feedback artifacts.
     let max_val = silence.channels[0].iter().map(|x| x.abs()).fold(0.0, f64::max);

@@ -28,6 +28,7 @@ fn reduction_without_dither_is_allowed_for_s16() {
         &mut current,
         OutputSampleFormat::S16,
         Some(DitherMode::None),
+        None,
         Some(1),
     )
     .expect("reduction with dither none should succeed");
@@ -48,6 +49,7 @@ fn reduction_without_dither_is_allowed_for_s24() {
         &mut current,
         OutputSampleFormat::S24,
         Some(DitherMode::None),
+        None,
         Some(1),
     )
     .expect("reduction to s24 with dither none should succeed");
@@ -71,6 +73,7 @@ fn seeded_tpdf_is_reproducible() {
         &mut current_a,
         OutputSampleFormat::S16,
         Some(DitherMode::Tpdf),
+        None,
         Some(42),
     )
     .expect("apply should succeed");
@@ -80,6 +83,7 @@ fn seeded_tpdf_is_reproducible() {
         &mut current_b,
         OutputSampleFormat::S16,
         Some(DitherMode::Tpdf),
+        None,
         Some(42),
     )
     .expect("apply should succeed");
@@ -97,6 +101,7 @@ fn quantized_samples_snap_to_integer_grid() {
         &mut current,
         OutputSampleFormat::S16,
         Some(DitherMode::Tpdf),
+        None,
         Some(7),
     )
     .expect("apply should succeed");

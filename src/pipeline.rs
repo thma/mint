@@ -165,8 +165,14 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
             // WAV and FLAC quantize the full-precision buffer exactly once, with dither.
             let mut current = OutputSampleFormat::F32;
             let in_format = current;
-            let bd =
-                bitdepth::apply(&mut buffer, &mut current, target.format, Some(target.dither), seed)?;
+            let bd = bitdepth::apply(
+                &mut buffer,
+                &mut current,
+                target.format,
+                Some(target.dither),
+                Some(target.dither_strength),
+                seed,
+            )?;
             dithered = bd.dithered;
             shaped = bd.shaped;
             shaping_curve = bd.shaping_tag;

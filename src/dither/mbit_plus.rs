@@ -26,6 +26,14 @@ pub enum MbitPlusStrength {
 }
 
 impl MbitPlusStrength {
+    pub fn from_config(value: crate::config::DitherStrength) -> Self {
+        match value {
+            crate::config::DitherStrength::Low => MbitPlusStrength::Low,
+            crate::config::DitherStrength::Normal => MbitPlusStrength::Normal,
+            crate::config::DitherStrength::High => MbitPlusStrength::High,
+        }
+    }
+
     /// FIR-Koeffizienten für diese Stärke @ 44.1 kHz.
     fn coeffs_441(&self) -> &'static [f64] {
         match self {

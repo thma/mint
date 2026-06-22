@@ -56,6 +56,7 @@ pub struct RawTarget {
     pub warn_limiting_db: Option<f64>,
     pub quality: Option<ResampleQuality>,
     pub dither: Option<DitherMode>,
+    pub dither_strength: Option<DitherStrength>,
     /// Output container/codec: `wav` (default), `flac`, or `mp3`. Orthogonal to
     /// `format` — FLAC reuses the integer bit depth; MP3 ignores it (lossy).
     pub codec: Option<OutputCodec>,
@@ -90,6 +91,14 @@ pub enum OnClipPolicy {
 pub enum LimiterCharacter {
     Balanced,
     Transient,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DitherStrength {
+    Low,
+    Normal,
+    High,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -194,6 +203,7 @@ pub struct ResolvedTarget {
     pub warn_limiting_db: f64,
     pub quality: ResampleQuality,
     pub dither: DitherMode,
+    pub dither_strength: DitherStrength,
     pub codec: OutputCodec,
     /// Write a Broadcast WAV `bext` chunk (WAV only).
     pub bwf: bool,
@@ -277,9 +287,10 @@ impl ResolvedTarget {
                         steps.push("write f32 (no quantization)".to_string())
                     }
                     other => steps.push(format!(
-                        "quantize -> {} + {}",
+                        "quantize -> {} + {} ({})",
                         format_tag(other),
-                        effective_dither_tag(self.dither, other)
+                        effective_dither_tag(self.dither, self.dither_strength, other),
+                        dither_strength_tag(self.dither_strength)
                     )),
                 }
                 let container = match codec {
@@ -350,6 +361,7 @@ impl Config {
             warn_limiting_db: merged.warn_limiting_db.unwrap(),
             quality: merged.quality.unwrap(),
             dither: merged.dither.unwrap(),
+            dither_strength: merged.dither_strength.unwrap_or(DitherStrength::Normal),
             codec,
             bwf: merged.bwf.unwrap(),
             mp3_bitrate: merged.mp3_bitrate.unwrap(),
@@ -452,6 +464,7 @@ fn overlay(base: RawTarget, top: RawTarget) -> RawTarget {
         warn_limiting_db: top.warn_limiting_db.or(base.warn_limiting_db),
         quality: top.quality.or(base.quality),
         dither: top.dither.or(base.dither),
+        dither_strength: top.dither_strength.or(base.dither_strength),
         codec: top.codec.or(base.codec),
         bwf: top.bwf.or(base.bwf),
         mp3_bitrate: top.mp3_bitrate.or(base.mp3_bitrate),
@@ -476,6 +489,7 @@ fn builtin_fallback() -> RawTarget {
         warn_limiting_db: Some(1.0),
         quality: Some(ResampleQuality::Vhq),
         dither: Some(DitherMode::Tpdf),
+        dither_strength: Some(DitherStrength::Normal),
         codec: Some(OutputCodec::Wav),
         bwf: Some(false),
         mp3_bitrate: Some(320),
@@ -605,14 +619,32 @@ fn dither_tag(dither: DitherMode) -> &'static str {
     }
 }
 
+fn dither_strength_tag(strength: DitherStrength) -> &'static str {
+    match strength {
+        DitherStrength::Low => "low",
+        DitherStrength::Normal => "normal",
+        DitherStrength::High => "high",
+    }
+}
+
 /// Dry-run label that reflects what the quantizer will *actually* do, including
 /// the s16-only downgrade of the shaped modes to flat TPDF at higher bit depths.
-fn effective_dither_tag(dither: DitherMode, format: OutputSampleFormat) -> String {
+fn effective_dither_tag(
+    dither: DitherMode,
+    strength: DitherStrength,
+    format: OutputSampleFormat,
+) -> String {
     if matches!(dither, DitherMode::MbitPlus) {
         return if matches!(format, OutputSampleFormat::S16) {
-            "mbit+ adaptive dither (psychoacoustic + temporal + stereo-correlated)".to_string()
+            format!(
+                "mbit+ {} dither (static minimal-phase, rate-aware)",
+                dither_strength_tag(strength)
+            )
         } else {
-            "tpdf dither (mbit+ skipped: s16 only)".to_string()
+            format!(
+                "tpdf dither (mbit+ {} skipped: s16 only)",
+                dither_strength_tag(strength)
+            )
         };
     }
 
