@@ -57,6 +57,8 @@ pub struct RawTarget {
     pub quality: Option<ResampleQuality>,
     pub dither: Option<DitherMode>,
     pub dither_strength: Option<DitherStrength>,
+    /// Phase 4.4: Stereo/multi-channel dither correlation mode (default: Decorrelated).
+    pub dither_correlation: Option<DitherCorrelation>,
     /// Output container/codec: `wav` (default), `flac`, or `mp3`. Orthogonal to
     /// `format` — FLAC reuses the integer bit depth; MP3 ignores it (lossy).
     pub codec: Option<OutputCodec>,
@@ -99,6 +101,43 @@ pub enum DitherStrength {
     Low,
     Normal,
     High,
+}
+
+/// Phase 4.4: Stereo and multi-channel dither correlation mode.
+///
+/// By default, each channel gets independent (decorrelated) TPDF noise, which
+/// maximizes the SNR benefit of dithering: the quantization error is uncorrelated
+/// across channels, so it won't create audible artifacts in the stereo image.
+///
+/// Alternative modes are available for specialized use cases:
+/// - `Correlated`: All channels share the same dither noise. This can be useful
+///   for certain mastering workflows but reduces SNR and may create subtle
+///   imaging artifacts.
+/// - `MidSide`: Dither is applied to mid (L+R) and side (L-R) channels separately,
+///   then reconstructed to L and R. Provides a balance between decorrelation and
+///   stereo coherence.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DitherCorrelation {
+    /// Default: Each channel gets independent dither (decorrelated).
+    /// Pros: Maximum SNR, no imaging artifacts.
+    /// Cons: Slight stereo width in the dither noise.
+    Decorrelated,
+    /// All channels share identical dither noise.
+    /// Pros: Mono dither noise (no stereo width).
+    /// Cons: Reduced SNR per channel, potential imaging artifacts.
+    Correlated,
+    /// Dither applied to mid (L+R) and side (L-R) channels, then reconstructed.
+    /// Pros: Balanced between SNR and stereo coherence.
+    /// Cons: Moderate complexity.
+    #[serde(rename = "mid_side")]
+    MidSide,
+}
+
+impl Default for DitherCorrelation {
+    fn default() -> Self {
+        DitherCorrelation::Decorrelated
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -204,6 +243,7 @@ pub struct ResolvedTarget {
     pub quality: ResampleQuality,
     pub dither: DitherMode,
     pub dither_strength: DitherStrength,
+    pub dither_correlation: DitherCorrelation,
     pub codec: OutputCodec,
     /// Write a Broadcast WAV `bext` chunk (WAV only).
     pub bwf: bool,
@@ -362,6 +402,7 @@ impl Config {
             quality: merged.quality.unwrap(),
             dither: merged.dither.unwrap(),
             dither_strength: merged.dither_strength.unwrap_or(DitherStrength::Normal),
+            dither_correlation: merged.dither_correlation.unwrap_or_default(),
             codec,
             bwf: merged.bwf.unwrap(),
             mp3_bitrate: merged.mp3_bitrate.unwrap(),
@@ -465,6 +506,7 @@ fn overlay(base: RawTarget, top: RawTarget) -> RawTarget {
         quality: top.quality.or(base.quality),
         dither: top.dither.or(base.dither),
         dither_strength: top.dither_strength.or(base.dither_strength),
+        dither_correlation: top.dither_correlation.or(base.dither_correlation),
         codec: top.codec.or(base.codec),
         bwf: top.bwf.or(base.bwf),
         mp3_bitrate: top.mp3_bitrate.or(base.mp3_bitrate),
@@ -490,6 +532,7 @@ fn builtin_fallback() -> RawTarget {
         quality: Some(ResampleQuality::Vhq),
         dither: Some(DitherMode::Tpdf),
         dither_strength: Some(DitherStrength::Normal),
+        dither_correlation: None,
         codec: Some(OutputCodec::Wav),
         bwf: Some(false),
         mp3_bitrate: Some(320),

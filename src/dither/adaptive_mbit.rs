@@ -16,11 +16,11 @@
 //! - Blauert & Laws (1978), "Group Delay Distortions in Electroacoustics", JAES
 
 use rustfft::{num_complex::Complex, FftPlanner};
-use rand::{Rng, SeedableRng};
-use rand::rngs::StdRng;
 
 use crate::dither::psychoacoustic::PsychoacousticAnalysis;
 use crate::audio::buffer::AudioBuffer;
+use crate::config::DitherCorrelation;
+use crate::dither::multichannel::MultiChannelDither;
 
 /// Maximum FIR order for adaptive filters. Balances expressiveness (ability to shape
 /// across many bands) with computational cost and numerical stability. Typical range
@@ -268,6 +268,7 @@ pub fn quantize_adaptive(
     min_i: i32,
     max_i: i32,
     shaper: &AdaptiveShaper,
+    correlation: DitherCorrelation,
     seed: Option<u64>,
 ) {
     if buffer.channels.is_empty() || buffer.frame_len() == 0 {
@@ -279,15 +280,9 @@ pub fn quantize_adaptive(
     let mut states = vec![AdaptiveChannelState::new(max_coeffs_len); ch_count];
     let blanking_threshold = (buffer.sample_rate as usize) / 20; // 50 ms
 
-    // Import needed for TPDF and per_channel_seed (these are in mbit_plus module).
-    // We'll use inline implementations since we don't want to expose them publicly.
-    let mut rng = StdRng::seed_from_u64(seed.unwrap_or_else(|| 0x_FEED_B00B_DEADBEEF_u64));
-    let mut per_ch_rngs = (0..ch_count)
-        .map(|ch| {
-            let per_ch_seed = seed.map(|s| s ^ (ch as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            StdRng::seed_from_u64(per_ch_seed.unwrap_or_else(|| 0x_CAFE_F00D_u64 ^ ch as u64))
-        })
-        .collect::<Vec<_>>();
+    // Create multi-channel dither generator with selected correlation mode.
+    let mut dither_gen = MultiChannelDither::new(ch_count, correlation, seed);
+    let mut dither_samples = vec![0.0; ch_count];
 
     for n in 0..buffer.frame_len() {
         // Get adaptive coefficients for this sample (linearly interpolated between frames).
@@ -323,16 +318,13 @@ pub fn quantize_adaptive(
                 .map(|(c, e)| c * e)
                 .sum::<f64>();
 
-            // Constant TPDF dither (±0.5 LSB per source, total ±1 LSB).
-            let dither = if ch == 0 {
-                let a = rng.gen_range(-0.5..0.5);
-                let b = rng.gen_range(-0.5..0.5);
-                a + b
-            } else {
-                let a = per_ch_rngs[ch].gen_range(-0.5..0.5);
-                let b = per_ch_rngs[ch].gen_range(-0.5..0.5);
-                a + b
-            };
+            // Generate dither samples for all channels at this sample index.
+            if ch == 0 {
+                dither_samples = dither_gen.sample_lsb_all();
+            }
+
+            // Get dither sample for this channel.
+            let dither = dither_samples[ch];
 
             // Quantize: shaped input + dither → round → clamp.
             let s = x.clamp(-1.0, 1.0) * max;

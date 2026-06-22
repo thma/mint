@@ -11,6 +11,8 @@
 //! - Per-Channel Noise-Unabhängigkeit, deterministische Stereo-Korrelation.
 
 use crate::audio::buffer::AudioBuffer;
+use crate::config::DitherCorrelation;
+use crate::dither::multichannel::MultiChannelDither;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -147,6 +149,7 @@ pub fn quantize(
     min_i: i32,
     max_i: i32,
     strength: MbitPlusStrength,
+    correlation: DitherCorrelation,
     seed: Option<u64>,
 ) {
     if buffer.channels.is_empty() || buffer.frame_len() == 0 {
@@ -156,12 +159,12 @@ pub fn quantize(
     let coeffs = strength.coeffs(buffer.sample_rate);
     let ch_count = buffer.channels_count();
 
-    // Initialize per-channel state + per-channel RNG.
+    // Initialize per-channel state.
     let mut states = vec![ChannelState::new(coeffs.len(), buffer.sample_rate); ch_count];
-    let mut rng = TpdfDither::new(seed);
-    let mut per_ch_rngs = (0..ch_count)
-        .map(|ch| TpdfDither::new(per_channel_seed(seed, ch)))
-        .collect::<Vec<_>>();
+    
+    // Create multi-channel dither generator with selected correlation mode.
+    let mut dither_gen = MultiChannelDither::new(ch_count, correlation, seed);
+    let mut dither_samples = vec![0.0; ch_count];
 
     for n in 0..buffer.frame_len() {
         for ch in 0..ch_count {
@@ -187,13 +190,13 @@ pub fn quantize(
             // Feedback term: apply FIR to error history.
             let fb = coeffs.iter().zip(&state.error_hist).map(|(c, e)| c * e).sum::<f64>();
 
-            // Constant TPDF dither: 2 LSB pp (±1 LSB).
-            let dither = if ch == 0 {
-                rng.sample_lsb()
-            } else {
-                // Decorrelated per-channel dither.
-                per_ch_rngs[ch].sample_lsb()
-            };
+            // Generate dither samples for all channels at this sample index.
+            if ch == 0 {
+                dither_samples = dither_gen.sample_lsb_all();
+            }
+
+            // Get dither sample for this channel.
+            let dither = dither_samples[ch];
 
             // Quantization: shaped input → dither → round → clamp.
             let s = x.clamp(-1.0, 1.0) * max;
@@ -211,15 +214,21 @@ pub fn quantize(
 }
 
 /// Per-Channel seed derivation for decorrelated TPDF.
+/// Deterministic distinct sub-seed per channel, so each channel gets independent TPDF.
+/// (Replaced by MultiChannelDither in Phase 4.4, but kept for reference.)
+#[allow(dead_code)]
 fn per_channel_seed(seed: Option<u64>, channel: usize) -> Option<u64> {
     seed.map(|s| s ^ (channel as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
 /// Portable TPDF dither generator.
+/// (Replaced by MultiChannelDither in Phase 4.4, but kept for reference.)
+#[allow(dead_code)]
 struct TpdfDither {
     rng: StdRng,
 }
 
+#[allow(dead_code)]
 impl TpdfDither {
     fn new(seed: Option<u64>) -> Self {
         let rng = match seed {

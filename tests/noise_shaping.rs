@@ -6,6 +6,7 @@ use mint::config::DitherMode;
 use mint::dither::mbit_plus::MbitPlusStrength;
 use mint::dither::psychoacoustic::{PsychoacousticAnalysis, FRAME_SIZE, HOP_SIZE};
 use mint::dither::adaptive_mbit::AdaptiveShaper;
+use mint::dither::multichannel::{MultiChannelDither, DitherCorrelation};
 use mint::ops::bitdepth;
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
@@ -42,7 +43,7 @@ fn test_signal(n: usize, amp: f64) -> Vec<f64> {
 fn quantize(signal: &[f64], mode: DitherMode, target: OutputSampleFormat, seed: u64) -> Vec<f64> {
     let mut buf = mk_buffer(signal.to_vec());
     let mut current = OutputSampleFormat::F32;
-    bitdepth::apply(&mut buf, &mut current, target, Some(mode), None, Some(seed)).expect("apply");
+    bitdepth::apply(&mut buf, &mut current, target, Some(mode), None, None, Some(seed)).expect("apply");
     buf.channels.into_iter().next().unwrap()
 }
 
@@ -140,15 +141,15 @@ fn shaped_flag_tracks_target_format() {
     let probe = || mk_buffer(vec![0.1, -0.1, 0.2, -0.3]);
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::Shaped), None, Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::Shaped), None, None, Some(1)).unwrap();
     assert!(r.shaped && r.dithered, "shaping must engage at s16");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::Shaped), None, Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::Shaped), None, None, Some(1)).unwrap();
     assert!(!r.shaped && r.dithered, "shaped must degrade to flat tpdf at s24");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::Shaped), None, Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::Shaped), None, None, Some(1)).unwrap();
     assert!(!r.shaped && !r.dithered, "f32 has no quantization to dither or shape");
 }
 
@@ -176,7 +177,7 @@ fn shaped_stereo_is_reproducible_and_per_channel() {
     let run = |seed: u64| {
         let mut buf = buffer_from(vec![sig.clone(), sig.clone()]);
         let mut current = OutputSampleFormat::F32;
-        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::Shaped), None, Some(seed)).unwrap();
+        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::Shaped), None, None, Some(seed)).unwrap();
         buf.channels
     };
 
@@ -229,15 +230,15 @@ fn psychoacoustic_flag_tracks_target_format() {
     let probe = || mk_buffer(vec![0.1, -0.1, 0.2, -0.3]);
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::Psychoacoustic), None, Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::Psychoacoustic), None, None, Some(1)).unwrap();
     assert!(r.shaped && r.dithered, "psychoacoustic shaping must engage at s16");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::Psychoacoustic), None, Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::Psychoacoustic), None, None, Some(1)).unwrap();
     assert!(!r.shaped && r.dithered, "psychoacoustic must degrade to flat tpdf at s24");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::Psychoacoustic), None, Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::Psychoacoustic), None, None, Some(1)).unwrap();
     assert!(!r.shaped && !r.dithered, "f32 has no quantization to dither or shape");
 }
 
@@ -294,15 +295,15 @@ fn mbit_plus_flag_tracks_target_format() {
     let probe = || mk_buffer(vec![0.1, -0.1, 0.2, -0.3]);
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, None, Some(1)).unwrap();
     assert!(r.shaped && r.dithered, "mbit+ shaping must engage at s16");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::MbitPlus), None, Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::MbitPlus), None, None, Some(1)).unwrap();
     assert!(!r.shaped && r.dithered, "mbit+ must degrade to flat tpdf at s24");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::MbitPlus), None, Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::MbitPlus), None, None, Some(1)).unwrap();
     assert!(!r.shaped && !r.dithered, "f32 has no quantization to dither or shape");
 }
 
@@ -329,7 +330,7 @@ fn mbit_plus_stereo_is_reproducible_and_decorrelated() {
     let run = |seed: u64| {
         let mut buf = buffer_from(vec![sig.clone(), sig.clone()]);
         let mut current = OutputSampleFormat::F32;
-        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, Some(seed)).unwrap();
+        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, None, Some(seed)).unwrap();
         buf.channels
     };
 
@@ -361,8 +362,8 @@ fn mbit_plus_dither_is_constant_amplitude() {
     let mut c_quiet = OutputSampleFormat::F32;
     let mut c_loud = OutputSampleFormat::F32;
 
-    bitdepth::apply(&mut quiet, &mut c_quiet, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, Some(42)).unwrap();
-    bitdepth::apply(&mut loud, &mut c_loud, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, Some(42)).unwrap();
+    bitdepth::apply(&mut quiet, &mut c_quiet, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, None, Some(42)).unwrap();
+    bitdepth::apply(&mut loud, &mut c_loud, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, None, Some(42)).unwrap();
 
     let max = 32_767.0;
     let noise_quiet: f64 = quiet.channels[0]
@@ -398,7 +399,7 @@ fn mbit_plus_auto_blanking_no_clipping() {
 
     let mut silence = mk_buffer(vec![0.0; silence_len]);
     let mut current = OutputSampleFormat::F32;
-    bitdepth::apply(&mut silence, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, Some(99)).unwrap();
+    bitdepth::apply(&mut silence, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, None, Some(99)).unwrap();
 
     // Exact silence should stay exact silence once blanking is active.
     let max_val = silence.channels[0].iter().map(|x| x.abs()).fold(0.0, f64::max);
@@ -702,7 +703,7 @@ fn phase_4_3_adaptive_quantization_applies_coefficients() {
     let mut buf = mk_buffer(sig.iter().map(|&s| s * 0.05).collect::<Vec<_>>());
 
     // Apply adaptive quantization.
-    quantize_adaptive(&mut buf, 32_767.0, -32_768, 32_767, &shaper, Some(42));
+    quantize_adaptive(&mut buf, 32_767.0, -32_768, 32_767, &shaper, DitherCorrelation::Decorrelated, Some(42));
 
     // Verify the output is quantized to s16 range.
     for ch in 0..buf.channels_count() {
@@ -737,8 +738,8 @@ fn phase_4_3_adaptive_quantization_is_reproducible() {
     let mut buf2 = mk_buffer(sig);
 
     // Quantize with same seed.
-    quantize_adaptive(&mut buf1, 32_767.0, -32_768, 32_767, &shaper, Some(100));
-    quantize_adaptive(&mut buf2, 32_767.0, -32_768, 32_767, &shaper, Some(100));
+    quantize_adaptive(&mut buf1, 32_767.0, -32_768, 32_767, &shaper, DitherCorrelation::Decorrelated, Some(100));
+    quantize_adaptive(&mut buf2, 32_767.0, -32_768, 32_767, &shaper, DitherCorrelation::Decorrelated, Some(100));
 
     // Should be bit-identical.
     for (s1, s2) in buf1.channels[0].iter().zip(buf2.channels[0].iter()) {
@@ -762,7 +763,7 @@ fn phase_4_3_adaptive_quantization_stereo_is_decorrelated() {
     ]);
 
     // Apply adaptive quantization.
-    quantize_adaptive(&mut buf, 32_767.0, -32_768, 32_767, &shaper, Some(50));
+    quantize_adaptive(&mut buf, 32_767.0, -32_768, 32_767, &shaper, DitherCorrelation::Decorrelated, Some(50));
 
     // Filter to nonzero samples only (where we actually have quantization noise).
     let mut same_count = 0;
@@ -820,5 +821,157 @@ fn phase_4_3_premaske_look_ahead_uses_future_frames() {
     assert!(
         coeff_diff > 0.01,
         "adaptive coefficients should reflect masking differences between quiet and loud regions"
+    );
+}
+
+// ===== Phase 4.4: Multi-Channel Dither Correlation Tests =====
+
+#[test]
+fn phase_4_4_decorrelated_dither_stereo_channels_independent() {
+    let mut dither_gen = MultiChannelDither::new(2, DitherCorrelation::Decorrelated, Some(42));
+    let mut samples_l = Vec::new();
+    let mut samples_r = Vec::new();
+    
+    for _ in 0..1000 {
+        let dither = dither_gen.sample_lsb_all();
+        samples_l.push(dither[0]);
+        samples_r.push(dither[1]);
+    }
+    
+    // Channels should differ on average, not perfectly correlated.
+    let mean_diff = samples_l
+        .iter()
+        .zip(samples_r.iter())
+        .map(|(l, r): (&f64, &f64)| (l - r).abs())
+        .sum::<f64>() / 1000.0;
+    
+    assert!(
+        mean_diff > 0.2,
+        "decorrelated dither should produce different L/R samples on average (mean_diff={mean_diff})"
+    );
+}
+
+#[test]
+fn phase_4_4_correlated_dither_stereo_channels_identical() {
+    let mut dither_gen = MultiChannelDither::new(2, DitherCorrelation::Correlated, Some(42));
+    let mut identical_count = 0;
+    
+    for _ in 0..100 {
+        let dither = dither_gen.sample_lsb_all();
+        if (dither[0] - dither[1]).abs() < 1e-10 {
+            identical_count += 1;
+        }
+    }
+    
+    assert_eq!(
+        identical_count, 100,
+        "correlated dither must produce identical L/R samples (got {identical_count}/100)"
+    );
+}
+
+#[test]
+fn phase_4_4_mid_side_dither_stereo_uncorrelated() {
+    let mut dither_gen = MultiChannelDither::new(2, DitherCorrelation::MidSide, Some(42));
+    let mut samples_l = Vec::new();
+    let mut samples_r = Vec::new();
+    
+    for _ in 0..1000 {
+        let dither = dither_gen.sample_lsb_all();
+        samples_l.push(dither[0]);
+        samples_r.push(dither[1]);
+    }
+    
+    // Mid-side should produce different L/R, but with balanced energy on M and S.
+    let mean_diff = samples_l
+        .iter()
+        .zip(samples_r.iter())
+        .map(|(l, r): (&f64, &f64)| (l - r).abs())
+        .sum::<f64>() / 1000.0;
+    
+    assert!(
+        mean_diff > 0.2,
+        "mid-side dither should produce different L/R samples (mean_diff={mean_diff})"
+    );
+}
+
+#[test]
+fn phase_4_4_multichannel_decorrelated_all_channels_independent() {
+    let mut dither_gen = MultiChannelDither::new(6, DitherCorrelation::Decorrelated, Some(100));
+    let mut channel_dither = vec![Vec::new(); 6];
+    
+    for _ in 0..500 {
+        let dither = dither_gen.sample_lsb_all();
+        for ch in 0..6 {
+            channel_dither[ch].push(dither[ch]);
+        }
+    }
+    
+    // Check pairwise differences: channels should not be correlated.
+    let mut distinct_channel_count = 0;
+    for i in 1..6 {
+        let mean_diff = channel_dither[0]
+            .iter()
+            .zip(channel_dither[i].iter())
+            .map(|(a, b): (&f64, &f64)| (a - b).abs())
+            .sum::<f64>() / 500.0;
+        
+        if mean_diff > 0.15 {
+            distinct_channel_count += 1;
+        }
+    }
+    
+    assert!(
+        distinct_channel_count >= 4,
+        "decorrelated multi-channel should have most channels independent (got {distinct_channel_count}/5 pairs distinct)"
+    );
+}
+
+#[test]
+fn phase_4_4_multichannel_correlated_all_channels_identical() {
+    let mut dither_gen = MultiChannelDither::new(6, DitherCorrelation::Correlated, Some(100));
+    
+    for _ in 0..100 {
+        let dither = dither_gen.sample_lsb_all();
+        assert_eq!(dither.len(), 6, "should return 6 samples");
+        
+        // All channels must be identical.
+        for i in 1..6 {
+            assert_eq!(
+                dither[i], dither[0],
+                "correlated dither must produce identical samples across all channels"
+            );
+        }
+    }
+}
+
+#[test]
+fn phase_4_4_multichannel_mid_side_falls_back_for_6ch() {
+    let mut dither_gen = MultiChannelDither::new(6, DitherCorrelation::MidSide, Some(100));
+    let mut channel_dither = vec![Vec::new(); 6];
+    
+    for _ in 0..500 {
+        let dither = dither_gen.sample_lsb_all();
+        for ch in 0..6 {
+            channel_dither[ch].push(dither[ch]);
+        }
+    }
+    
+    // For >2 channels, mid-side should fall back to decorrelated.
+    let mut distinct_channel_count = 0;
+    for i in 1..6 {
+        let mean_diff = channel_dither[0]
+            .iter()
+            .zip(channel_dither[i].iter())
+            .map(|(a, b): (&f64, &f64)| (a - b).abs())
+            .sum::<f64>() / 500.0;
+        
+        if mean_diff > 0.15 {
+            distinct_channel_count += 1;
+        }
+    }
+    
+    assert!(
+        distinct_channel_count >= 4,
+        "mid-side for >2 channels should fall back to decorrelated (got {distinct_channel_count}/5 pairs distinct)"
     );
 }

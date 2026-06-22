@@ -8,6 +8,8 @@ pub mod mbit_plus;
 pub mod psychoacoustic;
 /// Phase 4.2 adaptive minimal-phase filter design with coefficient interpolation.
 pub mod adaptive_mbit;
+/// Phase 4.4 stereo/multi-channel dither correlation modes (decorrelated, correlated, mid-side).
+pub mod multichannel;
 
 pub struct TpdfDither {
     rng: StdRng,
@@ -42,7 +44,16 @@ pub fn quantize_mbit_plus(
     max_i: i32,
     seed: Option<u64>,
 ) {
-    mbit_plus::quantize(buffer, max, min_i, max_i, mbit_plus::MbitPlusStrength::Normal, seed);
+    use crate::config::DitherCorrelation;
+    mbit_plus::quantize(
+        buffer,
+        max,
+        min_i,
+        max_i,
+        mbit_plus::MbitPlusStrength::Normal,
+        DitherCorrelation::Decorrelated,
+        seed,
+    );
 }
 
 /// Noise-transfer curve for the shaper. Coeffs are the error-feedback FIR `h_k`;

@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::audio::buffer::{AudioBuffer, OutputSampleFormat};
-use crate::config::{DitherMode, DitherStrength};
+use crate::config::{DitherMode, DitherStrength, DitherCorrelation};
 use crate::dither::{NoiseShaper, ShapingCurve, TpdfDither};
 use crate::dither::mbit_plus::{self, MbitPlusStrength};
 
@@ -21,6 +21,7 @@ pub fn apply(
     target: OutputSampleFormat,
     dither_mode: Option<DitherMode>,
     dither_strength: Option<DitherStrength>,
+    dither_correlation: Option<DitherCorrelation>,
     seed: Option<u64>,
 ) -> Result<BitDepthApplyResult> {
     let mode = dither_mode.unwrap_or(DitherMode::Tpdf);
@@ -43,7 +44,8 @@ pub fn apply(
     };
 
     if reduced {
-        quantize_in_place(buffer, target, mode, dither_strength, dithered, curve, seed);
+        let correlation = dither_correlation.unwrap_or_default();
+        quantize_in_place(buffer, target, mode, dither_strength, dithered, curve, correlation, seed);
     }
 
     *current = target;
@@ -80,6 +82,7 @@ fn quantize_in_place(
     dither_strength: Option<DitherStrength>,
     use_dither: bool,
     curve: Option<ShapingCurve>,
+    correlation: DitherCorrelation,
     seed: Option<u64>,
 ) {
     // Only ever called on a reduction, so the target is always an integer format
@@ -90,7 +93,7 @@ fn quantize_in_place(
 
     if is_mbit_plus(mode, target) {
         let strength = MbitPlusStrength::from_config(dither_strength.unwrap_or(DitherStrength::Normal));
-        mbit_plus::quantize(buffer, max, min_i, max_i, strength, seed);
+        mbit_plus::quantize(buffer, max, min_i, max_i, strength, correlation, seed);
         return;
     }
 

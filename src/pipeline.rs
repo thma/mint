@@ -171,6 +171,7 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
                 target.format,
                 Some(target.dither),
                 Some(target.dither_strength),
+                Some(target.dither_correlation),
                 seed,
             )?;
             dithered = bd.dithered;
