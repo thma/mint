@@ -1,4 +1,4 @@
-# mint
+![mint](mint-logo.png)
 
 Cross-platform audio CLI in Rust. Render high-resolution masters into one or more
 distribution targets defined declaratively in TOML — you describe the *deliverable*
