@@ -30,8 +30,9 @@ What it does:
 - Bit-depth conversion with seeded TPDF dither, quantizing the f64 buffer exactly once;
   optional s16-focused enhancement modes: gentle error-feedback shaping
   (`dither = "shaped"`), published psychoacoustic shaping (`dither = "psychoacoustic"`),
-  or adaptive MBIT+-style dithering (`dither = "mbit_plus"`) with psychoacoustic and
-  temporal masking plus stereo-correlated noise.
+  or adaptive MBIT+-style dithering (`dither = "mbit_plus"`) driven by a per-frame
+  psychoacoustic masking analysis, with configurable stereo/multichannel dither
+  correlation.
 - Output formats: **WAV** (f32/s16/s24) — optionally **Broadcast WAV** (`bwf = true`,
   a `bext` chunk carrying real EBU R128 loudness metadata measured from the delivery) —
   **FLAC** (lossless, pure-Rust), and **MP3** (`--features mp3`, libmp3lame built from
@@ -165,7 +166,7 @@ dither = "shaped"            # explicit -> overrides the [defaults] psychoacoust
 [target.cd-mbit]
 preset = "cd"
 lufs   = -12.0
-dither = "mbit_plus"         # adaptive psychoacoustic + temporal mode
+dither = "mbit_plus"         # adaptive psychoacoustic mode (s16 only)
 
 # 5. No preset at all — set the fields directly.
 [target.archive]

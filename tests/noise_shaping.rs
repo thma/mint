@@ -407,6 +407,51 @@ fn mbit_plus_auto_blanking_no_clipping() {
     assert!(silence.channels[0].iter().all(|&x| x == 0.0), "silence should be rendered as exact zero after blanking");
 }
 
+/// Auto-blanking must LATCH: a sub-half-LSB (but nonzero) noise floor has to be
+/// gated to exact zero after ~50 ms. Nonzero input matters — exact zeros take the
+/// separate `x == 0.0` fast path, which is what the test above already covers.
+/// Regression: the counter used to reset on trigger, re-arming the 50 ms window
+/// every sample and leaking dither through the entire "silence".
+#[test]
+fn mbit_plus_auto_blanking_gates_sub_lsb_noise_floor() {
+    let n = SR as usize; // 1 s
+    let sub_lsb = vec![0.3 / 32_767.0; n];
+    let out = quantize(&sub_lsb, DitherMode::MbitPlus, OutputSampleFormat::S16, 7);
+
+    // Gate must be closed from the first sample past the 50 ms threshold.
+    let after_gate = &out[(SR as usize / 20) + 1..];
+    let leaked = after_gate.iter().filter(|&&x| x != 0.0).count();
+    assert_eq!(
+        leaked, 0,
+        "sub-LSB noise floor must be gated to exact zero after ~50 ms, {leaked} samples leaked dither"
+    );
+}
+
+/// A digitally silent channel must not starve the OTHER channels of dither: with
+/// ch0 all-zero, ch1 still has to receive seeded TPDF, so different seeds must give
+/// different output. Regression: the dither draw sat behind `ch == 0` after the
+/// silence `continue`s, leaving ch1 to quantize against the 0.0-initialized buffer
+/// (undithered truncation) whenever ch0 was silent.
+#[test]
+fn mbit_plus_silent_channel_does_not_starve_others_of_dither() {
+    let n = SR as usize / 4;
+    let silent = vec![0.0f64; n];
+    let music = test_signal(n, 0.01);
+
+    let run = |seed: u64| {
+        let mut buf = buffer_from(vec![silent.clone(), music.clone()]);
+        let mut current = OutputSampleFormat::F32;
+        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, None, Some(seed)).unwrap();
+        buf.channels.into_iter().nth(1).unwrap()
+    };
+
+    assert_ne!(
+        run(111),
+        run(222),
+        "ch1 must be dithered (seed-dependent) even when ch0 is digital silence"
+    );
+}
+
 /// Phase 3: FFT validation of the static NTF tables. The filter should suppress the
 /// ear-sensitive low band much more than the high band, and stronger modes should
 /// suppress it more than weaker ones.

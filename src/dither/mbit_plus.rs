@@ -150,10 +150,13 @@ impl ChannelState {
         self.error_hist[0] = e;
     }
 
-    /// Reset error history and blanking counter.
-    fn reset(&mut self) {
+    /// Feedback-Historie nullen, wenn der Output auf exakt 0 gezwungen wird —
+    /// sonst leckt alter geformter Fehler in das nächste hörbare Sample. Lässt
+    /// `blanking_count` bewusst stehen: das Blanking-Gate muss durch die Stille
+    /// hindurch eingerastet bleiben (ein Reset würde das 50-ms-Fenster neu
+    /// aufziehen und Dither in die "Stille" lecken).
+    fn clear_feedback(&mut self) {
         self.error_hist.fill(0.0);
-        self.blanking_count = 0;
     }
 
     /// Check if blanking should be applied (silence).
@@ -193,6 +196,12 @@ pub fn quantize(
     let mut dither_samples = vec![0.0; ch_count];
 
     for n in 0..buffer.frame_len() {
+        // Ein Draw pro Sample-Index für ALLE Kanäle, vor dem per-Kanal-Silence-Gating.
+        // Hinter `ch == 0` darf der Draw nicht liegen: ein stiller ch0 würde ihn
+        // überspringen und alle anderen Kanäle ohne Dither lassen (Quantisierung
+        // gegen den 0.0-initialisierten Puffer = undithered Truncation).
+        dither_gen.sample_lsb_all_into(&mut dither_samples);
+
         for ch in 0..ch_count {
             let state = &mut states[ch];
             let x = buffer.channels[ch][n];
@@ -200,26 +209,22 @@ pub fn quantize(
             // Auto-blanking: when silent long enough, shut off dither and feedback.
             if state.should_blank(x) {
                 buffer.channels[ch][n] = 0.0;
-                state.reset();
+                state.clear_feedback();
                 continue;
             }
 
-            // True digital silence stays silent. We still keep the blanking counter
-            // updated above so a near-silent tail can trigger the same reset path,
-            // but once the input is exactly zero there is no reason to add dither.
+            // True digital silence stays silent. The blanking counter keeps
+            // accruing above, so true zeros interspersed in a sub-LSB noise floor
+            // still count toward the gate; once the input is exactly zero there is
+            // no reason to add dither.
             if x == 0.0 {
                 buffer.channels[ch][n] = 0.0;
-                state.reset();
+                state.clear_feedback();
                 continue;
             }
 
             // Feedback term: apply FIR to error history.
             let fb = coeffs.iter().zip(&state.error_hist).map(|(c, e)| c * e).sum::<f64>();
-
-            // Generate dither samples for all channels at this sample index.
-            if ch == 0 {
-                dither_samples = dither_gen.sample_lsb_all();
-            }
 
             // Get dither sample for this channel.
             let dither = dither_samples[ch];

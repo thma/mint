@@ -324,24 +324,26 @@ impl AdaptiveChannelState {
         self.error_hist[0] = e;
     }
 
-    fn reset(&mut self) {
+    /// Zero the feedback history when the output is forced to exact zero, so no
+    /// stale shaped error re-enters on the next audible sample. Deliberately leaves
+    /// `blanking_count` untouched — the blanking gate must stay latched through the
+    /// silence (resetting it re-arms the 50 ms window and leaks dither).
+    fn clear_feedback(&mut self) {
         self.error_hist.fill(0.0);
-        self.blanking_count = 0;
     }
 }
 
-/// Apply adaptive MBIT+ quantization using per-frame designed coefficients with zero-latency
-/// pre-masking look-ahead.
+/// Apply adaptive MBIT+ quantization using per-frame designed coefficients.
 ///
 /// This function extends Phase 1 error-feedback quantization with time-varying FIR
 /// coefficients from Phase 4.2's `AdaptiveShaper`. The shaper provides interpolated
 /// coefficients for each sample, allowing frequency-adaptive noise shaping that
 /// respects masking thresholds computed in a single analysis pass.
 ///
-/// **Pre-Masking Look-Ahead:**
-/// Since the entire signal is in memory, we can use future frames' masking information
-/// to design coefficients at the current position. This replaces ad-hoc slope extrapolation
-/// with principled predictive shaping.
+/// Simultaneous (frequency) masking only — there is no temporal pre/post-masking
+/// model. The only forward-looking element is the linear crossfade toward the next
+/// frame's coefficients, which suppresses zipper artifacts; it does not model
+/// pre-masking.
 ///
 /// # Arguments
 /// - `buffer`: audio buffer to quantize (in-place)
@@ -378,26 +380,33 @@ pub fn quantize_adaptive(
         // Get adaptive coefficients for this sample (linearly interpolated between frames).
         shaper.coeffs_for_sample_into(n, &mut coeffs);
 
+        // One draw per sample index for ALL channels, before any per-channel silence
+        // gating. The draw must not live behind `ch == 0`: a silent ch0 would skip it
+        // and starve every other channel of dither (they'd quantize against the
+        // 0.0-initialized buffer, i.e. undithered truncation).
+        dither_gen.sample_lsb_all_into(&mut dither_samples);
+
         for ch in 0..ch_count {
             let x = buffer.channels[ch][n];
             let state = &mut states[ch];
 
-            // Auto-blanking: zero out sustained silence.
+            // Auto-blanking: gate sustained sub-half-LSB passages to true zero.
             if x.abs() < 0.5 / 32_767.0 {
                 state.blanking_count += 1;
                 if state.blanking_count > blanking_threshold {
                     buffer.channels[ch][n] = 0.0;
-                    state.reset();
+                    state.clear_feedback();
                     continue;
                 }
             } else {
                 state.blanking_count = 0;
             }
 
-            // Exact zero: no dither, no feedback.
+            // Exact zero: no dither, no feedback. Keeps the blanking count accrued
+            // above, so true zeros interspersed in a sub-LSB noise floor still gate.
             if x == 0.0 {
                 buffer.channels[ch][n] = 0.0;
-                state.reset();
+                state.clear_feedback();
                 continue;
             }
 
@@ -407,11 +416,6 @@ pub fn quantize_adaptive(
                 .zip(state.error_hist.iter())
                 .map(|(c, e)| c * e)
                 .sum::<f64>();
-
-            // Generate dither samples for all channels at this sample index.
-            if ch == 0 {
-                dither_gen.sample_lsb_all_into(&mut dither_samples);
-            }
 
             // Get dither sample for this channel.
             let dither = dither_samples[ch];

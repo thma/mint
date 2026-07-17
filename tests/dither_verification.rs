@@ -1,9 +1,10 @@
 //! Dither / noise-shaping **verification harness**.
 //!
-//! Purpose: before wiring the (currently dead) adaptive Phase-4 path into
-//! production, prove — with measurements, not comments — whether each shaper's
+//! Purpose: prove — with measurements, not comments — whether each shaper's
 //! noise-transfer function (NTF) actually puts the quantization noise where the
-//! ear can't hear it. The existing `noise_shaping.rs` tests give false comfort:
+//! ear can't hear it. (Built to gate wiring the adaptive Phase-4 path into
+//! production; that wiring has since happened and the gates below now guard it.)
+//! The existing `noise_shaping.rs` tests give false comfort:
 //! `mbit_plus_fft_ntf_rate_tables_move_the_notch` searches for the NTF minimum
 //! *only inside 3–5 kHz*, so it always "finds" a notch there even though the
 //! global minimum of these filters is at DC. This harness measures globally.
