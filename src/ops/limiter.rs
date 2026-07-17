@@ -71,7 +71,11 @@ fn release_profile(character: LimiterCharacter) -> ReleaseProfile {
 /// 3. Sliding-minimum look-ahead: propagate gain reduction backward so attenuation
 ///    starts BEFORE the peak arrives (eliminates brickwall overshoot).
 /// 4. Forward pass with instant attack and controlled release.
-/// 5. Downsample gain curve to original rate; apply uniformly across all channels to
+/// 5. Raised-cosine smoothing over the look-ahead window: the attack becomes a smooth
+///    ramp reaching full attenuation exactly when the peak arrives, instead of a step
+///    (removes gain-slew modulation distortion; provably never lifts a sample above
+///    the ceiling — see `smooth_gain_curve`).
+/// 6. Downsample gain curve to original rate; apply uniformly across all channels to
 ///    preserve inter-channel balance.
 pub fn apply_true_peak_limit(buffer: &mut AudioBuffer, ceiling_dbtp: f64) -> Result<()> {
     apply_true_peak_limit_with_options(buffer, ceiling_dbtp, LimiterOptions::default())
@@ -136,7 +140,8 @@ pub fn apply_true_peak_limit_with_options(
     Ok(())
 }
 
-/// Build a look-ahead brickwall gain curve with adaptive, program-dependent release.
+/// Build a look-ahead brickwall gain curve with adaptive, program-dependent release
+/// and a raised-cosine attack ramp spanning the look-ahead window.
 fn build_gain_curve(
     envelope: &[f64],
     ceiling_lin: f64,
@@ -169,11 +174,74 @@ fn build_gain_curve(
             let rel_db_s = profile.fast_db_per_second
                 - (profile.fast_db_per_second - profile.base_db_per_second) * heavy;
             let rel_mul = 10_f64.powf(rel_db_s / (20.0 * over_rate));
-            g_smooth[i] = (prev * rel_mul).min(1.0);
+            // Clamp to `target`, not 1.0: g_smooth ≤ g_la everywhere is what lets the
+            // raised-cosine smoother below guarantee the ceiling (target ≤ 1.0 always).
+            g_smooth[i] = (prev * rel_mul).min(target);
         }
     }
 
-    g_smooth
+    smooth_gain_curve(&g_smooth, look_ahead)
+}
+
+/// Causally convolve the gain curve with normalized raised-cosine (Hann) taps spanning
+/// the look-ahead window, so the sliding-min attack step becomes a smooth ramp that
+/// reaches full attenuation exactly when the peak arrives.
+///
+/// No-overshoot argument: `g_la[i] = min(g_inst[i .. i+L))` implies
+/// `g_la[n−k] ≤ g_inst[n]` for every `k ∈ [0, L)`, and the release pass keeps
+/// `gains[i] ≤ g_la[i]` (its release branch clamps to target). Each output
+/// `Σ w[k]·gains[n−k]` is therefore a convex combination of values `≤ g_inst[n]` —
+/// the ramp can never lift a sample above its own ceiling requirement. Reads before
+/// index 0 use `gains[0]` (= the minimum over the first window), which keeps the bound
+/// valid for peaks inside the file's first look-ahead window; padding with 1.0 would not.
+fn smooth_gain_curve(gains: &[f64], window: usize) -> Vec<f64> {
+    if window <= 1 || gains.is_empty() {
+        return gains.to_vec();
+    }
+    let taps = hann_smoothing_taps(window);
+    let n = gains.len();
+    let mut out = Vec::with_capacity(n);
+
+    // Count of non-unity gains in the trailing window [i−window+1, i]. While zero, the
+    // output is exactly 1.0 and the dot product is skipped — this keeps the limiter
+    // ~O(n) for the common occasional-overshoot case and preserves bit-exact passthrough
+    // of below-ceiling material (no reliance on the taps summing to exactly 1.0).
+    let mut active_in_window = 0usize;
+    for i in 0..n {
+        if gains[i] != 1.0 {
+            active_in_window += 1;
+        }
+        if i >= window && gains[i - window] != 1.0 {
+            active_in_window -= 1;
+        }
+        if active_in_window == 0 {
+            out.push(1.0);
+            continue;
+        }
+        let mut acc = 0.0;
+        for (k, &w) in taps.iter().enumerate() {
+            let g = if i >= k { gains[i - k] } else { gains[0] };
+            acc += w * g;
+        }
+        out.push(acc);
+    }
+    out
+}
+
+/// Normalized raised-cosine (Hann) taps. The `(k+1)/(len+1)` phase avoids the zero
+/// endpoints of a textbook Hann window (which would waste support), and normalizing to
+/// unity sum makes the smoother a convex combination — level-preserving on constant
+/// input, never exceeding the window's maximum.
+fn hann_smoothing_taps(len: usize) -> Vec<f64> {
+    use std::f64::consts::PI;
+    let mut taps: Vec<f64> = (0..len)
+        .map(|k| 0.5 * (1.0 - (2.0 * PI * (k + 1) as f64 / (len + 1) as f64).cos()))
+        .collect();
+    let sum: f64 = taps.iter().sum();
+    for t in &mut taps {
+        *t /= sum;
+    }
+    taps
 }
 
 fn apply_soft_clip(buffer: &mut AudioBuffer, ceiling_lin: f64) {
@@ -323,6 +391,91 @@ mod tests {
             let expected = if k == 0 { 1.0 } else { 0.0 };
             assert!((c - expected).abs() < 1e-12, "phase-0 tap {k} = {c}, want {expected}");
         }
+    }
+
+    #[test]
+    fn smoothing_taps_are_normalized_and_nonnegative() {
+        for len in [1_usize, 2, 3, 57, 230] {
+            let taps = hann_smoothing_taps(len);
+            assert_eq!(taps.len(), len);
+            assert!(taps.iter().all(|&t| t > 0.0), "len {len}: zero/negative tap");
+            let sum: f64 = taps.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-12, "len {len}: tap sum {sum} != 1.0");
+        }
+    }
+
+    #[test]
+    fn smoothed_gain_never_exceeds_instantaneous_requirement() {
+        // Encodes the no-overshoot proof of `smooth_gain_curve`: every sample's final
+        // (ramped) gain must still satisfy that sample's own instantaneous requirement.
+        // Includes a peak inside the first look-ahead window (left-edge padding case).
+        let ceiling = 0.5;
+        let look_ahead = 37;
+        let profile = release_profile(LimiterCharacter::Balanced);
+
+        // Deterministic LCG envelope: mostly sub-ceiling, occasional loud spikes, so
+        // attack, release, and unity fast path all get exercised.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let envelope: Vec<f64> = (0..4096)
+            .map(|i| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let r = (state >> 11) as f64 / (1_u64 << 53) as f64;
+                if i == 5 || r > 0.97 { 0.5 + 2.0 * r } else { 0.4 * r }
+            })
+            .collect();
+
+        let gains = build_gain_curve(&envelope, ceiling, look_ahead, 192_000.0, profile);
+        for (i, (&g, &p)) in gains.iter().zip(envelope.iter()).enumerate() {
+            let required = if p > ceiling { ceiling / p } else { 1.0 };
+            assert!(g <= required + 1e-12, "gain {g} at {i} exceeds requirement {required}");
+        }
+    }
+
+    #[test]
+    fn attack_is_a_raised_cosine_ramp_not_a_step() {
+        let ceiling = 1.0;
+        let look_ahead = 48;
+        let profile = release_profile(LimiterCharacter::Balanced);
+        let peak_pos = 500;
+        let peak_val = 2.0;
+        let mut envelope = vec![0.1_f64; 1000];
+        envelope[peak_pos] = peak_val;
+
+        let gains = build_gain_curve(&envelope, ceiling, look_ahead, 192_000.0, profile);
+        let required = ceiling / peak_val;
+
+        // Full required attenuation exactly when the peak arrives.
+        assert!(gains[peak_pos] <= required + 1e-12, "peak gain {} too high", gains[peak_pos]);
+
+        // Attenuation starts exactly one look-ahead early — and not a sample sooner:
+        // everything before is untouched unity via the fast path (bit-exact passthrough).
+        let ramp_start = peak_pos - look_ahead + 1;
+        for (i, &g) in gains[..ramp_start].iter().enumerate() {
+            assert_eq!(g, 1.0, "gain at {i} not exactly 1.0 before the ramp");
+        }
+        assert!(gains[ramp_start] < 1.0, "ramp did not start at peak - look_ahead + 1");
+
+        // The largest per-sample drop of a smoothed step is the step height times the
+        // largest tap (≈ 2/L) — a fraction of the old one-sample step. The small extra
+        // margin absorbs release movement overlapping the ramp.
+        let step = 1.0 - required;
+        let max_tap = hann_smoothing_taps(look_ahead).into_iter().fold(0.0_f64, f64::max);
+        let max_slew = gains.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0_f64, f64::max);
+        assert!(
+            max_slew <= step * max_tap + 1e-5,
+            "slew {max_slew} exceeds raised-cosine bound {}",
+            step * max_tap
+        );
+    }
+
+    #[test]
+    fn smoothing_unity_regions_stay_exactly_one() {
+        // The fast path must emit literal 1.0 wherever the trailing window holds no
+        // gain reduction — this is what keeps below-ceiling material bit-exact.
+        let gains = smooth_gain_curve(&vec![1.0_f64; 500], 37);
+        assert!(gains.iter().all(|&g| g == 1.0), "unity input must smooth to literal 1.0");
     }
 
     #[test]

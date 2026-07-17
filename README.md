@@ -25,10 +25,11 @@ What it does:
 - Loudness normalization via `ebur128` (integrated LUFS to target ±0.1 LU).
 
 - Oversampled true-peak limiter with a band-limited (polyphase windowed-sinc) inter-sample
-  peak detector; the configured ceiling is always enforced (even for a pure transcode with
-  no loudness step), re-checked after every resample, and **verified against the BS.1770
-  meter** so the delivered file genuinely respects the ceiling. Limiter behavior is
-  configurable per target: adaptive `balanced`/`transient` release character,
+  peak detector and a raised-cosine attack ramp over the look-ahead window (no gain-step
+  modulation distortion); the configured ceiling is always enforced (even for a pure
+  transcode with no loudness step), re-checked after every resample, and **verified against
+  the BS.1770 meter** so the delivered file genuinely respects the ceiling. Limiter behavior
+  is configurable per target: adaptive `balanced`/`transient` release character,
   optional soft clipping, and linked/unlinked channel envelopes.
 
 - Per-file metering report: integrated **LUFS**, **LRA** (loudness range), max
@@ -322,7 +323,7 @@ When `on_clip = "limit"`, limiter behavior is configurable per target:
 
 | Field | Values | Meaning |
 |---|---|---|
-| `limiter_character` | `balanced` (default), `transient` | Program-dependent release profile. `balanced` is smoother; `transient` recovers faster and preserves attack more aggressively. |
+| `limiter_character` | `balanced` (default), `transient` | Program-dependent release profile and look-ahead length (which also sets the raised-cosine attack-ramp length: 1.2 ms `balanced`, 0.6 ms `transient`). `balanced` is smoother; `transient` recovers faster and preserves attack more aggressively. |
 | `limiter_soft_clip` | `true` / `false` (default) | Applies a gentle saturating curve near the ceiling after limiting to tame residual needles. |
 | `limiter_link_channels` | `true` (default), `false` | `true`: one shared gain envelope (stable stereo image). `false`: independent channel envelopes (can preserve more per-channel punch, but may shift image under heavy limiting). |
 
