@@ -5,6 +5,9 @@ pub enum OutputSampleFormat {
     S16,
     S24,
     F32,
+    /// 64-bit IEEE float. The canonical buffer is already f64, so this is a
+    /// bit-exact passthrough — the only format with a truly lossless round trip.
+    F64,
 }
 
 impl OutputSampleFormat {
@@ -13,18 +16,20 @@ impl OutputSampleFormat {
             Self::S16 => 16,
             Self::S24 => 24,
             Self::F32 => 32,
+            Self::F64 => 64,
         }
     }
 
     /// Integer quantization grid `(max, min_i, max_i)` for this format, or `None`
-    /// for f32 (no quantization). The grid is symmetric (±(2^(bits−1) − 1)) so the
-    /// mapping is an odd function and introduces no DC bias at full scale. Single
-    /// source of truth shared by the flat and noise-shaped quantizers.
+    /// for the float formats (no quantization). The grid is symmetric
+    /// (±(2^(bits−1) − 1)) so the mapping is an odd function and introduces no DC
+    /// bias at full scale. Single source of truth shared by the flat and
+    /// noise-shaped quantizers.
     pub fn int_grid(self) -> Option<(f64, i32, i32)> {
         match self {
             Self::S16 => Some((32_767.0, -32_767, 32_767)),
             Self::S24 => Some((8_388_607.0, -8_388_607, 8_388_607)),
-            Self::F32 => None,
+            Self::F32 | Self::F64 => None,
         }
     }
 }

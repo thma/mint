@@ -9,10 +9,23 @@ use crate::audio::buffer::{AudioBuffer, OutputSampleFormat};
 /// Write the buffer as a WAV file. When `bext` is `Some`, a Broadcast WAV extension
 /// chunk (EBU Tech 3285) is spliced into the RIFF; otherwise a plain WAV is written.
 ///
-/// The PCM is always encoded by `hound` (battle-tested 16/24/32-bit little-endian
-/// packing); the `bext` path just writes hound's output to memory and inserts one extra
-/// chunk before handing the bytes to disk, so sample encoding is never reimplemented.
+/// The PCM is encoded by `hound` (battle-tested 16/24/32-bit little-endian packing);
+/// the `bext` path just writes hound's output to memory and inserts one extra chunk
+/// before handing the bytes to disk, so sample encoding is never reimplemented.
+/// The one exception is f64: hound's Float support is 32-bit only, so that stream
+/// is serialized by `encode_wav_f64` (f64 has no packing subtleties to delegate).
 pub fn write_wav(path: &Path, buffer: &AudioBuffer, bext: Option<&BextMetadata>) -> Result<()> {
+    if buffer.out_format == OutputSampleFormat::F64 {
+        let wav = encode_wav_f64(buffer)?;
+        let bytes = match bext {
+            None => wav,
+            Some(meta) => splice_chunk_after_wave(&wav, b"bext", &meta.to_bytes())
+                .context("failed to splice bext chunk")?,
+        };
+        return std::fs::write(path, bytes)
+            .with_context(|| format!("failed to write output wav: {}", path.display()));
+    }
+
     let spec = wav_spec(buffer);
 
     match bext {
@@ -51,8 +64,54 @@ fn wav_spec(buffer: &AudioBuffer) -> WavSpec {
         sample_format: match format {
             OutputSampleFormat::F32 => SampleFormat::Float,
             OutputSampleFormat::S16 | OutputSampleFormat::S24 => SampleFormat::Int,
+            OutputSampleFormat::F64 => unreachable!("f64 is serialized by encode_wav_f64"),
         },
     }
+}
+
+/// Serialize a complete RIFF/WAVE stream of 64-bit IEEE float: a 16-byte `fmt `
+/// chunk with format tag 3 (WAVE_FORMAT_IEEE_FLOAT), the `fact` chunk the WAV spec
+/// requires for non-PCM formats (per-channel frame count), then interleaved
+/// little-endian f64 data. No pad bytes ever needed: 8-byte samples keep every
+/// chunk word-aligned.
+fn encode_wav_f64(buffer: &AudioBuffer) -> Result<Vec<u8>> {
+    let channels = buffer.channels_count() as u32;
+    let frames = buffer.frame_len();
+    let block_align = channels * 8;
+    let data_len = frames as u64 * block_align as u64;
+    // "WAVE" + fmt + fact + data headers and payload; RIFF sizes are u32 and f64
+    // doubles the payload vs f32, so guard the ~4 GB container limit explicitly.
+    let riff_size = 4 + (8 + 16) + (8 + 4) + (8 + data_len);
+    if riff_size > u32::MAX as u64 {
+        anyhow::bail!("f64 WAV would exceed the 4 GB RIFF size limit");
+    }
+
+    let mut out = Vec::with_capacity(8 + riff_size as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(riff_size as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&3u16.to_le_bytes()); // WAVE_FORMAT_IEEE_FLOAT
+    out.extend_from_slice(&(channels as u16).to_le_bytes());
+    out.extend_from_slice(&buffer.sample_rate.to_le_bytes());
+    out.extend_from_slice(&(buffer.sample_rate * block_align).to_le_bytes()); // byte rate
+    out.extend_from_slice(&(block_align as u16).to_le_bytes());
+    out.extend_from_slice(&64u16.to_le_bytes()); // bits per sample
+
+    out.extend_from_slice(b"fact");
+    out.extend_from_slice(&4u32.to_le_bytes());
+    out.extend_from_slice(&(frames as u32).to_le_bytes()); // dwSampleLength
+
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data_len as u32).to_le_bytes());
+    for i in 0..frames {
+        for channel in &buffer.channels {
+            out.extend_from_slice(&channel[i].to_le_bytes());
+        }
+    }
+    Ok(out)
 }
 
 fn write_samples<W: std::io::Write + std::io::Seek>(
@@ -68,6 +127,7 @@ fn write_samples<W: std::io::Write + std::io::Seek>(
         for channel in &buffer.channels {
             let sample = channel[i];
             match format {
+                OutputSampleFormat::F64 => unreachable!("f64 is serialized by encode_wav_f64"),
                 OutputSampleFormat::F32 => writer.write_sample(sample as f32)?,
                 OutputSampleFormat::S16 => {
                     let Some((max, min_i, max_i)) = int_grid else {

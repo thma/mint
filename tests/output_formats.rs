@@ -89,6 +89,60 @@ fn wav_without_bext_has_no_bext_chunk() {
 }
 
 #[test]
+fn wav_f64_roundtrip_is_bit_exact() {
+    let buf = buffer(OutputSampleFormat::F64);
+    // The premise: the tone's f64 values must not survive an f32 round trip, else
+    // bit-exact recovery would not prove the writer keeps full precision.
+    assert!(
+        buf.channels.iter().flatten().any(|&s| (s as f32) as f64 != s),
+        "test signal must exercise f64 precision"
+    );
+
+    let path = tmp("out_f64.wav");
+    io_write::write_wav(&path, &buf, None).expect("write f64 wav");
+    let bytes = std::fs::read(&path).expect("read back");
+
+    // fmt: tag 3 (IEEE float) at data offset 0, bits/sample at data offset 14.
+    let fmt = find_chunk(&bytes, b"fmt ").expect("fmt chunk");
+    assert_eq!(u16::from_le_bytes([bytes[fmt + 8], bytes[fmt + 9]]), 3, "WAVE_FORMAT_IEEE_FLOAT");
+    assert_eq!(u16::from_le_bytes([bytes[fmt + 22], bytes[fmt + 23]]), 64, "64 bits/sample");
+    // Non-PCM WAV requires a fact chunk carrying the per-channel frame count.
+    let fact = find_chunk(&bytes, b"fact").expect("fact chunk");
+    let n = u32::from_le_bytes([bytes[fact + 8], bytes[fact + 9], bytes[fact + 10], bytes[fact + 11]]);
+    assert_eq!(n as usize, buf.frame_len(), "fact dwSampleLength");
+
+    let decoded = mint::audio::io_read::read_audio(&path).expect("decode f64 wav");
+    assert_eq!(decoded.sample_rate, buf.sample_rate);
+    assert_eq!(decoded.channels, buf.channels, "f64 output must round-trip bit-exact");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn wav_f64_with_bext_stays_bit_exact() {
+    let buf = buffer(OutputSampleFormat::F64);
+    let path = tmp("bext_f64.wav");
+    let bext = BextMetadata {
+        description: "test".to_string(),
+        integrated_lufs: -23.0,
+        loudness_range_lu: 6.0,
+        max_true_peak_dbtp: -1.0,
+        max_momentary_lufs: -12.0,
+        max_short_term_lufs: -13.0,
+        sample_rate: 48_000,
+        channels: 2,
+        bits: 64,
+    };
+    io_write::write_wav(&path, &buf, Some(&bext)).expect("write f64 bext wav");
+    let bytes = std::fs::read(&path).expect("read back");
+    assert!(find_chunk(&bytes, b"bext").is_some(), "bext chunk present");
+
+    // The splice must not disturb the audio payload.
+    let decoded = mint::audio::io_read::read_audio(&path).expect("decode f64 bext wav");
+    assert_eq!(decoded.channels, buf.channels, "bit-exact after bext splice");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn flac_output_has_flac_marker() {
     let buf = buffer(OutputSampleFormat::S24);
     let path = tmp("out.flac");

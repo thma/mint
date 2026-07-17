@@ -87,6 +87,7 @@ fn is_reduction(current: OutputSampleFormat, target: OutputSampleFormat) -> bool
 
 fn bit_depth_rank(format: OutputSampleFormat) -> u8 {
     match format {
+        OutputSampleFormat::F64 => 4,
         OutputSampleFormat::F32 => 3,
         OutputSampleFormat::S24 => 2,
         OutputSampleFormat::S16 => 1,

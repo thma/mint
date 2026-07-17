@@ -24,7 +24,7 @@ struct TaskJson<'a> {
     output: &'a str,
     sample_rate: RateJson,
     codec: &'a str,
-    /// Sample format (s16/s24/f32) for PCM codecs, or "<N> kbps" for MP3.
+    /// Sample format (s16/s24/f32/f64) for PCM codecs, or "<N> kbps" for MP3.
     format: &'a str,
     /// True when a Broadcast WAV bext chunk was written.
     bwf: bool,

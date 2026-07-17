@@ -310,6 +310,37 @@ fn flac_with_f32_is_rejected() {
 }
 
 #[test]
+fn flac_with_f64_is_rejected() {
+    let err = config_err(
+        r#"
+        [target.x]
+        format = "f64"
+        codec  = "flac"
+        "#,
+    );
+    assert!(err.contains("flac") && err.contains("f64"), "got: {err}");
+}
+
+#[test]
+fn f64_format_resolves_and_plans_a_passthrough() {
+    let config = config_from_str(
+        r#"
+        [target.archive]
+        format = "f64"
+        "#,
+    );
+    let t = config.resolve_target("archive").unwrap();
+    assert_eq!(t.format, OutputSampleFormat::F64);
+    // No quantize/dither step may be planned; f64 is a pure passthrough.
+    let steps = t.describe(48_000);
+    assert!(
+        steps.iter().any(|s| s.contains("write f64 (no quantization)")),
+        "got: {steps:?}"
+    );
+    assert!(!steps.iter().any(|s| s.contains("quantize")), "got: {steps:?}");
+}
+
+#[test]
 fn bwf_on_non_wav_is_rejected() {
     let err = config_err(
         r#"

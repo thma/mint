@@ -189,6 +189,7 @@ pub enum BitDepthFormat {
     S16,
     S24,
     F32,
+    F64,
 }
 
 /// Output container / codec. Separate axis from `BitDepthFormat`: WAV and FLAC carry an
@@ -223,6 +224,7 @@ impl From<BitDepthFormat> for OutputSampleFormat {
             BitDepthFormat::S16 => OutputSampleFormat::S16,
             BitDepthFormat::S24 => OutputSampleFormat::S24,
             BitDepthFormat::F32 => OutputSampleFormat::F32,
+            BitDepthFormat::F64 => OutputSampleFormat::F64,
         }
     }
 }
@@ -326,8 +328,8 @@ impl ResolvedTarget {
             )),
             codec => {
                 match self.format {
-                    OutputSampleFormat::F32 => {
-                        steps.push("write f32 (no quantization)".to_string())
+                    f @ (OutputSampleFormat::F32 | OutputSampleFormat::F64) => {
+                        steps.push(format!("write {} (no quantization)", format_tag(f)))
                     }
                     other => steps.push(format!(
                         "quantize -> {} + {} ({})",
@@ -464,10 +466,13 @@ impl ResolvedTarget {
             );
         }
         // FLAC is an integer codec; it has no floating-point sample format.
-        if self.codec == OutputCodec::Flac && matches!(self.format, OutputSampleFormat::F32) {
+        if self.codec == OutputCodec::Flac
+            && matches!(self.format, OutputSampleFormat::F32 | OutputSampleFormat::F64)
+        {
             bail!(
-                "target '{}': codec=flac requires an integer format (s16 or s24), not f32",
-                self.name
+                "target '{}': codec=flac requires an integer format (s16 or s24), not {}",
+                self.name,
+                format_tag(self.format)
             );
         }
         // The bext chunk is a WAV (RIFF) extension; it has no meaning in FLAC/MP3.
@@ -611,6 +616,7 @@ pub fn format_tag(format: OutputSampleFormat) -> &'static str {
         OutputSampleFormat::S16 => "s16",
         OutputSampleFormat::S24 => "s24",
         OutputSampleFormat::F32 => "f32",
+        OutputSampleFormat::F64 => "f64",
     }
 }
 

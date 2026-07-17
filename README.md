@@ -42,7 +42,8 @@ What it does:
   masking analysis, with configurable stereo/multichannel dither correlation — an
   independent implementation comparable in approach to commercial adaptive dithers.
 
-- Output formats: **WAV** (f32/s16/s24) — optionally **Broadcast WAV** (`bwf = true`,
+- Output formats: **WAV** (f32/f64/s16/s24; f64 output from an f64 source is a bit-exact
+  passthrough) — optionally **Broadcast WAV** (`bwf = true`,
   a `bext` chunk carrying real EBU R128 loudness metadata measured from the delivery) —
   **FLAC** (lossless, pure-Rust), and **MP3** (`--features mp3`, libmp3lame built from
   vendored source). Codec is a separate axis from bit depth: `codec = "wav" | "flac" | "mp3"`.
@@ -350,8 +351,8 @@ Set the mode per target with `dither`:
 Things worth knowing:
 
 - **Shaping only engages at s16.** At s24 the noise floor is already inaudible, so both
-  `shaped` and `psychoacoustic` fall back to flat TPDF; at f32 there is no quantization to
-  dither at all. The dry-run and report spell out what ran and name the curve — e.g.
+  `shaped` and `psychoacoustic` fall back to flat TPDF; at f32/f64 there is no quantization
+  to dither at all. The dry-run and report spell out what ran and name the curve — e.g.
   `quantize -> s16 + tpdf + noise-shaping (psychoacoustic)`.
 - **Quantization runs exactly once.** Integer outputs are quantized in the bit-depth step
   (`ops/bitdepth`) using the shared grid in `OutputSampleFormat::int_grid()`. Container
