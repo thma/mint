@@ -1,8 +1,11 @@
-//! MBIT+ Phase 1: Statische Error-Feedback-Quantisierung mit Hochpass-Shaping.
+//! Phase 1: Statische Error-Feedback-Quantisierung mit Hochpass-Shaping.
+//! (Historisch als Zwischenschritt zu einem adaptiven Dither nach dem Vorbild
+//! kommerzieller Verfahren entstanden — eigenständige
+//! Implementierung)
 //!
-//! HINWEIS: Dies ist NICHT mehr der Produktionspfad. `DitherMode::MbitPlus` läuft
+//! HINWEIS: Dies ist NICHT mehr der Produktionspfad. `DitherMode::Adaptive` läuft
 //! seit dem Verdrahten des adaptiven Pfads über `psychoacoustic.rs` +
-//! `adaptive_mbit.rs` (siehe `ops::bitdepth`). Dieses Modul bleibt als Referenz-
+//! `adaptive.rs` (siehe `ops::bitdepth`). Dieses Modul bleibt als Referenz-
 //! /Vergleichsimplementierung und für die NTF-Tabellen-Tests erhalten.
 //!
 //! Dieses Modul implementiert ein stabiles Noise-Shaping für 16-Bit über feste,
@@ -12,7 +15,7 @@
 //! (tiefster Punkt bei DC, monoton steigend zum Nyquist) — KEIN auf das
 //! 2–5-kHz-Sensitivitätstal getuntes, gehörrichtiges Design. Sie sind perzeptiv
 //! wirksam (gemessen, siehe `tests/dither_verification.rs`), aber das eigentlich
-//! gehörgewichtete, adaptive Design lebt in `psychoacoustic.rs` + `adaptive_mbit.rs`.
+//! gehörgewichtete, adaptive Design lebt in `psychoacoustic.rs` + `adaptive.rs`.
 //!
 //! **Phase 1 Fokus**: Korrektheit und Stabilität.
 //! - Konstantes TPDF-Dither (2 LSB pp, ±1 LSB).
@@ -26,13 +29,13 @@ use crate::dither::multichannel::MultiChannelDither;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-/// MBIT+ Stärke-Stufe: bestimmt die Agressivität des Noise-Shaping.
+/// Stärke-Stufe des statischen Shapers: bestimmt die Agressivität des Noise-Shaping.
 ///
 /// Die dB-Angaben sind *gemessen* (siehe `tests/dither_verification.rs`, NTF-Tabelle
 /// @ 44.1 kHz), nicht geschätzt. „totales Rauschen" = mittlere NTF-Leistung über
 /// das Band; „perzeptiv" = ATH-gewichtete Verbesserung ggü. flachem TPDF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MbitPlusStrength {
+pub enum StaticFirStrength {
     /// Sanft (NTF 3-Tap): +4.7 dB totales Rauschen, +7.1 dB perzeptiv.
     Low,
     /// Ausgewogen (Default, NTF 5-Tap): +8.7 dB totales Rauschen, +10.4 dB perzeptiv.
@@ -41,12 +44,12 @@ pub enum MbitPlusStrength {
     High,
 }
 
-impl MbitPlusStrength {
+impl StaticFirStrength {
     pub fn from_config(value: crate::config::DitherStrength) -> Self {
         match value {
-            crate::config::DitherStrength::Low => MbitPlusStrength::Low,
-            crate::config::DitherStrength::Normal => MbitPlusStrength::Normal,
-            crate::config::DitherStrength::High => MbitPlusStrength::High,
+            crate::config::DitherStrength::Low => StaticFirStrength::Low,
+            crate::config::DitherStrength::Normal => StaticFirStrength::Normal,
+            crate::config::DitherStrength::High => StaticFirStrength::High,
         }
     }
 
@@ -66,13 +69,13 @@ impl MbitPlusStrength {
         match self {
             // NTF 1 − 1.330z⁻¹ + 0.410z⁻². Monotoner Hochpass: −21.9 dB @ DC,
             // −9.2 dB @ 4 kHz, +8.8 dB @ Nyquist. +4.7 dB totale Leistung.
-            MbitPlusStrength::Low => &[1.330, -0.410],
+            StaticFirStrength::Low => &[1.330, -0.410],
             // Default-Stärke. −28 dB @ DC, −11.5 dB @ 3.5 kHz, +14.4 dB @ Nyquist,
             // +8.7 dB totale Leistung. (Das letzte 0.0-Tap ist wirkungslos.)
-            MbitPlusStrength::Normal => &[1.850, -1.530, 0.760, -0.120, 0.0],
+            StaticFirStrength::Normal => &[1.850, -1.530, 0.760, -0.120, 0.0],
             // Aggressiv: stärkstes HF-Dumping. −20 dB @ DC, −14.8 dB @ 3.5 kHz,
             // +18.1 dB @ Nyquist, +11.2 dB totale Leistung. (Letztes 0.0-Tap unnütz.)
-            MbitPlusStrength::High => &[2.050, -2.140, 1.620, -0.890, 0.310, -0.050, 0.0],
+            StaticFirStrength::High => &[2.050, -2.140, 1.620, -0.890, 0.310, -0.050, 0.0],
         }
     }
 
@@ -85,27 +88,27 @@ impl MbitPlusStrength {
     /// Die separaten Tabellen sind daher weitgehend kosmetisch.
     fn coeffs_48(&self) -> &'static [f64] {
         match self {
-            MbitPlusStrength::Low => &[1.300, -0.395],
-            MbitPlusStrength::Normal => &[1.820, -1.500, 0.740, -0.115, 0.0],
-            MbitPlusStrength::High => &[2.010, -2.100, 1.590, -0.870, 0.300, -0.048, 0.0],
+            StaticFirStrength::Low => &[1.300, -0.395],
+            StaticFirStrength::Normal => &[1.820, -1.500, 0.740, -0.115, 0.0],
+            StaticFirStrength::High => &[2.010, -2.100, 1.590, -0.870, 0.300, -0.048, 0.0],
         }
     }
 
     /// FIR-Koeffizienten für diese Stärke @ 88.2 kHz.
     fn coeffs_882(&self) -> &'static [f64] {
         match self {
-            MbitPlusStrength::Low => &[1.310, -0.412],
-            MbitPlusStrength::Normal => &[1.860, -1.560, 0.775, -0.125, 0.0],
-            MbitPlusStrength::High => &[2.070, -2.180, 1.650, -0.910, 0.320, -0.052, 0.0],
+            StaticFirStrength::Low => &[1.310, -0.412],
+            StaticFirStrength::Normal => &[1.860, -1.560, 0.775, -0.125, 0.0],
+            StaticFirStrength::High => &[2.070, -2.180, 1.650, -0.910, 0.320, -0.052, 0.0],
         }
     }
 
     /// FIR-Koeffizienten für diese Stärke @ 96 kHz.
     fn coeffs_96(&self) -> &'static [f64] {
         match self {
-            MbitPlusStrength::Low => &[1.290, -0.387],
-            MbitPlusStrength::Normal => &[1.830, -1.530, 0.760, -0.120, 0.0],
-            MbitPlusStrength::High => &[2.030, -2.150, 1.620, -0.895, 0.315, -0.050, 0.0],
+            StaticFirStrength::Low => &[1.290, -0.387],
+            StaticFirStrength::Normal => &[1.830, -1.530, 0.760, -0.120, 0.0],
+            StaticFirStrength::High => &[2.030, -2.150, 1.620, -0.895, 0.315, -0.050, 0.0],
         }
     }
 
@@ -171,13 +174,13 @@ impl ChannelState {
     }
 }
 
-/// MBIT+ Phase 1 quantizer: stable, gehörgewichtet, auto-blanking.
+/// Statischer Phase-1-Quantisierer: stabil, Hochpass-geshaped, Auto-Blanking.
 pub fn quantize(
     buffer: &mut AudioBuffer,
     max: f64,
     min_i: i32,
     max_i: i32,
-    strength: MbitPlusStrength,
+    strength: StaticFirStrength,
     correlation: DitherCorrelation,
     seed: Option<u64>,
 ) {
@@ -288,7 +291,7 @@ mod tests {
 
     #[test]
     fn coeffs_are_defined_for_common_rates() {
-        let lo = MbitPlusStrength::Low;
+        let lo = StaticFirStrength::Low;
         assert!(!lo.coeffs(44_100).is_empty());
         assert!(!lo.coeffs(48_000).is_empty());
         assert!(!lo.coeffs(88_200).is_empty());

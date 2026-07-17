@@ -153,14 +153,14 @@ pub enum DitherMode {
     /// a stronger, ear-weighted shaper than `Shaped` (deep notch at ~4 kHz). Same
     /// s16-only gating and graceful degradation.
     Psychoacoustic,
-    /// MBIT+-style adaptive dither: a per-frame psychoacoustic analysis (MPEG-1
-    /// model-1 masking) designs a minimal-phase noise-shaping curve whose noise sits
-    /// under the program's masking threshold, with a per-frame fallback to a fixed
-    /// ATH-optimal curve so quiet/exposed passages are never worse than a fixed
-    /// shaper. Per-channel decorrelated noise. s16-only; degrades to flat TPDF above.
+    /// Adaptive dither — comparable in approach to commercial adaptive dithers. 
+    /// A per-frame psychoacoustic analysis (MPEG-1 model-1 masking)
+    /// designs a minimal-phase noise-shaping curve whose noise sits under the
+    /// program's masking threshold, with a per-frame fallback to a fixed ATH-optimal
+    /// curve so quiet/exposed passages are never worse than a fixed shaper.
+    /// Per-channel decorrelated noise. s16-only; degrades to flat TPDF above.
     /// (Frequency/simultaneous masking only — no temporal pre/post-masking model yet.)
-    #[serde(rename = "mbit_plus")]
-    MbitPlus,
+    Adaptive,
 }
 
 impl DitherMode {
@@ -172,7 +172,7 @@ impl DitherMode {
         match self {
             DitherMode::Shaped => Some(ShapingCurve::Gentle),
             DitherMode::Psychoacoustic => Some(ShapingCurve::Psychoacoustic),
-            DitherMode::Tpdf | DitherMode::None | DitherMode::MbitPlus => None,
+            DitherMode::Tpdf | DitherMode::None | DitherMode::Adaptive => None,
         }
     }
 
@@ -661,7 +661,7 @@ fn dither_tag(dither: DitherMode) -> &'static str {
         DitherMode::None => "none",
         DitherMode::Shaped => "shaped",
         DitherMode::Psychoacoustic => "psychoacoustic",
-        DitherMode::MbitPlus => "mbit_plus",
+        DitherMode::Adaptive => "adaptive",
     }
 }
 
@@ -680,15 +680,15 @@ fn effective_dither_tag(
     strength: DitherStrength,
     format: OutputSampleFormat,
 ) -> String {
-    if matches!(dither, DitherMode::MbitPlus) {
+    if matches!(dither, DitherMode::Adaptive) {
         return if matches!(format, OutputSampleFormat::S16) {
             format!(
-                "mbit+ {} dither (static minimal-phase, rate-aware)",
+                "adaptive {} dither (psychoacoustic, per-frame)",
                 dither_strength_tag(strength)
             )
         } else {
             format!(
-                "tpdf dither (mbit+ {} skipped: s16 only)",
+                "tpdf dither (adaptive {} skipped: s16 only)",
                 dither_strength_tag(strength)
             )
         };

@@ -5,7 +5,7 @@
 //! ear can't hear it. (Built to gate wiring the adaptive Phase-4 path into
 //! production; that wiring has since happened and the gates below now guard it.)
 //! The existing `noise_shaping.rs` tests give false comfort:
-//! `mbit_plus_fft_ntf_rate_tables_move_the_notch` searches for the NTF minimum
+//! `static_fir_fft_ntf_rate_tables_move_the_notch` searches for the NTF minimum
 //! *only inside 3–5 kHz*, so it always "finds" a notch there even though the
 //! global minimum of these filters is at DC. This harness measures globally.
 //!
@@ -31,8 +31,8 @@ use std::path::PathBuf;
 
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
 use mint::config::{DitherCorrelation, DitherMode};
-use mint::dither::adaptive_mbit::{quantize_adaptive, AdaptiveShaper};
-use mint::dither::mbit_plus::MbitPlusStrength;
+use mint::dither::adaptive::{quantize_adaptive, AdaptiveShaper};
+use mint::dither::static_fir::StaticFirStrength;
 use mint::dither::psychoacoustic::{PsychoacousticAnalysis, FRAME_SIZE, HOP_SIZE};
 use mint::dither::ShapingCurve;
 use mint::ops::bitdepth;
@@ -318,15 +318,15 @@ fn diagnostic_clamp_tradeoff() {
 /// Analytic NTF table for every shipped curve. Reports the *global* notch (not a
 /// band-restricted one) and the ATH-weighted perceptual gain. Asserts only the
 /// invariants that a stable shaper must satisfy, plus the key honesty check:
-/// the borrowed Lipshitz curve must out-perform the hand-typed MBIT+ table.
+/// the borrowed Lipshitz curve must out-perform the hand-typed static table.
 #[test]
 fn analytic_ntf_report_and_invariants() {
     let w = ath_weights();
 
     let curves: [(&str, &[f64]); 6] = [
-        ("MBIT+ Low (3-tap)", MbitPlusStrength::Low.coeffs_for_rate(SR)),
-        ("MBIT+ Normal (5-tap)", MbitPlusStrength::Normal.coeffs_for_rate(SR)),
-        ("MBIT+ High (7-tap)", MbitPlusStrength::High.coeffs_for_rate(SR)),
+        ("Static Low (3-tap)", StaticFirStrength::Low.coeffs_for_rate(SR)),
+        ("Static Normal (5-tap)", StaticFirStrength::Normal.coeffs_for_rate(SR)),
+        ("Static High (7-tap)", StaticFirStrength::High.coeffs_for_rate(SR)),
         ("Lipshitz Psychoacoustic", lipshitz_coeffs()),
         ("Gentle (1-z^-1)^2", gentle_coeffs()),
         ("flat TPDF (no shaping)", &[]),
@@ -353,30 +353,30 @@ fn analytic_ntf_report_and_invariants() {
 
     // Every shipped shaper must at least *work* — i.e. beat flat TPDF on the
     // ear-weighted metric. All four do.
-    for s in ["MBIT+ Low (3-tap)", "MBIT+ Normal (5-tap)", "MBIT+ High (7-tap)", "Lipshitz Psychoacoustic"] {
+    for s in ["Static Low (3-tap)", "Static Normal (5-tap)", "Static High (7-tap)", "Lipshitz Psychoacoustic"] {
         assert!(perceptual[s] > 2.0, "{s}: a shaper must clearly beat flat TPDF, got {:+.2} dB", perceptual[s]);
     }
 
     // MEASURED reality (corrects an intuition that did NOT survive measurement):
     // broadband high-pass shaping is competitive with a single-notch curve. The
-    // hand-typed MBIT+ Normal table actually *edges out* Lipshitz on ATH weight
+    // hand-typed static Normal table actually *edges out* Lipshitz on ATH weight
     // (more total noise dumped across the insensitive band extremes), even though
     // its notch is in the "wrong" place. We assert the ordering we measured so a
     // future re-tune is forced to re-confirm it here.
-    let mbit = perceptual["MBIT+ Normal (5-tap)"];
+    let stat = perceptual["Static Normal (5-tap)"];
     let lip = perceptual["Lipshitz Psychoacoustic"];
     assert!(
-        mbit > lip,
-        "measured: static MBIT+ Normal ({mbit:+.2}) ≥ Lipshitz ({lip:+.2}); if this flips, re-examine the verdict"
+        stat > lip,
+        "measured: static Normal table ({stat:+.2}) ≥ Lipshitz ({lip:+.2}); if this flips, re-examine the verdict"
     );
 
-    // The valid core of "Befund 2": the static MBIT+ tables null at DC, NOT in
+    // The valid core of "Befund 2": the static tables null at DC, NOT in
     // the 3–4 kHz critical band the comments claim. Lipshitz, by contrast, does
     // notch at ~4 kHz. Both are legitimate designs; the *comment* is the bug.
-    let normal_notch = ntf_metrics(MbitPlusStrength::Normal.coeffs_for_rate(SR), &w).notch_hz;
+    let normal_notch = ntf_metrics(StaticFirStrength::Normal.coeffs_for_rate(SR), &w).notch_hz;
     assert!(
         normal_notch < 200.0,
-        "MBIT+ Normal global NTF minimum is at DC ({normal_notch:.0} Hz), not the critical band — \
+        "Static Normal global NTF minimum is at DC ({normal_notch:.0} Hz), not the critical band — \
          the 'deep notch at ~3.5 kHz' comment is unsupported by the coefficients"
     );
     assert!(
@@ -415,11 +415,11 @@ fn empirical_perceptual_improvement_report() {
     println!("\n=== Empirical improvement vs flat TPDF (broadband −40 dBFS) ===");
     println!("{:<28} {:>14} {:>14}", "mode", "idle ATH dB", "masked NMR dB");
 
-    // MbitPlus now routes through the safeguarded adaptive path in production.
+    // DitherMode::Adaptive routes through the safeguarded adaptive path in production.
     let modes: [(&str, DitherMode); 4] = [
         ("Gentle (fixed)", DitherMode::Shaped),
         ("Lipshitz (fixed)", DitherMode::Psychoacoustic),
-        ("MBIT+ (adaptive, prod)", DitherMode::MbitPlus),
+        ("Adaptive (prod)", DitherMode::Adaptive),
         ("flat TPDF (baseline)", DitherMode::Tpdf),
     ];
     let mut ath = std::collections::HashMap::new();
@@ -448,9 +448,9 @@ fn empirical_perceptual_improvement_report() {
     }
 
     // DESIGN-CORRECTNESS GATE: under the masking objective it is designed for, the
-    // (now wired) adaptive MBIT+ path must beat every fixed shaper. Proves the unit
+    // (now wired) adaptive path must beat every fixed shaper. Proves the unit
     // + minimal-phase-design + two-curve fixes work end-to-end through bitdepth.
-    let adapt_nmr = mask["MBIT+ (adaptive, prod)"];
+    let adapt_nmr = mask["Adaptive (prod)"];
     let best_fixed_nmr = mask["Lipshitz (fixed)"].max(mask["Gentle (fixed)"]);
     println!(
         "\nGATE (design correctness, NMR)  adaptive {adapt_nmr:+.2} vs best fixed {best_fixed_nmr:+.2} → {}",
@@ -458,7 +458,7 @@ fn empirical_perceptual_improvement_report() {
     );
     assert!(
         adapt_nmr > best_fixed_nmr,
-        "adaptive MBIT+ must win its masking objective ({adapt_nmr:+.2} vs {best_fixed_nmr:+.2} dB)"
+        "the adaptive path must win its masking objective ({adapt_nmr:+.2} vs {best_fixed_nmr:+.2} dB)"
     );
 }
 

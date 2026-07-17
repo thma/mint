@@ -1,13 +1,13 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::audio::buffer::AudioBuffer;
-
-pub mod mbit_plus;
+/// Phase 1 static error-feedback quantizer with fixed high-pass NTF tables.
+/// Legacy/reference path — production adaptive dither lives in `adaptive`.
+pub mod static_fir;
 /// Phase 4.1 psychoacoustic analysis pass (STFT → Bark → spreading → ATH).
 pub mod psychoacoustic;
 /// Phase 4.2 adaptive minimal-phase filter design with coefficient interpolation.
-pub mod adaptive_mbit;
+pub mod adaptive;
 /// Phase 4.4 stereo/multi-channel dither correlation modes (decorrelated, correlated, mid-side).
 pub mod multichannel;
 
@@ -34,26 +34,6 @@ impl TpdfDither {
         a + b
     }
 
-}
-
-/// MBIT+ Phase 1 quantizer: delegate to the mbit_plus module with default strength.
-pub fn quantize_mbit_plus(
-    buffer: &mut AudioBuffer,
-    max: f64,
-    min_i: i32,
-    max_i: i32,
-    seed: Option<u64>,
-) {
-    use crate::config::DitherCorrelation;
-    mbit_plus::quantize(
-        buffer,
-        max,
-        min_i,
-        max_i,
-        mbit_plus::MbitPlusStrength::Normal,
-        DitherCorrelation::Decorrelated,
-        seed,
-    );
 }
 
 /// Noise-transfer curve for the shaper. Coeffs are the error-feedback FIR `h_k`;

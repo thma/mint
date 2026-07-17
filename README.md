@@ -7,36 +7,46 @@ distribution targets defined declaratively in TOML — you describe the *deliver
 What it does:
 - Decode input audio (WAV and AIFF; 16/24/32-bit int and 32/64-bit float) into an
   internal f64 buffer with no precision loss at the input boundary.
+
 - **Declarative targets**: each `[target.NAME]` is an output spec; the tool figures
   out which steps are needed (resample only if the rate differs, dither/quantize only
   for integer output, etc.) and runs them in the one correct order.
+
 - **Built-in presets** (`spotify`, `apple-music`, `youtube`, `tidal`, `amazon-music`,
   `soundcloud`, `cd`, `broadcast-ebu-r128`, `48k`, `hires`) you can override per field.
+
 - **Multiple targets per config** — render every distribution format from one file in
   a single pass.
+
 - Resample via **libsoxr** by default for reference-grade SRC (multi-stage, ~150 dB
   stopband, on par with SoX/Weiss), with a pure-Rust `rubato` fallback
   (`--no-default-features`) for builds with no system dependencies. See **Build**.
+
 - Loudness normalization via `ebur128` (integrated LUFS to target ±0.1 LU).
+
 - Oversampled true-peak limiter with a band-limited (polyphase windowed-sinc) inter-sample
   peak detector; the configured ceiling is always enforced (even for a pure transcode with
   no loudness step), re-checked after every resample, and **verified against the BS.1770
   meter** so the delivered file genuinely respects the ceiling. Limiter behavior is
   configurable per target: adaptive `balanced`/`transient` release character,
   optional soft clipping, and linked/unlinked channel envelopes.
+
 - Per-file metering report: integrated **LUFS**, **LRA** (loudness range), max
   **momentary**/**short-term**, **true peak**, and crest figures **PLR**/**PSR** — shown
   for both the source and the delivered signal so you can see what processing changed.
+
 - Bit-depth conversion with seeded TPDF dither, quantizing the f64 buffer exactly once;
   optional s16-focused enhancement modes: gentle error-feedback shaping
   (`dither = "shaped"`), published psychoacoustic shaping (`dither = "psychoacoustic"`),
-  or adaptive MBIT+-style dithering (`dither = "mbit_plus"`) driven by a per-frame
-  psychoacoustic masking analysis, with configurable stereo/multichannel dither
-  correlation.
+  or adaptive dithering (`dither = "adaptive"`) driven by a per-frame psychoacoustic
+  masking analysis, with configurable stereo/multichannel dither correlation — an
+  independent implementation comparable in approach to commercial adaptive dithers.
+
 - Output formats: **WAV** (f32/s16/s24) — optionally **Broadcast WAV** (`bwf = true`,
   a `bext` chunk carrying real EBU R128 loudness metadata measured from the delivery) —
   **FLAC** (lossless, pure-Rust), and **MP3** (`--features mp3`, libmp3lame built from
   vendored source). Codec is a separate axis from bit depth: `codec = "wav" | "flac" | "mp3"`.
+
 - Dry-run that prints the derived chain and planned output path per input × target.
 
 ## Config
@@ -61,10 +71,10 @@ preset = "cd"              # -> 44100 / s16 / -0.1 dBTP
 lufs   = -12.0             # CD has no loudness standard; you choose
 dither = "shaped"          # optional: TPDF + noise shaping (s16 only)
 
-[target.cd-mbit]
+[target.cd-adaptive]
 preset = "cd"
 lufs   = -12.0
-dither = "mbit_plus"       # adaptive MBIT+-style mode (s16 only)
+dither = "adaptive"        # adaptive psychoacoustic mode (s16 only)
 
 [target.archive]
 format = "f32"             # no preset: keep rate, no quantization, just normalize
@@ -163,10 +173,10 @@ preset = "cd"                # -> 44100 / s16 / -0.1 dBTP
 lufs   = -12.0
 dither = "shaped"            # explicit -> overrides the [defaults] psychoacoustic
 
-[target.cd-mbit]
+[target.cd-adaptive]
 preset = "cd"
 lufs   = -12.0
-dither = "mbit_plus"         # adaptive psychoacoustic mode (s16 only)
+dither = "adaptive"          # adaptive psychoacoustic mode (s16 only)
 
 # 5. No preset at all — set the fields directly.
 [target.archive]

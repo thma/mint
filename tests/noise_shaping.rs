@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
 use mint::config::DitherMode;
-use mint::dither::mbit_plus::MbitPlusStrength;
+use mint::dither::static_fir::StaticFirStrength;
 use mint::dither::psychoacoustic::{PsychoacousticAnalysis, FRAME_SIZE, HOP_SIZE};
-use mint::dither::adaptive_mbit::AdaptiveShaper;
+use mint::dither::adaptive::AdaptiveShaper;
 use mint::dither::multichannel::{MultiChannelDither, DitherCorrelation};
 use mint::ops::bitdepth;
 use rustfft::num_complex::Complex;
@@ -84,7 +84,7 @@ fn lowpass_energy(x: &[f64], l: usize) -> f64 {
     energy
 }
 
-fn ntf_magnitude_response(strength: MbitPlusStrength, sample_rate: u32, fft_len: usize) -> Vec<f64> {
+fn ntf_magnitude_response(strength: StaticFirStrength, sample_rate: u32, fft_len: usize) -> Vec<f64> {
     let coeffs = strength.coeffs_for_rate(sample_rate);
     let mut response = vec![Complex::new(0.0, 0.0); fft_len];
     response[0] = Complex::new(1.0, 0.0);
@@ -291,52 +291,52 @@ fn psychoacoustic_is_stronger_than_gentle() {
 }
 
 #[test]
-fn mbit_plus_flag_tracks_target_format() {
+fn adaptive_flag_tracks_target_format() {
     let probe = || mk_buffer(vec![0.1, -0.1, 0.2, -0.3]);
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, None, Some(1)).unwrap();
-    assert!(r.shaped && r.dithered, "mbit+ shaping must engage at s16");
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S16, Some(DitherMode::Adaptive), None, None, Some(1)).unwrap();
+    assert!(r.shaped && r.dithered, "adaptive shaping must engage at s16");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::MbitPlus), None, None, Some(1)).unwrap();
-    assert!(!r.shaped && r.dithered, "mbit+ must degrade to flat tpdf at s24");
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::S24, Some(DitherMode::Adaptive), None, None, Some(1)).unwrap();
+    assert!(!r.shaped && r.dithered, "adaptive must degrade to flat tpdf at s24");
 
     let mut c = OutputSampleFormat::F32;
-    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::MbitPlus), None, None, Some(1)).unwrap();
+    let r = bitdepth::apply(&mut probe(), &mut c, OutputSampleFormat::F32, Some(DitherMode::Adaptive), None, None, Some(1)).unwrap();
     assert!(!r.shaped && !r.dithered, "f32 has no quantization to dither or shape");
 }
 
 #[test]
-fn mbit_plus_is_reproducible_with_seed() {
+fn adaptive_is_reproducible_with_seed() {
     let sig = test_signal(4096, 0.5);
-    let a = quantize(&sig, DitherMode::MbitPlus, OutputSampleFormat::S16, 123);
-    let b = quantize(&sig, DitherMode::MbitPlus, OutputSampleFormat::S16, 123);
-    assert_eq!(a, b, "seeded mbit+ output must be deterministic");
+    let a = quantize(&sig, DitherMode::Adaptive, OutputSampleFormat::S16, 123);
+    let b = quantize(&sig, DitherMode::Adaptive, OutputSampleFormat::S16, 123);
+    assert_eq!(a, b, "seeded adaptive output must be deterministic");
 }
 
 #[test]
-fn mbit_plus_degrades_to_flat_tpdf_at_s24() {
+fn adaptive_degrades_to_flat_tpdf_at_s24() {
     let sig = test_signal(4096, 0.5);
-    let mb = quantize(&sig, DitherMode::MbitPlus, OutputSampleFormat::S24, 99);
+    let mb = quantize(&sig, DitherMode::Adaptive, OutputSampleFormat::S24, 99);
     let tpdf = quantize(&sig, DitherMode::Tpdf, OutputSampleFormat::S24, 99);
-    assert_eq!(mb, tpdf, "mbit+ must be byte-identical to flat tpdf at s24");
+    assert_eq!(mb, tpdf, "adaptive must be byte-identical to flat tpdf at s24");
 }
 
 #[test]
-fn mbit_plus_stereo_is_reproducible_and_decorrelated() {
+fn adaptive_stereo_is_reproducible_and_decorrelated() {
     let sig = test_signal(4096, 0.5);
 
     let run = |seed: u64| {
         let mut buf = buffer_from(vec![sig.clone(), sig.clone()]);
         let mut current = OutputSampleFormat::F32;
-        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, None, Some(seed)).unwrap();
+        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::Adaptive), None, None, Some(seed)).unwrap();
         buf.channels
     };
 
     let a = run(17);
     let b = run(17);
-    assert_eq!(a, b, "seeded stereo mbit+ output must be deterministic");
+    assert_eq!(a, b, "seeded stereo adaptive output must be deterministic");
 
     // Channels should be decorrelated (independent RNGs per channel).
     assert_ne!(a[0], a[1], "L/R should get independent dither");
@@ -355,15 +355,15 @@ fn mbit_plus_stereo_is_reproducible_and_decorrelated() {
 /// variance under signal. This is a statistical property: we measure peak residual
 /// noise (quantized − original) and check it doesn't shrink when signal is present.
 #[test]
-fn mbit_plus_dither_is_constant_amplitude() {
+fn adaptive_dither_is_constant_amplitude() {
     let mut quiet = mk_buffer(vec![0.001; 1000]); // Very quiet signal.
     let mut loud = mk_buffer(vec![0.8; 1000]); // Loud signal.
 
     let mut c_quiet = OutputSampleFormat::F32;
     let mut c_loud = OutputSampleFormat::F32;
 
-    bitdepth::apply(&mut quiet, &mut c_quiet, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, None, Some(42)).unwrap();
-    bitdepth::apply(&mut loud, &mut c_loud, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, None, Some(42)).unwrap();
+    bitdepth::apply(&mut quiet, &mut c_quiet, OutputSampleFormat::S16, Some(DitherMode::Adaptive), None, None, Some(42)).unwrap();
+    bitdepth::apply(&mut loud, &mut c_loud, OutputSampleFormat::S16, Some(DitherMode::Adaptive), None, None, Some(42)).unwrap();
 
     let max = 32_767.0;
     let noise_quiet: f64 = quiet.channels[0]
@@ -393,13 +393,13 @@ fn mbit_plus_dither_is_constant_amplitude() {
 /// but we can verify that silent regions produce correctly dithered samples without feedback.
 /// For now, a simpler check: silence for 50ms+ should not cause clipping artifacts.
 #[test]
-fn mbit_plus_auto_blanking_no_clipping() {
+fn adaptive_auto_blanking_no_clipping() {
     let sr = 44_100;
     let silence_len = (sr as usize) / 10; // 100 ms of silence.
 
     let mut silence = mk_buffer(vec![0.0; silence_len]);
     let mut current = OutputSampleFormat::F32;
-    bitdepth::apply(&mut silence, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, None, Some(99)).unwrap();
+    bitdepth::apply(&mut silence, &mut current, OutputSampleFormat::S16, Some(DitherMode::Adaptive), None, None, Some(99)).unwrap();
 
     // Exact silence should stay exact silence once blanking is active.
     let max_val = silence.channels[0].iter().map(|x| x.abs()).fold(0.0, f64::max);
@@ -413,10 +413,10 @@ fn mbit_plus_auto_blanking_no_clipping() {
 /// Regression: the counter used to reset on trigger, re-arming the 50 ms window
 /// every sample and leaking dither through the entire "silence".
 #[test]
-fn mbit_plus_auto_blanking_gates_sub_lsb_noise_floor() {
+fn adaptive_auto_blanking_gates_sub_lsb_noise_floor() {
     let n = SR as usize; // 1 s
     let sub_lsb = vec![0.3 / 32_767.0; n];
-    let out = quantize(&sub_lsb, DitherMode::MbitPlus, OutputSampleFormat::S16, 7);
+    let out = quantize(&sub_lsb, DitherMode::Adaptive, OutputSampleFormat::S16, 7);
 
     // Gate must be closed from the first sample past the 50 ms threshold.
     let after_gate = &out[(SR as usize / 20) + 1..];
@@ -433,7 +433,7 @@ fn mbit_plus_auto_blanking_gates_sub_lsb_noise_floor() {
 /// silence `continue`s, leaving ch1 to quantize against the 0.0-initialized buffer
 /// (undithered truncation) whenever ch0 was silent.
 #[test]
-fn mbit_plus_silent_channel_does_not_starve_others_of_dither() {
+fn adaptive_silent_channel_does_not_starve_others_of_dither() {
     let n = SR as usize / 4;
     let silent = vec![0.0f64; n];
     let music = test_signal(n, 0.01);
@@ -441,7 +441,7 @@ fn mbit_plus_silent_channel_does_not_starve_others_of_dither() {
     let run = |seed: u64| {
         let mut buf = buffer_from(vec![silent.clone(), music.clone()]);
         let mut current = OutputSampleFormat::F32;
-        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::MbitPlus), None, None, Some(seed)).unwrap();
+        bitdepth::apply(&mut buf, &mut current, OutputSampleFormat::S16, Some(DitherMode::Adaptive), None, None, Some(seed)).unwrap();
         buf.channels.into_iter().nth(1).unwrap()
     };
 
@@ -456,13 +456,13 @@ fn mbit_plus_silent_channel_does_not_starve_others_of_dither() {
 /// ear-sensitive low band much more than the high band, and stronger modes should
 /// suppress it more than weaker ones.
 #[test]
-fn mbit_plus_fft_ntf_stronger_modes_suppress_low_band_more() {
+fn static_fir_fft_ntf_stronger_modes_suppress_low_band_more() {
     let fft_len = 16_384;
     let sample_rate = 44_100;
 
-    let low = ntf_magnitude_response(MbitPlusStrength::Low, sample_rate, fft_len);
-    let normal = ntf_magnitude_response(MbitPlusStrength::Normal, sample_rate, fft_len);
-    let high = ntf_magnitude_response(MbitPlusStrength::High, sample_rate, fft_len);
+    let low = ntf_magnitude_response(StaticFirStrength::Low, sample_rate, fft_len);
+    let normal = ntf_magnitude_response(StaticFirStrength::Normal, sample_rate, fft_len);
+    let high = ntf_magnitude_response(StaticFirStrength::High, sample_rate, fft_len);
 
     let low_ratio = band_power(&low, sample_rate, 20.0, 2_000.0) / band_power(&low, sample_rate, 8_000.0, 18_000.0);
     let normal_ratio = band_power(&normal, sample_rate, 20.0, 2_000.0) / band_power(&normal, sample_rate, 8_000.0, 18_000.0);
@@ -476,12 +476,12 @@ fn mbit_plus_fft_ntf_stronger_modes_suppress_low_band_more() {
 /// Phase 3: rate-aware validation. The notch should move with the sample-rate table
 /// instead of staying stuck at one absolute frequency.
 #[test]
-fn mbit_plus_fft_ntf_rate_tables_move_the_notch() {
+fn static_fir_fft_ntf_rate_tables_move_the_notch() {
     let fft_len = 16_384;
-    let (f441, _) = band_minimum_frequency(&ntf_magnitude_response(MbitPlusStrength::Normal, 44_100, fft_len), 44_100, 3_000.0, 5_000.0);
-    let (f48, _) = band_minimum_frequency(&ntf_magnitude_response(MbitPlusStrength::Normal, 48_000, fft_len), 48_000, 3_000.0, 5_000.0);
-    let (f882, _) = band_minimum_frequency(&ntf_magnitude_response(MbitPlusStrength::Normal, 88_200, fft_len), 88_200, 6_000.0, 8_500.0);
-    let (f96, _) = band_minimum_frequency(&ntf_magnitude_response(MbitPlusStrength::Normal, 96_000, fft_len), 96_000, 6_500.0, 9_000.0);
+    let (f441, _) = band_minimum_frequency(&ntf_magnitude_response(StaticFirStrength::Normal, 44_100, fft_len), 44_100, 3_000.0, 5_000.0);
+    let (f48, _) = band_minimum_frequency(&ntf_magnitude_response(StaticFirStrength::Normal, 48_000, fft_len), 48_000, 3_000.0, 5_000.0);
+    let (f882, _) = band_minimum_frequency(&ntf_magnitude_response(StaticFirStrength::Normal, 88_200, fft_len), 88_200, 6_000.0, 8_500.0);
+    let (f96, _) = band_minimum_frequency(&ntf_magnitude_response(StaticFirStrength::Normal, 96_000, fft_len), 96_000, 6_500.0, 9_000.0);
 
     assert!((f441 - 3_500.0).abs() < 1_500.0, "44.1k notch should sit in the critical band, got {f441:.0} Hz");
     assert!((f48 - 3_600.0).abs() < 1_500.0, "48k notch should stay in the same perceptual zone, got {f48:.0} Hz");
@@ -738,7 +738,7 @@ fn adaptive_shaper_bounds_checking() {
 /// Phase 4.3: Adaptive quantization applies time-varying FIR coefficients correctly.
 #[test]
 fn phase_4_3_adaptive_quantization_applies_coefficients() {
-    use mint::dither::adaptive_mbit::quantize_adaptive;
+    use mint::dither::adaptive::quantize_adaptive;
 
     let sr = 44_100u32;
     let sig = sine_signal(1_000.0, sr as usize, sr);
@@ -772,7 +772,7 @@ fn phase_4_3_adaptive_quantization_applies_coefficients() {
 /// Phase 4.3: Adaptive quantization is reproducible with the same seed.
 #[test]
 fn phase_4_3_adaptive_quantization_is_reproducible() {
-    use mint::dither::adaptive_mbit::quantize_adaptive;
+    use mint::dither::adaptive::quantize_adaptive;
 
     let sr = 44_100u32;
     let sig = sine_signal(440.0, sr as usize / 2, sr);
@@ -795,7 +795,7 @@ fn phase_4_3_adaptive_quantization_is_reproducible() {
 /// Phase 4.3: Adaptive quantization preserves stereo decorrelation.
 #[test]
 fn phase_4_3_adaptive_quantization_stereo_is_decorrelated() {
-    use mint::dither::adaptive_mbit::quantize_adaptive;
+    use mint::dither::adaptive::quantize_adaptive;
 
     let sr = 44_100u32;
     let sig = sine_signal(1_000.0, sr as usize / 2, sr);  // Longer signal for more data

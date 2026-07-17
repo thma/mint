@@ -333,7 +333,7 @@ impl AdaptiveChannelState {
     }
 }
 
-/// Apply adaptive MBIT+ quantization using per-frame designed coefficients.
+/// Apply adaptive quantization using per-frame designed coefficients.
 ///
 /// This function extends Phase 1 error-feedback quantization with time-varying FIR
 /// coefficients from Phase 4.2's `AdaptiveShaper`. The shaper provides interpolated

@@ -222,17 +222,17 @@ fn psychoacoustic_dither_parses_and_dry_run_names_the_curve() {
 }
 
 #[test]
-fn mbit_plus_parses_and_dry_run_reflects_s16_gating() {
+fn adaptive_parses_and_dry_run_reflects_s16_gating() {
     let config = config_from_str(
         r#"
         [target.cd]
         preset = "cd"            # s16
-        dither = "mbit_plus"
+        dither = "adaptive"
         dither_strength = "high"
 
         [target.archive]
         preset = "hires"         # s24
-        dither = "mbit_plus"
+        dither = "adaptive"
         dither_strength = "low"
         "#,
     );
@@ -241,8 +241,8 @@ fn mbit_plus_parses_and_dry_run_reflects_s16_gating() {
     assert!(
         cd.describe(44_100)
             .iter()
-            .any(|s| s.contains("mbit+ high dither")),
-        "s16 dry-run should advertise the selected mbit+ strength"
+            .any(|s| s.contains("adaptive high dither")),
+        "s16 dry-run should advertise the selected adaptive strength"
     );
 
     let archive = config.resolve_target("archive").unwrap();
@@ -250,8 +250,8 @@ fn mbit_plus_parses_and_dry_run_reflects_s16_gating() {
         archive
             .describe(96_000)
             .iter()
-            .any(|s| s.contains("mbit+") && s.contains("skipped") && s.contains("low")),
-        "s24 dry-run should note that mbit+ was skipped"
+            .any(|s| s.contains("adaptive") && s.contains("skipped") && s.contains("low")),
+        "s24 dry-run should note that adaptive was skipped"
     );
 }
 

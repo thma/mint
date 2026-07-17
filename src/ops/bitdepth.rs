@@ -3,9 +3,8 @@ use anyhow::Result;
 use crate::audio::buffer::{AudioBuffer, OutputSampleFormat};
 use crate::config::{DitherMode, DitherStrength, DitherCorrelation};
 use crate::dither::{NoiseShaper, ShapingCurve, TpdfDither};
-use crate::dither::mbit_plus::MbitPlusStrength;
 use crate::dither::psychoacoustic::PsychoacousticAnalysis;
-use crate::dither::adaptive_mbit::{AdaptiveShaper, quantize_adaptive};
+use crate::dither::adaptive::{AdaptiveShaper, quantize_adaptive};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BitDepthApplyResult {
@@ -37,10 +36,10 @@ pub fn apply(
     // the shaped modes gracefully degrade to flat TPDF here (and to nothing for f32).
     // The gate (`DitherMode::shapes`) is shared with the dry-run summary so they can't
     // drift; `shaping_curve` then selects which curve to run.
-    let shaped = (dithered && mode.shapes(target)) || (dithered && is_mbit_plus(mode, target));
+    let shaped = (dithered && mode.shapes(target)) || (dithered && is_adaptive(mode, target));
     let curve = shaped.then(|| mode.shaping_curve()).flatten();
-    let shaping_tag = if is_mbit_plus(mode, target) {
-        Some("mbit+")
+    let shaping_tag = if is_adaptive(mode, target) {
+        Some("adaptive")
     } else {
         curve.map(ShapingCurve::tag)
     };
@@ -61,8 +60,8 @@ pub fn apply(
     })
 }
 
-fn is_mbit_plus(mode: DitherMode, target: OutputSampleFormat) -> bool {
-    matches!(mode, DitherMode::MbitPlus) && matches!(target, OutputSampleFormat::S16)
+fn is_adaptive(mode: DitherMode, target: OutputSampleFormat) -> bool {
+    matches!(mode, DitherMode::Adaptive) && matches!(target, OutputSampleFormat::S16)
 }
 
 /// Equal-weight mono mixdown for the shared psychoacoustic analysis. Cheap and
@@ -110,13 +109,12 @@ fn quantize_in_place(
         return;
     };
 
-    if is_mbit_plus(mode, target) {
-        let strength = MbitPlusStrength::from_config(dither_strength.unwrap_or(DitherStrength::Normal));
+    if is_adaptive(mode, target) {
         // Strength → FIR order: more taps track the perceptual target more sharply.
-        let order = match strength {
-            MbitPlusStrength::Low => 5,
-            MbitPlusStrength::Normal => 7,
-            MbitPlusStrength::High => 9,
+        let order = match dither_strength.unwrap_or(DitherStrength::Normal) {
+            DitherStrength::Low => 5,
+            DitherStrength::Normal => 7,
+            DitherStrength::High => 9,
         };
         // One psychoacoustic analysis on a mono mixdown drives a single shared NTF
         // design across channels; the dither itself stays per-channel/decorrelated

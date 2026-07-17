@@ -31,7 +31,7 @@ pub struct ProcessingReport {
     /// True when error-feedback noise shaping ran (implies `dithered`).
     pub shaped: bool,
     /// Name of the shaping family when shaping ran ("gentle" |
-    /// "psychoacoustic" | "mbit+"); `None` otherwise. Mirrors the dry-run label.
+    /// "psychoacoustic" | "adaptive"); `None` otherwise. Mirrors the dry-run label.
     pub shaping_curve: Option<&'static str>,
     /// Output container/codec: "wav" | "flac" | "mp3".
     pub codec: String,
