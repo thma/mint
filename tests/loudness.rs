@@ -55,14 +55,190 @@ fn sparse_peak_buffer(rate: u32, seconds: f64, peak: f64) -> AudioBuffer {
     }
 }
 
+/// A steady carrier with short loud clicks: the loudness lives in the carrier, the
+/// true peak in the clicks — exactly the shape where limiting eats integrated loudness
+/// and single-shot normalization undershoots a hot target. One click per second, so the
+/// limiter's release completes between clicks and makeup gain genuinely buys loudness
+/// back (denser clicks saturate: the gain never recovers and added gain buys ~nothing,
+/// which is the capped case, not the convergent one).
+fn carrier_with_clicks(rate: u32, seconds: f64, carrier_amp: f64, click: f64) -> AudioBuffer {
+    let mut buffer = sine_buffer(rate, seconds, 997.0, carrier_amp);
+    let frames = buffer.channels[0].len();
+    let period = rate as usize; // 1 click per second
+    for i in (period..frames).step_by(period) {
+        for j in i..(i + 3).min(frames) {
+            buffer.channels[0][j] = click;
+        }
+    }
+    buffer
+}
+
+#[test]
+fn maximize_converges_to_target_where_limit_undershoots() {
+    let ceiling = -1.0;
+    // Pick a target 6 dB above the source: the clicks then need ~6 dB of limiting,
+    // which eats enough loudness that single-shot normalization visibly undershoots.
+    let source = carrier_with_clicks(48_000, 6.0, 0.15, 0.95);
+    let in_lufs = loudness::analyze(&source).expect("analyze").integrated_lufs;
+    let target = in_lufs + 6.0;
+
+    let mut limit_buffer = carrier_with_clicks(48_000, 6.0, 0.15, 0.95);
+    let limit_result = loudness::apply(
+        &mut limit_buffer,
+        target,
+        Some(ceiling),
+        Some(OnClipPolicy::Limit),
+        limiter_opts(),
+        8.0,
+    )
+    .expect("limit apply should succeed");
+    assert!(
+        target - limit_result.out_lufs > 0.1,
+        "test premise: plain limit must undershoot (delivered {:.2}, target {target:.2})",
+        limit_result.out_lufs
+    );
+
+    let mut max_buffer = carrier_with_clicks(48_000, 6.0, 0.15, 0.95);
+    // Generous cap: this test is about convergence, not the cap (covered below).
+    let max_result = loudness::apply(
+        &mut max_buffer,
+        target,
+        Some(ceiling),
+        Some(OnClipPolicy::Maximize),
+        limiter_opts(),
+        12.0,
+    )
+    .expect("maximize apply should succeed");
+
+    assert!(
+        (max_result.out_lufs - target).abs() <= 0.1,
+        "maximize must hit the target ±0.1 LU (delivered {:.2}, target {target:.2})",
+        max_result.out_lufs
+    );
+    assert!(
+        max_result.true_peak_out_dbtp <= ceiling + 0.1,
+        "ceiling must hold under maximization (got {:.3})",
+        max_result.true_peak_out_dbtp
+    );
+    assert!(
+        max_result.limiter_gain_reduction_db > limit_result.limiter_gain_reduction_db,
+        "makeup gain must have bought extra limiting"
+    );
+    // Honesty stats: some but not all of the signal was limited, at a mean depth
+    // that cannot exceed the peak depth.
+    assert!(max_result.limiter_active_ratio > 0.0);
+    assert!(max_result.limiter_active_ratio <= 1.0);
+    assert!(max_result.limiter_avg_gain_reduction_db > 0.0);
+    assert!(
+        max_result.limiter_avg_gain_reduction_db
+            <= max_result.limiter_gain_reduction_db + 1e-9
+    );
+}
+
+#[test]
+fn maximize_respects_max_limiting_db_cap_and_warns() {
+    let ceiling = -1.0;
+    let cap = 2.0;
+    let mut buffer = carrier_with_clicks(48_000, 6.0, 0.15, 0.95);
+    let in_lufs = loudness::analyze(&buffer).expect("analyze").integrated_lufs;
+    let target = in_lufs + 12.0; // absurd: would need ~12 dB of peak reduction
+
+    let result = loudness::apply(
+        &mut buffer,
+        target,
+        Some(ceiling),
+        Some(OnClipPolicy::Maximize),
+        limiter_opts(),
+        cap,
+    )
+    .expect("maximize apply should succeed");
+
+    // The gain was clamped so peak GR lands exactly on the cap.
+    assert!(
+        (result.limiter_gain_reduction_db - cap).abs() < 1e-6,
+        "peak GR {:.3} should sit exactly at the cap {cap:.1}",
+        result.limiter_gain_reduction_db
+    );
+    assert!(
+        target - result.out_lufs > 0.1,
+        "capped maximization must fall short of the target"
+    );
+    assert!(
+        result.warnings.iter().any(|w| w.contains("maximization capped")),
+        "cap warning expected, got: {:?}",
+        result.warnings
+    );
+    assert!(result.true_peak_out_dbtp <= ceiling + 0.1);
+}
+
+#[test]
+fn maximize_without_ceiling_breach_hits_target_in_one_pass() {
+    // Quiet source, quiet target: no limiting → plain normalization, exact landing.
+    let mut buffer = sine_buffer(48_000, 3.0, 997.0, 0.1);
+    let result = loudness::apply(
+        &mut buffer,
+        -20.0,
+        Some(-1.0),
+        Some(OnClipPolicy::Maximize),
+        limiter_opts(),
+        8.0,
+    )
+    .expect("maximize apply should succeed");
+
+    assert_eq!(result.limiter_gain_reduction_db, 0.0);
+    assert_eq!(result.limiter_active_ratio, 0.0);
+    assert!(
+        (result.out_lufs - (-20.0)).abs() <= 0.05,
+        "no-limiting maximize is plain normalization (got {:.3})",
+        result.out_lufs
+    );
+    assert!(result.warnings.is_empty(), "unexpected warnings: {:?}", result.warnings);
+}
+
+#[test]
+fn limit_reports_avg_gain_reduction_and_duty_cycle() {
+    // A steady sine pushed above the ceiling is limited essentially everywhere:
+    // duty cycle near 1, mean depth positive but never above the peak depth.
+    let mut buffer = sine_buffer(48_000, 3.0, 997.0, 0.9);
+    let result = loudness::apply(
+        &mut buffer,
+        -1.0,
+        Some(-1.0),
+        Some(OnClipPolicy::Limit),
+        limiter_opts(),
+        8.0,
+    )
+    .expect("loudness apply should succeed");
+
+    assert!(result.limiter_gain_reduction_db > 0.0, "premise: limiting must run");
+    assert!(
+        result.limiter_active_ratio > 0.9,
+        "steady over-ceiling sine should be limited nearly everywhere (got {:.3})",
+        result.limiter_active_ratio
+    );
+    assert!(result.limiter_avg_gain_reduction_db > 0.0);
+    assert!(
+        result.limiter_avg_gain_reduction_db <= result.limiter_gain_reduction_db + 1e-9,
+        "mean GR {:.3} cannot exceed peak GR {:.3}",
+        result.limiter_avg_gain_reduction_db,
+        result.limiter_gain_reduction_db
+    );
+}
+
 #[test]
 fn loudness_moves_towards_target() {
     let mut buffer = sine_buffer(48_000, 3.0, 997.0, 0.1);
     let target = -16.0;
 
-    let result =
-        loudness::apply(&mut buffer, target, Some(-1.0), Some(OnClipPolicy::Warn), limiter_opts())
-            .expect("loudness apply should succeed");
+    let result = loudness::apply(
+        &mut buffer,
+        target,
+        Some(-1.0),
+        Some(OnClipPolicy::Warn),
+        limiter_opts(),
+        8.0,
+    )
+    .expect("loudness apply should succeed");
 
     let before = (result.in_lufs - target).abs();
     let after = (result.out_lufs - target).abs();
@@ -126,6 +302,7 @@ fn limit_policy_reports_gain_reduction_when_squashing_to_target() {
         Some(ceiling),
         Some(OnClipPolicy::Limit),
         limiter_opts(),
+        8.0,
     )
     .expect("loudness apply should succeed");
 
@@ -162,6 +339,7 @@ fn limit_policy_reports_zero_gain_reduction_when_within_ceiling() {
         Some(-1.0),
         Some(OnClipPolicy::Limit),
         limiter_opts(),
+        8.0,
     )
     .expect("loudness apply should succeed");
 
@@ -182,6 +360,7 @@ fn reduce_gain_policy_caps_predicted_peak() {
         Some(-1.0),
         Some(OnClipPolicy::ReduceGain),
         limiter_opts(),
+        8.0,
     )
     .expect("loudness apply should succeed");
 

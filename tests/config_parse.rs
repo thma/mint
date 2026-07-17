@@ -405,3 +405,64 @@ fn limiter_options_parse_and_appear_in_dry_run() {
     assert!(plan.contains("unlinked"), "plan: {plan}");
     assert!(plan.contains("soft_clip=true"), "plan: {plan}");
 }
+
+#[test]
+fn maximize_policy_parses_with_cap_and_appears_in_dry_run() {
+    let config = config_from_str(
+        r#"
+        [target.loud]
+        format = "s16"
+        lufs = -9.0
+        on_clip = "maximize"
+        limiter_character = "dense"
+        max_limiting_db = 4.5
+        "#,
+    );
+
+    let t = config.resolve_target("loud").unwrap();
+    assert_eq!(t.max_limiting_db, 4.5);
+    let plan = t.describe(48_000).join(" | ");
+    assert!(plan.contains("maximize to target (cap 4.5 dB)"), "plan: {plan}");
+    assert!(plan.contains("dense"), "plan: {plan}");
+}
+
+#[test]
+fn max_limiting_db_defaults_to_8() {
+    let config = config_from_str(
+        r#"
+        [target.t]
+        format = "s16"
+        "#,
+    );
+    assert_eq!(config.resolve_target("t").unwrap().max_limiting_db, 8.0);
+}
+
+#[test]
+fn non_positive_max_limiting_db_is_rejected() {
+    let err = config_err(
+        r#"
+        [target.t]
+        format = "s16"
+        on_clip = "maximize"
+        max_limiting_db = 0.0
+        "#,
+    );
+    assert!(err.contains("max_limiting_db"), "err: {err}");
+}
+
+#[test]
+fn maximize_without_lufs_is_a_valid_config() {
+    // on_clip may arrive via [defaults], so a no-lufs target must not fail resolution;
+    // the pipeline degrades it to plain limiting with a warning at processing time.
+    let config = config_from_str(
+        r#"
+        [defaults]
+        on_clip = "maximize"
+
+        [target.transcode]
+        format = "f32"
+        "#,
+    );
+    let t = config.resolve_target("transcode").unwrap();
+    assert!(t.lufs.is_none());
+}

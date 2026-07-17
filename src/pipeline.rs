@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use crate::audio::buffer::OutputSampleFormat;
 use crate::audio::io_read;
 use crate::audio::io_write;
-use crate::config::{DitherMode, OutputCodec, ResolvedTarget, format_tag};
+use crate::config::{DitherMode, OnClipPolicy, OutputCodec, ResolvedTarget, format_tag};
 use crate::ops::loudness::LoudnessAnalysis;
 use crate::ops::{bitdepth, limiter, loudness, resample};
 
@@ -26,6 +26,13 @@ pub struct ProcessingReport {
     /// Peak gain reduction applied by the loudness limiter (None when no loudness
     /// step ran or no limiting was needed). Surfaces dynamics lost to hit the target.
     pub limiter_gain_reduction_db: Option<f64>,
+    /// Mean gain reduction (dB) over the limited portion (None when no limiting ran).
+    /// Together with `limiter_active_percent` it distinguishes one shaved needle from
+    /// wall-to-wall limiting — peak GR alone can't.
+    pub limiter_avg_gain_reduction_db: Option<f64>,
+    /// Percent (0–100) of the signal's samples the limiter attenuated (None when no
+    /// limiting ran).
+    pub limiter_active_percent: Option<f64>,
     /// True when TPDF dither was applied during quantization.
     pub dithered: bool,
     /// True when error-feedback noise shaping ran (implies `dithered`).
@@ -69,6 +76,8 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     };
     let mut warnings = Vec::new();
     let mut limiter_gain_reduction = None;
+    let mut limiter_avg_gain_reduction = None;
+    let mut limiter_active_percent = None;
 
     // Full source metering, measured once on the untouched input so the report shows
     // loudness/dynamics uniformly whether or not a loudness step runs.
@@ -78,16 +87,28 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     //    The loudness step applies a constant gain and (for on_clip=limit) runs
     //    the limiter, so it also enforces the ceiling on its own output.
     let loudness_ran = if let Some(lufs) = target.lufs {
-        let result =
-            loudness::apply(&mut buffer, lufs, Some(ceiling), Some(target.on_clip), limiter_options)?;
+        let result = loudness::apply(
+            &mut buffer,
+            lufs,
+            Some(ceiling),
+            Some(target.on_clip),
+            limiter_options,
+            target.max_limiting_db,
+        )?;
         warnings.extend(result.warnings);
 
         // Heavy-limiting check: hitting the LUFS target required squashing peaks.
         // Both delivered loudness and true peak look clean afterwards, so this
         // gain-reduction number is the only place the lost dynamics become visible.
+        // Maximize is exempt — limiting is the point there, and its own max_limiting_db
+        // cap (warned about in loudness::apply) is the guard instead.
         if result.limiter_gain_reduction_db > 0.0 {
             limiter_gain_reduction = Some(result.limiter_gain_reduction_db);
-            if result.limiter_gain_reduction_db > target.warn_limiting_db {
+            limiter_avg_gain_reduction = Some(result.limiter_avg_gain_reduction_db);
+            limiter_active_percent = Some(result.limiter_active_ratio * 100.0);
+            if result.limiter_gain_reduction_db > target.warn_limiting_db
+                && !matches!(target.on_clip, OnClipPolicy::Maximize)
+            {
                 warnings.push(format!(
                     "heavy limiting: {:.1} dB of peak gain reduction to reach {lufs:.1} LUFS \
                      under the {ceiling:.1} dBTP ceiling (source true peak {:.1} dBTP); \
@@ -124,6 +145,12 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     //    When a loudness step ran, its policy + the post-resample re-check already
     //    hold the ceiling, so this is skipped to avoid duplicate handling.
     if !loudness_ran {
+        // Makeup-gain convergence needs a LUFS goal; without one, maximize is just limit.
+        if matches!(target.on_clip, OnClipPolicy::Maximize) {
+            warnings.push(
+                "on_clip=maximize has no effect without lufs; behaving as limit".to_string(),
+            );
+        }
         warnings.extend(loudness::enforce_ceiling(
             &mut buffer,
             ceiling,
@@ -226,6 +253,8 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
         source,
         delivered,
         limiter_gain_reduction_db: limiter_gain_reduction,
+        limiter_avg_gain_reduction_db: limiter_avg_gain_reduction,
+        limiter_active_percent,
         dithered,
         shaped,
         shaping_curve,

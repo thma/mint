@@ -60,6 +60,16 @@ fn release_profile(character: LimiterCharacter) -> ReleaseProfile {
             fast_db_per_second: 75.0,
             look_ahead_ms: 0.6,
         },
+        // Mastering-style profile for *sustained* gain reduction (loudness
+        // maximization): a much slower release rides between peaks instead of
+        // sawtooth-pumping, and the doubled look-ahead doubles the raised-cosine
+        // attack ramp, spreading attack energy further. Balanced/transient are
+        // tuned for occasional overshoots, where fast recovery matters more.
+        LimiterCharacter::Dense => ReleaseProfile {
+            base_db_per_second: 7.0,  // 3 dB recovery ≈ 430 ms under heavy GR
+            fast_db_per_second: 28.0, // still breathes near unity gain
+            look_ahead_ms: 2.0,
+        },
     }
 }
 
@@ -476,6 +486,44 @@ mod tests {
         // gain reduction — this is what keeps below-ceiling material bit-exact.
         let gains = smooth_gain_curve(&vec![1.0_f64; 500], 37);
         assert!(gains.iter().all(|&g| g == 1.0), "unity input must smooth to literal 1.0");
+    }
+
+    #[test]
+    fn dense_release_recovers_slower_than_balanced() {
+        // Dense exists for sustained gain reduction: it must ride between peaks instead
+        // of pumping, i.e. recover clearly slower than balanced, and look further ahead
+        // (longer raised-cosine attack ramp).
+        let dense = release_profile(LimiterCharacter::Dense);
+        let balanced = release_profile(LimiterCharacter::Balanced);
+        assert!(dense.look_ahead_ms > balanced.look_ahead_ms);
+
+        // Same isolated over-ceiling impulse through both profiles; count samples until
+        // the gain climbs back to 0.99 after the peak. The impulse is deep (18 dB of
+        // required reduction) so recovery spends real time in the heavy-GR region where
+        // the base release rates differ most; the adaptive blend toward the fast rate
+        // near unity dilutes the ratio at shallow reductions.
+        let over_rate = 48_000.0;
+        let look_ahead = |p: ReleaseProfile| (over_rate * p.look_ahead_ms / 1000.0) as usize;
+        let mut envelope = vec![0.1_f64; 120_000];
+        let peak_pos = 2_000;
+        envelope[peak_pos] = 8.0; // forces gain 0.125 at the peak
+
+        let recovery_samples = |profile: ReleaseProfile| {
+            let gains =
+                build_gain_curve(&envelope, 1.0, look_ahead(profile).max(1), over_rate, profile);
+            gains[peak_pos..]
+                .iter()
+                .position(|&g| g > 0.99)
+                .expect("gain should recover within the test buffer")
+        };
+
+        let dense_recovery = recovery_samples(dense);
+        let balanced_recovery = recovery_samples(balanced);
+        // Continuous-time integration of the two rate curves gives ≈ 2.2×.
+        assert!(
+            dense_recovery as f64 >= 1.8 * balanced_recovery as f64,
+            "dense recovery ({dense_recovery} samples) should be ≈ 2× balanced ({balanced_recovery})"
+        );
     }
 
     #[test]

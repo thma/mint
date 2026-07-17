@@ -15,6 +15,14 @@ const TP_TOLERANCE_DB: f64 = 0.05;
 /// stop so a pathological signal can't loop forever.
 const MAX_LIMIT_PASSES: usize = 6;
 
+/// Convergence tolerance for maximize's makeup-gain loop — half the pipeline's ±0.1 LU
+/// "target not met" threshold, so a converged run never trips that warning.
+const MAKEUP_TOLERANCE_LU: f64 = 0.05;
+
+/// Cap on maximize's makeup-gain passes. Convergence is monotone from below and
+/// typically lands within tolerance in 2–3 passes; this bounds pathological programs.
+const MAX_MAKEUP_PASSES: usize = 5;
+
 #[derive(Debug, Clone)]
 pub struct LoudnessApplyResult {
     pub in_lufs: f64,
@@ -27,6 +35,12 @@ pub struct LoudnessApplyResult {
     /// squashed" number — the only signal that a loudness target was reached at
     /// the cost of dynamics, since `out_lufs`/`true_peak_out` both look clean.
     pub limiter_gain_reduction_db: f64,
+    /// Mean gain reduction (dB) across the samples the limiter actually attenuated
+    /// (0.0 when no limiting ran). Peak GR alone can't distinguish one shaved needle
+    /// from wall-to-wall limiting; this and `limiter_active_ratio` can.
+    pub limiter_avg_gain_reduction_db: f64,
+    /// Fraction (0..=1) of assessable samples the limiter attenuated.
+    pub limiter_active_ratio: f64,
     pub warnings: Vec<String>,
 }
 
@@ -36,6 +50,7 @@ pub fn apply(
     true_peak_ceiling_dbtp: Option<f64>,
     on_clip: Option<OnClipPolicy>,
     limiter_options: limiter::LimiterOptions,
+    max_limiting_db: f64,
 ) -> Result<LoudnessApplyResult> {
     let in_lufs = measure_lufs(buffer)?;
     let tp_in = measure_true_peak_dbtp(buffer)?;
@@ -45,6 +60,14 @@ pub fn apply(
 
     let ceiling = true_peak_ceiling_dbtp.unwrap_or(-1.0);
     let policy = on_clip.unwrap_or(OnClipPolicy::Limit);
+
+    // Maximize is normalization *with* makeup-gain convergence — its own control flow.
+    if matches!(policy, OnClipPolicy::Maximize) {
+        return apply_maximize(
+            buffer, target_lufs, ceiling, limiter_options, max_limiting_db, in_lufs, tp_in,
+        );
+    }
+
     let predicted_tp = tp_in + gain_db;
     let needs_ceiling_enforcement = predicted_tp > ceiling;
 
@@ -81,11 +104,17 @@ pub fn apply(
     // For the Limit policy, run the oversampled true-peak limiter after gain, then verify
     // the BS.1770 meter agrees the ceiling is held.
     let mut limiter_gain_reduction_db = 0.0;
+    let mut limiter_avg_gain_reduction_db = 0.0;
+    let mut limiter_active_ratio = 0.0;
     if matches!(policy, OnClipPolicy::Limit) && needs_ceiling_enforcement {
+        // Kept only to measure the exact per-sample gain reduction for the report.
+        let pre_limit = buffer.channels.clone();
         let (final_tp, passes) = limit_and_verify(buffer, ceiling, limiter_options)?;
         // The loudest peak sat at `predicted_tp`; the limiter pulls it down to the
         // ceiling, so this is the maximum gain reduction applied anywhere in the file.
         limiter_gain_reduction_db = predicted_tp - ceiling;
+        (limiter_avg_gain_reduction_db, limiter_active_ratio) =
+            gain_reduction_stats(&pre_limit, &buffer.channels, 1.0);
         if final_tp - ceiling > TP_TOLERANCE_DB {
             warnings.push(format!(
                 "true peak still {final_tp:.2} dBTP after {passes} limiter passes \
@@ -104,8 +133,142 @@ pub fn apply(
         true_peak_in_dbtp: tp_in,
         true_peak_out_dbtp: tp_out,
         limiter_gain_reduction_db,
+        limiter_avg_gain_reduction_db,
+        limiter_active_ratio,
         warnings,
     })
+}
+
+/// `Maximize`: loudness normalization with makeup-gain convergence. A single gain
+/// application undershoots hot targets because the limiter eats integrated loudness;
+/// this loop re-adds the measured shortfall until the delivered LUFS lands on target
+/// (± `MAKEUP_TOLERANCE_LU`), the peak gain reduction reaches `max_limiting_db`, or
+/// `MAX_MAKEUP_PASSES` runs out (the pipeline's "target not met" warning then reports it).
+///
+/// Every pass restarts from the pristine source (× the accumulated gain): re-limiting an
+/// already-limited signal would compound envelope modulation, while restarting keeps
+/// exactly one limiter generation in the delivered audio. Convergence is monotone from
+/// below — limiting only ever eats loudness and `out(gain + Δ) ≤ out(gain) + Δ`, so the
+/// target is approached but never overshot.
+fn apply_maximize(
+    buffer: &mut AudioBuffer,
+    target_lufs: f64,
+    ceiling: f64,
+    limiter_options: limiter::LimiterOptions,
+    max_limiting_db: f64,
+    in_lufs: f64,
+    tp_in: f64,
+) -> Result<LoudnessApplyResult> {
+    let pristine = buffer.channels.clone();
+    let mut warnings = Vec::new();
+
+    // The gain at which peak gain reduction hits exactly max_limiting_db; makeup gain
+    // never exceeds it. Clamping unconditionally is safe: gains below the ceiling-breach
+    // point produce no gain reduction at all and sit below this bound anyway.
+    let cap_gain_db = ceiling + max_limiting_db - tp_in;
+    let desired_gain_db = target_lufs - in_lufs;
+    let mut gain_db = desired_gain_db.min(cap_gain_db);
+    let mut hit_cap = desired_gain_db > cap_gain_db;
+
+    let mut out_lufs = in_lufs;
+    let mut limited = false;
+    let mut residual_tp_warning = None;
+
+    for pass in 1..=MAX_MAKEUP_PASSES {
+        let gain_lin = 10_f64.powf(gain_db / 20.0);
+        for (channel, source) in buffer.channels.iter_mut().zip(&pristine) {
+            for (sample, &s) in channel.iter_mut().zip(source) {
+                *sample = s * gain_lin;
+            }
+        }
+
+        limited = tp_in + gain_db > ceiling;
+        if limited {
+            let (final_tp, passes) = limit_and_verify(buffer, ceiling, limiter_options)?;
+            // Only the last pass's audio survives, so earlier residuals are irrelevant.
+            residual_tp_warning = (final_tp - ceiling > TP_TOLERANCE_DB).then(|| {
+                format!(
+                    "true peak still {final_tp:.2} dBTP after {passes} limiter passes \
+                     (ceiling {ceiling:.2} dBTP)"
+                )
+            });
+        }
+
+        out_lufs = measure_lufs(buffer)?;
+        let shortfall = target_lufs - out_lufs;
+        // The last pass must not raise the gain again: gain_db has to describe the
+        // audio actually delivered.
+        if shortfall <= MAKEUP_TOLERANCE_LU || hit_cap || pass == MAX_MAKEUP_PASSES {
+            break;
+        }
+        let desired = gain_db + shortfall;
+        hit_cap = desired > cap_gain_db;
+        gain_db = desired.min(cap_gain_db);
+    }
+
+    if hit_cap && target_lufs - out_lufs > MAKEUP_TOLERANCE_LU {
+        warnings.push(format!(
+            "maximization capped: reached max_limiting_db {max_limiting_db:.1} dB before \
+             {target_lufs:.1} LUFS (delivered {out_lufs:.2} LUFS); raise max_limiting_db \
+             or lower the target"
+        ));
+    }
+    warnings.extend(residual_tp_warning);
+
+    let (limiter_avg_gain_reduction_db, limiter_active_ratio) = if limited {
+        gain_reduction_stats(&pristine, &buffer.channels, 10_f64.powf(gain_db / 20.0))
+    } else {
+        (0.0, 0.0)
+    };
+
+    let tp_out = measure_true_peak_dbtp(buffer)?;
+    Ok(LoudnessApplyResult {
+        in_lufs,
+        out_lufs,
+        gain_db,
+        true_peak_in_dbtp: tp_in,
+        true_peak_out_dbtp: tp_out,
+        limiter_gain_reduction_db: if limited {
+            ((tp_in + gain_db) - ceiling).max(0.0)
+        } else {
+            0.0
+        },
+        limiter_avg_gain_reduction_db,
+        limiter_active_ratio,
+        warnings,
+    })
+}
+
+/// Exact per-sample gain-reduction stats of a limiter run: mean reduction (dB) over the
+/// attenuated samples, and the fraction of samples attenuated. The reference signal is
+/// `pre × pre_gain` — what the limiter actually saw — so maximize can reuse its pristine
+/// copy without materializing another buffer.
+fn gain_reduction_stats(pre: &[Vec<f64>], post: &[Vec<f64>], pre_gain: f64) -> (f64, f64) {
+    let mut assessable = 0_usize;
+    let mut active = 0_usize;
+    let mut gr_db_sum = 0.0;
+    for (pre_ch, post_ch) in pre.iter().zip(post) {
+        for (&p, &q) in pre_ch.iter().zip(post_ch) {
+            let reference = p * pre_gain;
+            // Near-silent samples carry no measurable ratio; leave them out of both
+            // numerator and denominator rather than pretend to know their gain.
+            if reference.abs() <= 1e-9 {
+                continue;
+            }
+            assessable += 1;
+            let ratio = q / reference;
+            // Untouched samples are bit-exact (the limiter's unity-gain fast path), so
+            // any ratio below 1 − ε is real attenuation, not float noise.
+            if ratio < 1.0 - 1e-9 {
+                active += 1;
+                gr_db_sum += -20.0 * ratio.max(1e-12).log10();
+            }
+        }
+    }
+    if active == 0 || assessable == 0 {
+        return (0.0, 0.0);
+    }
+    (gr_db_sum / active as f64, active as f64 / assessable as f64)
 }
 
 fn measure_lufs(buffer: &AudioBuffer) -> Result<f64> {
@@ -288,7 +451,9 @@ pub fn enforce_ceiling(
     }
 
     match on_clip {
-        OnClipPolicy::Limit => {
+        // Maximize without a loudness step has nothing to maximize toward — it degrades
+        // to plain ceiling enforcement (the pipeline warns about the no-op intent).
+        OnClipPolicy::Limit | OnClipPolicy::Maximize => {
             let (final_tp, passes) = limit_and_verify(buffer, ceiling_dbtp, limiter_options)?;
             let mut warnings = vec![format!(
                 "true peak {tp:.2} dBTP exceeded ceiling {ceiling_dbtp:.2} dBTP; limiter applied"
@@ -326,6 +491,10 @@ pub fn enforce_ceiling(
 /// SRC filters can produce inter-sample peaks up to ~3 dBTP above the peak of the input;
 /// this function ensures the ceiling remains enforced without requiring a manual second
 /// loudness step in the pipeline config.
+///
+/// Deliberately does NOT re-run maximize's makeup-gain convergence: it trims only the
+/// new inter-sample overshoots (hundredths of a dB), whose loudness effect is far below
+/// the ±0.1 LU reporting threshold.
 ///
 /// Returns warnings if the limiter was actually invoked.
 pub fn recheck_and_limit_if_needed(

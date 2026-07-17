@@ -22,14 +22,17 @@ What it does:
   stopband, on par with SoX/Weiss), with a pure-Rust `rubato` fallback
   (`--no-default-features`) for builds with no system dependencies. See **Build**.
 
-- Loudness normalization via `ebur128` (integrated LUFS to target ±0.1 LU).
+- Loudness normalization via `ebur128` (integrated LUFS to target ±0.1 LU), plus opt-in
+  **loudness maximization** (`on_clip = "maximize"`): makeup-gain convergence that actually
+  hits hot targets where limiting eats loudness, bounded by a `max_limiting_db` peak
+  gain-reduction cap.
 
 - Oversampled true-peak limiter with a band-limited (polyphase windowed-sinc) inter-sample
   peak detector and a raised-cosine attack ramp over the look-ahead window (no gain-step
   modulation distortion); the configured ceiling is always enforced (even for a pure
   transcode with no loudness step), re-checked after every resample, and **verified against
   the BS.1770 meter** so the delivered file genuinely respects the ceiling. Limiter behavior
-  is configurable per target: adaptive `balanced`/`transient` release character,
+  is configurable per target: adaptive `balanced`/`transient`/`dense` release character,
   optional soft clipping, and linked/unlinked channel envelopes.
 
 - Per-file metering report: integrated **LUFS**, **LRA** (loudness range), max
@@ -108,7 +111,7 @@ one with `preset = "NAME"`, then override any field on top of it.
 
 A preset sets **only those four fields.** Everything else (`on_clip`,
 `limiter_character`, `limiter_soft_clip`, `limiter_link_channels`,
-`warn_limiting_db`, `quality`, `dither`, `dir`, `naming`, `overwrite`) comes from
+`warn_limiting_db`, `max_limiting_db`, `quality`, `dither`, `dir`, `naming`, `overwrite`) comes from
 the built-in defaults or your `[defaults]` — so, e.g., dither stays `tpdf` and
 quality stays `vhq` unless you say otherwise.
 
@@ -129,6 +132,7 @@ When a field is set by neither a preset nor an explicit value, these apply:
 | `limiter_soft_clip` | `false` |
 | `limiter_link_channels` | `true` |
 | `warn_limiting_db` | 1.0 |
+| `max_limiting_db` | 8.0 |
 | `quality` | `vhq` |
 | `dither` | `tpdf` |
 | `dir` | `./out` |
@@ -158,10 +162,15 @@ dither  = "psychoacoustic"   # s16 targets get the strong shaper; s24/f32 ignore
 [target.streaming]
 preset = "spotify"           # -> 44100 / s16 / -14 LUFS / -1.0 dBTP
 
-# 2. Preset + one tweak: the Spotify spec, but a louder normalization target.
+# 2. A deliberately loud master: maximize actually reaches the hot target by re-adding
+#    the loudness the limiter eats (bounded by max_limiting_db of peak reduction);
+#    the dense character is the slow-release profile made for sustained limiting.
 [target.loud]
-preset = "spotify"
-lufs   = -9.0                # overrides the preset's -14
+preset            = "spotify"
+lufs              = -9.0     # overrides the preset's -14
+on_clip           = "maximize"
+limiter_character = "dense"
+max_limiting_db   = 6.0      # spend at most 6 dB of peaks on loudness
 
 # 3. Preset + several overrides: a 24-bit Apple Music variant with a custom ceiling.
 [target.apple-hd]
@@ -319,15 +328,31 @@ tool.
 
 ### Limiter behavior
 
-When `on_clip = "limit"`, limiter behavior is configurable per target:
+When `on_clip = "limit"` or `"maximize"`, limiter behavior is configurable per target:
 
 | Field | Values | Meaning |
 |---|---|---|
-| `limiter_character` | `balanced` (default), `transient` | Program-dependent release profile and look-ahead length (which also sets the raised-cosine attack-ramp length: 1.2 ms `balanced`, 0.6 ms `transient`). `balanced` is smoother; `transient` recovers faster and preserves attack more aggressively. |
+| `limiter_character` | `balanced` (default), `transient`, `dense` | Program-dependent release profile and look-ahead length (which also sets the raised-cosine attack-ramp length: 1.2 ms `balanced`, 0.6 ms `transient`, 2.0 ms `dense`). `balanced` is smoother; `transient` recovers faster and preserves attack more aggressively; `dense` recovers much slower — the mastering-style choice for *sustained* gain reduction (pair it with `maximize`), riding between peaks instead of pumping. |
 | `limiter_soft_clip` | `true` / `false` (default) | Applies a gentle saturating curve near the ceiling after limiting to tame residual needles. |
 | `limiter_link_channels` | `true` (default), `false` | `true`: one shared gain envelope (stable stereo image). `false`: independent channel envelopes (can preserve more per-channel punch, but may shift image under heavy limiting). |
+| `max_limiting_db` | dB > 0 (default 8.0) | `maximize` only: the peak gain reduction the makeup loop may spend before it stops adding gain (with a warning). The guard that keeps a mis-set hot target from grinding a master flat. |
 
-These options are ignored unless `on_clip = "limit"`.
+These options are ignored unless `on_clip = "limit"` or `"maximize"`.
+
+### Loudness maximization
+
+`on_clip = "limit"` treats limiting as a safety net: the makeup gain is computed once
+from the source loudness, and when limiting then eats loudness, hot targets undershoot
+(reported via the "loudness target not met" warning). `on_clip = "maximize"` makes the
+loudness target authoritative instead: after each limiting pass the delivered LUFS is
+re-measured and the shortfall re-added as gain — restarting from the pristine source
+each time, so the delivered audio always carries exactly one limiter generation — until
+the target is hit (±0.1 LU), `max_limiting_db` of peak reduction is reached, or the
+signal stops getting louder. The heavy-limiting warning is suppressed (limiting is the
+point); honesty comes from the report instead: peak **and** mean gain reduction plus the
+percentage of the signal limited, alongside the delivered PLR/PSR. Expect transparent
+results up to roughly 3–6 dB of peak reduction with `limiter_character = "dense"`;
+beyond that a single-band brickwall audibly flattens the program.
 
 ### Dither & noise shaping
 

@@ -272,9 +272,18 @@ fn print_reports(reports: &[ProcessingReport]) {
         let s = &report.source;
         let d = &report.delivered;
 
-        // How much the limiter squashed to hit the loudness target (omitted when none).
+        // How much the limiter squashed to hit the loudness target (omitted when none):
+        // peak reduction, plus mean depth and how much of the signal was touched —
+        // one shaved needle and wall-to-wall limiting have the same peak figure.
         let limiting = match report.limiter_gain_reduction_db {
-            Some(gr) if gr > 0.0 => format!(" | limited -{gr:.1} dB"),
+            Some(gr) if gr > 0.0 => {
+                let detail = match (report.limiter_avg_gain_reduction_db, report.limiter_active_percent)
+                {
+                    (Some(avg), Some(pct)) => format!(" (avg -{avg:.1} dB over {pct:.1}%)"),
+                    _ => String::new(),
+                };
+                format!(" | limited peak -{gr:.1} dB{detail}")
+            }
             _ => String::new(),
         };
         let dither_tag = match (report.shaping_curve, report.dithered) {

@@ -31,6 +31,10 @@ struct TaskJson<'a> {
     dither: DitherJson<'a>,
     /// Peak gain reduction the limiter applied (dB); `null` when none was needed.
     limiter_gain_reduction_db: Option<f64>,
+    /// Mean gain reduction (dB) over the limited portion; `null` when none was needed.
+    limiter_avg_gain_reduction_db: Option<f64>,
+    /// Percent (0–100) of samples the limiter attenuated; `null` when none was needed.
+    limiter_active_percent: Option<f64>,
     source: AnalysisJson,
     delivered: AnalysisJson,
     warnings: &'a [String],
@@ -107,6 +111,8 @@ pub fn render(
             bwf: r.bwf,
             dither: DitherJson { applied: r.dithered, noise_shaping: r.shaping_curve },
             limiter_gain_reduction_db: r.limiter_gain_reduction_db,
+            limiter_avg_gain_reduction_db: r.limiter_avg_gain_reduction_db,
+            limiter_active_percent: r.limiter_active_percent,
             source: (&r.source).into(),
             delivered: (&r.delivered).into(),
             warnings: &r.warnings,
@@ -147,6 +153,8 @@ mod tests {
             source: analysis(f64::NEG_INFINITY), // silence -> null
             delivered: analysis(-14.0),
             limiter_gain_reduction_db: Some(2.5),
+            limiter_avg_gain_reduction_db: Some(0.8),
+            limiter_active_percent: Some(42.0),
             dithered: true,
             shaped: true,
             shaping_curve: Some("psychoacoustic"),
@@ -172,6 +180,8 @@ mod tests {
         assert_eq!(v["tasks"][0]["sample_rate"]["out"].as_u64(), Some(44_100));
         assert_eq!(v["tasks"][0]["dither"]["noise_shaping"].as_str(), Some("psychoacoustic"));
         assert_eq!(v["tasks"][0]["limiter_gain_reduction_db"].as_f64(), Some(2.5));
+        assert_eq!(v["tasks"][0]["limiter_avg_gain_reduction_db"].as_f64(), Some(0.8));
+        assert_eq!(v["tasks"][0]["limiter_active_percent"].as_f64(), Some(42.0));
         // Non-finite source loudness must serialize as JSON null.
         assert!(v["tasks"][0]["source"]["integrated_lufs"].is_null());
         assert_eq!(v["tasks"][0]["delivered"]["integrated_lufs"].as_f64(), Some(-14.0));

@@ -54,6 +54,10 @@ pub struct RawTarget {
     /// silent "source got crushed to hit the target" case (default 1.0 — conservative,
     /// so even mild limiting is flagged).
     pub warn_limiting_db: Option<f64>,
+    /// Peak gain reduction (dB) `on_clip = "maximize"` may spend before it stops adding
+    /// makeup gain (default 8.0). The safety cap that keeps a mis-set hot target from
+    /// grinding a master flat; ignored by the other policies.
+    pub max_limiting_db: Option<f64>,
     pub quality: Option<ResampleQuality>,
     pub dither: Option<DitherMode>,
     pub dither_strength: Option<DitherStrength>,
@@ -86,6 +90,11 @@ pub enum OnClipPolicy {
     Limit,
     ReduceGain,
     Warn,
+    /// Like `Limit`, but with makeup-gain convergence: after limiting eats loudness,
+    /// gain is added back iteratively until the delivered LUFS actually hits the target
+    /// (bounded by `max_limiting_db` of peak gain reduction). Deliberate loudness
+    /// maximization — the heavy-limiting warning is suppressed; the cap is the guard.
+    Maximize,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -93,6 +102,9 @@ pub enum OnClipPolicy {
 pub enum LimiterCharacter {
     Balanced,
     Transient,
+    /// Slow, mastering-style release for *sustained* gain reduction (loudness
+    /// maximization); balanced/transient are tuned for occasional overshoots.
+    Dense,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +257,8 @@ pub struct ResolvedTarget {
     pub limiter_link_channels: bool,
     /// Limiter gain-reduction threshold (dB) above which a heavy-limiting warning fires.
     pub warn_limiting_db: f64,
+    /// Peak gain-reduction budget (dB) for `on_clip = "maximize"`.
+    pub max_limiting_db: f64,
     pub quality: ResampleQuality,
     pub dither: DitherMode,
     pub dither_strength: DitherStrength,
@@ -295,6 +309,7 @@ impl ResolvedTarget {
                     self.limiter_character,
                     self.limiter_soft_clip,
                     self.limiter_link_channels,
+                    self.max_limiting_db,
                 )
             )),
             None => steps.push(format!(
@@ -305,6 +320,7 @@ impl ResolvedTarget {
                     self.limiter_character,
                     self.limiter_soft_clip,
                     self.limiter_link_channels,
+                    self.max_limiting_db,
                 )
             )),
         }
@@ -404,6 +420,7 @@ impl Config {
             limiter_soft_clip: merged.limiter_soft_clip.unwrap(),
             limiter_link_channels: merged.limiter_link_channels.unwrap(),
             warn_limiting_db: merged.warn_limiting_db.unwrap(),
+            max_limiting_db: merged.max_limiting_db.unwrap(),
             quality: merged.quality.unwrap(),
             dither: merged.dither.unwrap(),
             dither_strength: merged.dither_strength.unwrap_or(DitherStrength::Normal),
@@ -465,6 +482,15 @@ impl ResolvedTarget {
                 self.warn_limiting_db
             );
         }
+        // Zero would forbid all limiting, making maximize unable to ever exceed the
+        // plain-normalization result — surely a config mistake.
+        if !self.max_limiting_db.is_finite() || self.max_limiting_db <= 0.0 {
+            bail!(
+                "target '{}': max_limiting_db must be a finite value > 0 (got {:.2})",
+                self.name,
+                self.max_limiting_db
+            );
+        }
         // FLAC is an integer codec; it has no floating-point sample format.
         if self.codec == OutputCodec::Flac
             && matches!(self.format, OutputSampleFormat::F32 | OutputSampleFormat::F64)
@@ -511,6 +537,7 @@ fn overlay(base: RawTarget, top: RawTarget) -> RawTarget {
         limiter_soft_clip: top.limiter_soft_clip.or(base.limiter_soft_clip),
         limiter_link_channels: top.limiter_link_channels.or(base.limiter_link_channels),
         warn_limiting_db: top.warn_limiting_db.or(base.warn_limiting_db),
+        max_limiting_db: top.max_limiting_db.or(base.max_limiting_db),
         quality: top.quality.or(base.quality),
         dither: top.dither.or(base.dither),
         dither_strength: top.dither_strength.or(base.dither_strength),
@@ -537,6 +564,7 @@ fn builtin_fallback() -> RawTarget {
         limiter_soft_clip: Some(false),
         limiter_link_channels: Some(true),
         warn_limiting_db: Some(1.0),
+        max_limiting_db: Some(8.0),
         quality: Some(ResampleQuality::Vhq),
         dither: Some(DitherMode::Tpdf),
         dither_strength: Some(DitherStrength::Normal),
@@ -634,6 +662,7 @@ fn on_clip_tag(policy: OnClipPolicy) -> &'static str {
         OnClipPolicy::Limit => "limit",
         OnClipPolicy::ReduceGain => "reduce_gain",
         OnClipPolicy::Warn => "warn",
+        OnClipPolicy::Maximize => "maximize",
     }
 }
 
@@ -641,6 +670,7 @@ fn limiter_character_tag(character: LimiterCharacter) -> &'static str {
     match character {
         LimiterCharacter::Balanced => "balanced",
         LimiterCharacter::Transient => "transient",
+        LimiterCharacter::Dense => "dense",
     }
 }
 
@@ -649,14 +679,21 @@ fn limiter_policy_tag(
     character: LimiterCharacter,
     soft_clip: bool,
     link_channels: bool,
+    max_limiting_db: f64,
 ) -> String {
-    match policy {
-        OnClipPolicy::Limit => format!(
-            "limit; {} release; {}; soft_clip={}",
+    let limiter_detail = |verb: String| {
+        format!(
+            "{verb}; {} release; {}; soft_clip={}",
             limiter_character_tag(character),
             if link_channels { "linked" } else { "unlinked" },
             soft_clip
-        ),
+        )
+    };
+    match policy {
+        OnClipPolicy::Limit => limiter_detail("limit".to_string()),
+        OnClipPolicy::Maximize => {
+            limiter_detail(format!("maximize to target (cap {max_limiting_db:.1} dB)"))
+        }
         _ => on_clip_tag(policy).to_string(),
     }
 }
