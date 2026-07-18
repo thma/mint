@@ -1,0 +1,192 @@
+# Builds self-contained release binaries and publishes them as a GitHub Release.
+#
+# To cut a release:
+#   1. Bump `version` in Cargo.toml (the tag guard below enforces a match).
+#   2. git tag v0.2.0 && git push origin v0.2.0
+# The workflow builds all five targets and publishes the release with
+# auto-generated notes. `workflow_dispatch` builds the same artifacts for
+# testing (downloadable from the run page) but skips the release step.
+#
+# Unlike CI — which links the system libsoxr — release binaries link soxr
+# *statically*, so downloads run without any package-manager install:
+#   - Linux/macOS: soxr 0.1.3 built from source (Debian's orig tarball; a
+#     stable URL, unlike SourceForge redirects) as a static lib. soxr's cmake
+#     generates soxr.pc on non-Windows, which libsoxr-sys probes via pkg-config.
+#   - Windows: vcpkg's x64-windows-static-md triplet (static soxr, dynamic CRT
+#     — matching Rust's MSVC default, so no /MT vs /MD symbol clashes). Same
+#     hand-written soxr.pc trick as ci.yml, since upstream only generates the
+#     .pc on non-Windows.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Release-binary tuning without touching Cargo.toml (keeps local `--release`
+  # builds fast): strip debug symbols, thin LTO for cross-crate inlining.
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  CARGO_PROFILE_RELEASE_LTO: thin
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          # Last free Intel-mac runner label; supported by GitHub until Aug 2027.
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Releasing v0.2.0 with Cargo.toml still at 0.1.0 is a silent lie; fail
+      # early instead of shipping mislabeled binaries.
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [[ "$tag" != "$crate" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "VERSION=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=dev-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install pkg-config (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config
+
+      - name: Install pkg-config (macOS)
+        if: runner.os == 'macOS'
+        run: brew install pkg-config
+
+      - name: Build static libsoxr (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL -o soxr.tar.xz "https://deb.debian.org/debian/pool/main/libs/libsoxr/libsoxr_0.1.3.orig.tar.xz"
+          mkdir soxr-src && tar xf soxr.tar.xz -C soxr-src --strip-components=1
+          # POLICY_VERSION_MINIMUM: soxr 0.1.3 declares cmake_minimum_required
+          # < 3.5, which cmake 4.x (on current runners) refuses without this.
+          # OPENMP off: mint parallelizes via rayon; and Apple clang has no
+          # bundled libomp anyway.
+          cmake -S soxr-src -B soxr-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWITH_OPENMP=OFF \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/soxr-prefix" \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build soxr-build
+          cmake --install soxr-build
+          echo "PKG_CONFIG_PATH=$PWD/soxr-prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Build static libsoxr (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install soxr:x64-windows-static-md
+          choco install pkgconfiglite -y
+          # Upstream soxr skips .pc generation on WIN32 and libsoxr-sys probes
+          # exclusively via pkg-config, so write the .pc by hand (same trick as
+          # ci.yml, but pointing at the static triplet — no DLL to ship).
+          $prefix = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md" -replace '\\', '/'
+          $pcDir = "$prefix/lib/pkgconfig"
+          New-Item -ItemType Directory -Force $pcDir | Out-Null
+          @"
+          prefix=$prefix
+          includedir=$prefix/include
+          libdir=$prefix/lib
+
+          Name: soxr
+          Description: High quality, one-dimensional sample-rate conversion library
+          Version: 0.1.3
+          Libs: -L$prefix/lib -lsoxr
+          Cflags: -I$prefix/include
+          "@ | Out-File "$pcDir/soxr.pc" -Encoding ascii
+          "PKG_CONFIG_PATH=$pcDir" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir pkg
+          cp "target/${{ matrix.target }}/release/mint" README.md LICENSE pkg/
+          tar czf "mint-$VERSION-${{ matrix.target }}.tar.gz" -C pkg .
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/mint.exe", README.md, LICENSE pkg/
+          Compress-Archive -Path pkg/* -DestinationPath "mint-$env:VERSION-${{ matrix.target }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mint-${{ matrix.target }}
+          path: |
+            mint-*.tar.gz
+            mint-*.zip
+          if-no-files-found: error
+
+  # Publishes only when every target built — a release with missing platforms
+  # is worse than a delayed one.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
