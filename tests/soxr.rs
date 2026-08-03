@@ -1,5 +1,4 @@
-#![cfg(feature = "soxr")]
-//! libsoxr backend tests. Compiled only with `--features soxr` (needs the system lib).
+//! libsoxr backend tests (libsoxr is the only SRC backend; the system lib is required).
 //! They assert the three properties that make the binding reference-grade *and safe*:
 //! sample-accurate alignment, near-perfect passband reconstruction, deep stopband
 //! rejection, and corruption-free concurrent use (cli.rs runs the batch under rayon).

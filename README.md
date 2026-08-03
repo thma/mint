@@ -18,9 +18,8 @@ What it does:
 - **Multiple targets per config** — render every distribution format from one file in
   a single pass.
 
-- Resample via **libsoxr** by default for reference-grade SRC (multi-stage, ~150 dB
-  stopband, on par with SoX/Weiss), with a pure-Rust `rubato` fallback
-  (`--no-default-features`) for builds with no system dependencies. See **Build**.
+- Resample via **libsoxr** for reference-grade SRC (multi-stage, ~150 dB stopband, on par
+  with SoX/Weiss). See **Build** for the system dependency.
 
 - Loudness normalization via `ebur128` (integrated LUFS to target ±0.1 LU), plus opt-in
   **loudness maximization** (`on_clip = "maximize"`): makeup-gain convergence that actually
@@ -226,9 +225,8 @@ target before processing anything.
 ## Build
 
 Prerequisites: a stable Rust toolchain (edition 2024) **and** the system **libsoxr** C
-library + `pkg-config` — the default build links libsoxr for reference-grade
-sample-rate conversion (resampling only; dither, quantization, and noise shaping stay in
-this tool).
+library + `pkg-config` — mint links libsoxr for reference-grade sample-rate conversion
+(resampling only; dither, quantization, and noise shaping stay in this tool).
 
     # install the C library + pkg-config first (pkg-config is how the build finds libsoxr)
     brew install libsoxr pkg-config                 # macOS
@@ -242,16 +240,6 @@ this tool).
 
 The `quality = lq|mq|hq|vhq` setting maps onto libsoxr's recipes. See
 [Audio quality](#audio-quality) for what libsoxr buys you.
-
-### No-system-deps fallback (rubato)
-
-If you can't (or don't want to) install libsoxr, build with the pure-Rust `rubato`
-backend instead — no system dependencies at all:
-
-    cargo build --no-default-features
-
-The SRC backend is selected at **compile time**; everything else (loudness, limiting,
-dither, output formats) is identical between the two builds.
 
 ### MP3 output (opt-in)
 
@@ -302,29 +290,21 @@ and the per-file report show exactly what each target will do.
 
 ### Resampling
 
-`mint` has two sample-rate-conversion backends behind the same `quality` knob:
-
-| Backend | How to get it | Character |
-|---|---|---|
-| `libsoxr` *(default)* | built in (needs system libsoxr; see [Build](#build)) | Reference-grade multi-stage SRC (~150 dB stopband), same engine class as SoX/Weiss. |
-| `rubato` | `--no-default-features` (pure Rust, no system deps) | High-quality windowed-sinc SRC; transparent for virtually all material. |
+Sample-rate conversion goes through **libsoxr** (needs the system library; see
+[Build](#build)): reference-grade multi-stage SRC with a ~150 dB stopband, the same
+engine class as SoX and Weiss.
 
 `quality = lq | mq | hq | vhq` (default `vhq`) sets the filter length/steepness and maps
-onto each backend's internal recipes. `vhq` is the right choice for masters; the lower
+onto libsoxr's internal recipes. `vhq` is the right choice for masters; the lower
 settings trade stopband and transition-band performance for speed.
 
 The resampler runs **only when a target's rate differs from the source** — same-rate
 targets skip it entirely. Whenever it does run, the true-peak ceiling is re-checked and
 re-limited afterwards, since sample-rate conversion can create new inter-sample peaks.
 
-**Which should I use?** The default `libsoxr` is the right call for serious work — final
-masters, large or awkward rate ratios (e.g. 96k → 44.1k), archival deliverables, or
-matching a SoX-based reference. The pure-Rust `rubato` fallback (`--no-default-features`)
-is excellent in its own right and needs nothing installed; reach for it when you can't
-add the system dependency. The backend is chosen at **compile time** — the default binary
-always resamples through libsoxr, a `--no-default-features` binary always uses rubato.
-libsoxr does resampling only; dither, quantization, and noise shaping always stay in this
-tool.
+libsoxr handles large or awkward rate ratios (e.g. 96k → 44.1k) by deriving the
+multi-stage decomposition itself, which is why it is the only backend here. It does
+resampling only; dither, quantization, and noise shaping always stay in this tool.
 
 ### Limiter behavior
 

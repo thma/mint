@@ -5,8 +5,8 @@ on:
   pull_request:
 
 jobs:
-  # The default build now routes through libsoxr (reference-grade SRC), so every
-  # platform installs the C library + pkg-config before building. Windows uses the
+  # Every build routes through libsoxr (the only SRC backend), so every platform
+  # installs the C library + pkg-config before building. Windows uses the
   # vcpkg that ships preinstalled on the GitHub runner, plus pkg-config from choco.
   # Upstream soxr only generates soxr.pc on non-Windows (src/CMakeLists.txt gates
   # it behind NOT WIN32), and libsoxr-sys probes exclusively via pkg-config with
@@ -67,20 +67,3 @@ jobs:
 
       - name: Test
         run: cargo test --verbose
-
-  # The pure-Rust rubato fallback must keep compiling and passing with no system deps.
-  test-rubato-fallback:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build (rubato fallback)
-        run: cargo build --no-default-features --verbose
-
-      - name: Test (rubato fallback)
-        run: cargo test --no-default-features --verbose

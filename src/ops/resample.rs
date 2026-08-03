@@ -5,11 +5,8 @@ use crate::config::ResampleQuality;
 
 /// Resample `buffer` to `target_rate` in place.
 ///
-/// The actual SRC backend is chosen at compile time: the default `soxr` feature routes
-/// to libsoxr (reference-grade, multi-stage, FFI to the system C lib); a
-/// `--no-default-features` build falls back to the pure-Rust rubato backend. Both share
-/// the same public contract: planar f64 in, planar f64 out, output length ==
-/// round(in_frames * ratio).
+/// SRC is libsoxr throughout (reference-grade, multi-stage, FFI to the system C lib).
+/// Contract: planar f64 in, planar f64 out, output length == round(in_frames * ratio).
 pub fn apply(buffer: &mut AudioBuffer, target_rate: u32, quality: Option<ResampleQuality>) -> Result<()> {
     if target_rate == buffer.sample_rate {
         return Ok(());
@@ -22,19 +19,8 @@ pub fn apply(buffer: &mut AudioBuffer, target_rate: u32, quality: Option<Resampl
         return Ok(());
     }
 
-    #[cfg(feature = "soxr")]
-    {
-        apply_soxr(buffer, target_rate, quality, channels, in_frames)
-    }
-    #[cfg(not(feature = "soxr"))]
-    {
-        apply_rubato(buffer, target_rate, quality, channels, in_frames)
-    }
+    apply_soxr(buffer, target_rate, quality, channels, in_frames)
 }
-
-// ---------------------------------------------------------------------------
-// libsoxr backend (feature = "soxr", default)
-// ---------------------------------------------------------------------------
 
 /// libsoxr as a *pure* resampler: f64 in, f64 out. Because the I/O datatype is
 /// floating point, libsoxr's internal TPDF dither never engages (it only applies on
@@ -42,7 +28,6 @@ pub fn apply(buffer: &mut AudioBuffer, target_rate: u32, quality: Option<Resampl
 /// `pipeline.rs`, preserving the "canonical f64 buffer, quantize exactly once" invariant.
 /// libsoxr also derives the multi-stage decomposition (half-band cascade + polyphase/DFT)
 /// from the rate pair on its own, so large ratios like 192k -> 44.1k are staged for us.
-#[cfg(feature = "soxr")]
 fn apply_soxr(
     buffer: &mut AudioBuffer,
     target_rate: u32,
@@ -88,8 +73,8 @@ fn apply_soxr(
 
     // libsoxr introduces a linear-phase group delay; its first `delay()` output frames
     // are the filter priming, not aligned audio. We drain everything, then drop those
-    // leading frames so the result is sample-aligned with the source (same contract as
-    // the rubato path). Query delay before processing — it is the steady-state latency.
+    // leading frames so the result is sample-aligned with the source. Query delay before
+    // processing — it is the steady-state latency.
     let delay = soxr.delay().round() as usize;
 
     // Hold `expected + delay` aligned frames plus headroom for the flush tail.
@@ -137,7 +122,6 @@ fn apply_soxr(
 /// Map our quality tiers onto libsoxr recipes. `ROLLOFF_SMALL` keeps passband ripple
 /// <= 0.01 dB at every tier (flattest response); the top tier adds `HI_PREC_CLOCK` to
 /// maximize ratio accuracy for irrational conversions (e.g. the 44.1 <-> 48 kHz family).
-#[cfg(feature = "soxr")]
 fn soxr_quality(quality: Option<ResampleQuality>) -> (libsoxr::QualityRecipe, libsoxr::QualityFlags) {
     use libsoxr::{QualityFlags, QualityRecipe};
     match quality.unwrap_or(ResampleQuality::Hq) {
@@ -148,126 +132,5 @@ fn soxr_quality(quality: Option<ResampleQuality>) -> (libsoxr::QualityRecipe, li
             QualityRecipe::VeryHigh,
             QualityFlags::ROLLOFF_SMALL | QualityFlags::HI_PREC_CLOCK,
         ),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// rubato backend (fallback: --no-default-features)
-// ---------------------------------------------------------------------------
-
-#[cfg(not(feature = "soxr"))]
-fn apply_rubato(
-    buffer: &mut AudioBuffer,
-    target_rate: u32,
-    quality: Option<ResampleQuality>,
-    channels: usize,
-    in_frames: usize,
-) -> Result<()> {
-    use anyhow::Context;
-    use rubato::{Resampler, SincFixedIn};
-
-    let ratio = target_rate as f64 / buffer.sample_rate as f64;
-    let chunk_size = in_frames.clamp(64, 4096);
-    let params = quality_params(quality);
-
-    let mut resampler = SincFixedIn::<f64>::new(ratio, 1.0, params, chunk_size, channels)
-        .context("failed to construct rubato resampler")?;
-
-    let mut out_channels = vec![Vec::<f64>::new(); channels];
-    let mut cursor = 0usize;
-
-    while cursor + resampler.input_frames_next() <= in_frames {
-        let needed = resampler.input_frames_next();
-        let chunk: Vec<Vec<f64>> = buffer
-            .channels
-            .iter()
-            .map(|ch| ch[cursor..cursor + needed].to_vec())
-            .collect();
-
-        let out = resampler
-            .process(&chunk, None)
-            .context("rubato process failed")?;
-        append_non_interleaved(&mut out_channels, out);
-        cursor += needed;
-    }
-
-    if cursor < in_frames {
-        let tail: Vec<Vec<f64>> = buffer
-            .channels
-            .iter()
-            .map(|ch| ch[cursor..].to_vec())
-            .collect();
-        let out = resampler
-            .process_partial(Some(&tail), None)
-            .context("rubato tail flush failed")?;
-        append_non_interleaved(&mut out_channels, out);
-    }
-
-    // Push any delayed frames from the internal filter state.
-    for _ in 0..3 {
-        let out = resampler
-            .process_partial::<Vec<f64>>(None, None)
-            .context("rubato delayed flush failed")?;
-        let produced = out.first().map_or(0, Vec::len);
-        append_non_interleaved(&mut out_channels, out);
-        if produced == 0 {
-            break;
-        }
-    }
-
-    // Match exact theoretical output length and trim tail artefacts deterministically.
-    let expected = (in_frames as f64 * ratio).round() as usize;
-    for channel in &mut out_channels {
-        if channel.len() > expected {
-            channel.truncate(expected);
-        } else if channel.len() < expected {
-            channel.resize(expected, 0.0);
-        }
-    }
-
-    buffer.channels = out_channels;
-    buffer.sample_rate = target_rate;
-    Ok(())
-}
-
-#[cfg(not(feature = "soxr"))]
-fn append_non_interleaved(dst: &mut [Vec<f64>], src: Vec<Vec<f64>>) {
-    for (dst_ch, src_ch) in dst.iter_mut().zip(src.into_iter()) {
-        dst_ch.extend(src_ch);
-    }
-}
-
-#[cfg(not(feature = "soxr"))]
-fn quality_params(quality: Option<ResampleQuality>) -> rubato::SincInterpolationParameters {
-    use rubato::{SincInterpolationParameters, SincInterpolationType, WindowFunction};
-    match quality.unwrap_or(ResampleQuality::Hq) {
-        ResampleQuality::Lq => SincInterpolationParameters {
-            sinc_len: 96,
-            f_cutoff: 0.90,
-            oversampling_factor: 64,
-            interpolation: SincInterpolationType::Linear,
-            window: WindowFunction::Hann,
-        },
-        ResampleQuality::Mq => SincInterpolationParameters {
-            sinc_len: 128,
-            f_cutoff: 0.92,
-            oversampling_factor: 96,
-            interpolation: SincInterpolationType::Quadratic,
-            window: WindowFunction::Blackman,
-        },
-        ResampleQuality::Hq => SincInterpolationParameters {
-            sinc_len: 192,
-            f_cutoff: 0.945,
-            oversampling_factor: 128,
-            interpolation: SincInterpolationType::Cubic,
-            window: WindowFunction::BlackmanHarris,
-        },
-        ResampleQuality::Vhq => SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            oversampling_factor: 160,
-            interpolation: SincInterpolationType::Cubic,
-            window: WindowFunction::BlackmanHarris2,
-        },
     }
 }
