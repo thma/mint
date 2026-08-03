@@ -1,17 +1,40 @@
 # DSD-Ausgabe für mint — Design & Plan
 
-Status: **Entwurf, erste Runde durchgesprochen**. Nichts davon ist implementiert.
+> **Dieses Dokument ist der Übergabepunkt.** Es ist so geschrieben, dass man die Arbeit
+> ohne jede Vorgeschichte aufnehmen kann: Entscheidungen, Herleitungen, Messwerte und
+> Phasenstand stehen hier, nicht in irgendeinem Gesprächsverlauf.
 
-### Getroffene Entscheidungen (Runde 1)
+## Stand
+
+**Phase 1 abgeschlossen, Phase 2 ist als Nächstes dran.** Alles unten ist umgesetzt und
+grün (150 Tests, 1 ignorierte Messprobe).
+
+Was existiert:
+
+| Datei | Rolle |
+|---|---|
+| `src/ops/dsd/interpolate.rs` | `SoxrStream` — eine libsoxr-Instanz pro Datei, blockweise gefüttert; bit-identisch zum One-Shot-Pfad |
+| `src/ops/dsd/mod.rs` | Modulkopf, hält die Streaming-Invariante fest |
+| `src/ops/resample.rs` | `create_soxr` — **die** Konstruktionsstelle für Soxr-Instanzen, mit dem prozessweiten Init-Lock |
+| `tests/dsd_interpolate.rs` | 8 Tests um den Wrapper |
+| `tests/soxr_dsd_probe.rs` | Durchsatz-/Speicherprobe, `#[ignore]`; Messwerte in § 3.3 |
+
+Was als Nächstes zu bauen ist: **Phase 2** (§ 6) — NTF-Koeffizienten pro DSD-Rate, der
+CIFB-Modulator mit Zustandsbegrenzung und Quantisierer-Dither, der Dezimator als
+Messwerkzeug und `tests/dsd_verification.rs`. Abnahmekriterium dort ist die dB-Tabelle
+aus § 4, nicht „läuft durch".
+
+Arbeitsweise in diesem Repo: direkt auf `main`, Commits macht Thomas selbst.
+
+### Getroffene Entscheidungen
 
 | Frage | Entscheidung |
 |---|---|
 | Vorgehen | Durchgehend nach Plan, kein vorgeschalteter Go/No-Go-Spike |
 | Scope erster Wurf | **Alle DSD-Raten (64/128/256/512), Container nur DSF**; DFF vorerst raus |
 | Interpolation | **Komplett auf libsoxr** — rubato gilt als obsolet, Bit-Parität zwischen den Build-Varianten ist damit kein Designziel mehr |
-| rubato-Backend | **Bereits entfernt** (eigener Commit, vor der DSD-Arbeit): kein `soxr`-Feature, kein `--no-default-features`-Pfad, kein zweiter CI-Job mehr |
-
-Offen: die Zwischenraten-Regel (§ 2.1) — unten ausführlich hergeleitet.
+| rubato-Backend | **Entfernt** (Commit vor der DSD-Arbeit): kein `soxr`-Feature, kein `--no-default-features`-Pfad, kein zweiter CI-Job mehr |
+| Zwischenraten-Regel | `min(nächste_44,1-Rate, dsd_rate/32)` — hergeleitet in § 2.1, angenommen |
 
 ---
 
@@ -553,12 +576,11 @@ Invariante „die DSD-Stufe streamt, der PCM-Pfad nicht").
 
 ---
 
-## 7. Offene Entscheidungen
+## 7. Verworfene Alternativen zur Zwischenraten-Regel
 
-Nur noch eine, und sie ist billig zu ändern:
-
-**Zwischenraten-Regel.** Vorgeschlagen (§ 2.1): *nächstniedrigere Rate der 44,1-Familie
-zur Quellrate, gedeckelt auf DSD-Rate / 32*; explizites `rate` übersteuert. Alternativen:
+Die Regel aus § 2.1 (*nächstgelegene Rate der 44,1-Familie, gedeckelt auf DSD-Rate / 32*;
+explizites `rate` übersteuert) ist **angenommen**. Festgehalten ist hier, was dagegen
+abgewogen wurde — damit die Frage nicht in sechs Monaten neu aufgemacht wird:
 
 - **immer die höchstmögliche 44,1-Rate** — mehr Bandbreite in den Modulator, aber bei
   DSD64 landet Programminhalt bis 88 kHz in einem Modulator, dessen Rauschen ab ~25 kHz
@@ -569,10 +591,10 @@ zur Quellrate, gedeckelt auf DSD-Rate / 32*; explizites `rate` übersteuert. Alt
   möglich, seit die Interpolation ohnehin soxr ist, aber teurer und gegen die Konvention
   der DSD-Welt. Würde ich nicht tun.
 
-Bis auf Widerspruch nehme ich den Vorschlag.
+Der einzige Fall, in dem die gewählte Regel echte Bandbreite kostet, ist 48 → 44,1 kHz
+(24 → 22,05 kHz Band) — derselbe Handel, den mint für jedes 44,1-Deliverable längst macht.
 
-Der zweite Punkt von vorhin — das rubato-Backend — ist erledigt und aus diesem Dokument
-als Vorbehalt entfernt.
+**Es sind derzeit keine Entscheidungen offen.**
 
 ---
 
