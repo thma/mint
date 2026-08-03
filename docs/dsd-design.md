@@ -6,23 +6,26 @@
 
 ## Stand
 
-**Phase 1 abgeschlossen, Phase 2 ist als Nächstes dran.** Alles unten ist umgesetzt und
-grün (150 Tests, 1 ignorierte Messprobe).
+**Phase 1 und 2 abgeschlossen, Phase 3 ist als Nächstes dran.** Alles unten ist umgesetzt
+und grün (160 Tests, 1 ignorierte Messprobe).
 
 Was existiert:
 
 | Datei | Rolle |
 |---|---|
 | `src/ops/dsd/interpolate.rs` | `SoxrStream` — eine libsoxr-Instanz pro Datei, blockweise gefüttert; bit-identisch zum One-Shot-Pfad |
-| `src/ops/dsd/mod.rs` | Modulkopf, hält die Streaming-Invariante fest |
+| `src/ops/dsd/modulator.rs` | 1-Bit-Sigma-Delta, CIFB **Ordnung 7**, NTF-Tabelle pro Rate, Komparator-Dither, Zustandsbegrenzung, Overload-Zähler |
+| `src/ops/dsd/decimate.rs` | DSD → PCM, Halfband-Kaskade — reines Messwerkzeug, aus keinem Ausgabepfad erreichbar |
+| `src/ops/dsd/mod.rs` | Modulkopf (Streaming-Invariante), `DsdRate` |
 | `src/ops/resample.rs` | `create_soxr` — **die** Konstruktionsstelle für Soxr-Instanzen, mit dem prozessweiten Init-Lock |
+| `tools/design_ntf.py` | Offline-NTF-Entwurf + CIFB-Realisierung; erzeugt die Konstantentabelle, wird zur Bauzeit nicht gebraucht |
 | `tests/dsd_interpolate.rs` | 8 Tests um den Wrapper |
+| `tests/dsd_verification.rs` | Messharness, 10 Tests; Ergebnisse in § 4.1 |
 | `tests/soxr_dsd_probe.rs` | Durchsatz-/Speicherprobe, `#[ignore]`; Messwerte in § 3.3 |
 
-Was als Nächstes zu bauen ist: **Phase 2** (§ 6) — NTF-Koeffizienten pro DSD-Rate, der
-CIFB-Modulator mit Zustandsbegrenzung und Quantisierer-Dither, der Dezimator als
-Messwerkzeug und `tests/dsd_verification.rs`. Abnahmekriterium dort ist die dB-Tabelle
-aus § 4, nicht „läuft durch".
+Was als Nächstes zu bauen ist: **Phase 3** (§ 6) — der DSF-Streaming-Writer (Bit-Packing
+mit Bitreihenfolge als Parameter, 4096-Byte-Blöcke pro Kanal, Header-Patch via seek) und
+`tests/dsd_format.rs`. Ab da existiert die erste abspielbare Datei.
 
 Arbeitsweise in diesem Repo: direkt auf `main`, Commits macht Thomas selbst.
 
@@ -35,6 +38,9 @@ Arbeitsweise in diesem Repo: direkt auf `main`, Commits macht Thomas selbst.
 | Interpolation | **Komplett auf libsoxr** — rubato gilt als obsolet, Bit-Parität zwischen den Build-Varianten ist damit kein Designziel mehr |
 | rubato-Backend | **Entfernt** (Commit vor der DSD-Arbeit): kein `soxr`-Feature, kein `--no-default-features`-Pfad, kein zweiter CI-Job mehr |
 | Zwischenraten-Regel | `min(nächste_44,1-Rate, dsd_rate/32)` — hergeleitet in § 2.1, angenommen |
+| Modulator | **CIFB Ordnung 7, `H_inf` 1,30**, eine NTF pro Rate — gemessen besser *und* stabiler als die ursprünglich geplante Ordnung 5 / 1,5 (§ 2.3.1) |
+| Komparator-Dither | **0,2** statt der geplanten 1e-3 … 1e-2; der kleine Bereich tut messbar nichts, weil die Schleife ihn genau im Band wegformt (§ 2.3.1) |
+| Betriebsbereich | **0 … 50 % Modulation** (was die Ceiling-Stufe zulässt), nicht 0 … 71,43 %. Darüber kontrollierte Übersteuerung statt Divergenz |
 
 ---
 
@@ -224,6 +230,10 @@ den **tatsächlich erreichten Spitzen-Modulationsindex** ausweisen und oberhalb 
 
 ### 2.3 Modulator
 
+> **Umgesetzt in Phase 2.** Drei Parameter dieses Abschnitts haben die Messung nicht
+> überlebt; was tatsächlich gebaut wurde, steht in § 2.3.1. Der ursprüngliche Entwurf
+> bleibt hier stehen, weil die Begründungen weiter tragen — nur die Zahlen nicht.
+
 Stand der Technik für DSD64: **Rückkopplungsmodulator 5. bis 7. Ordnung, 1 Bit**, mit
 im Audioband optimierten NTF-Nullstellen und begrenztem Out-of-Band-Gain.
 
@@ -244,6 +254,59 @@ im Audioband optimierten NTF-Nullstellen und begrenztem Out-of-Band-Gain.
 - Erwartungswert: theoretisch ~167 dB SNR (Ordnung 5, OSR 64, Vollaussteuerung),
   realistisch **110–125 dB im Band 20 Hz – 20 kHz** bei 50 % Modulation. Was es wirklich
   wird, sagt uns die Messung in Phase 0 — nicht die Formel.
+
+#### 2.3.1 Was daraus geworden ist
+
+Drei Abweichungen, alle durch Messung erzwungen. Details und Messtabellen stehen im Kopf
+von `src/ops/dsd/modulator.rs`; hier die Kurzfassung mit Begründung.
+
+**Ordnung 7 statt 5, `H_inf` 1,30 statt 1,50.** Ordnung 5 mit `H_inf = 1,5` ist gemessen
+nur bis ~57 % Modulation stabil — sie divergiert also *unterhalb* der 71,43 %, die das
+Format erlaubt, und 0 dBFS (= 50 %) läge knapp 1 dB vor der Kante. Die Alternativen
+gegeneinander (DSD64, `tools/design_ntf.py --sweep`):
+
+| Ordnung | `H_inf` | max. stabile Amplitude | In-Band-SNR |
+|---|---|---|---|
+| 5 | 1,50 | 0,57 | 119,6 dB |
+| 5 | 1,35 | 0,75 | 110,2 dB |
+| **7** | **1,30** | **0,75** | **121,1 dB** |
+| 7 | 1,45 | 0,58 | 137,7 dB |
+
+Ordnung 7 bei 1,30 dominiert die beste Ordnung-5-Variante auf beiden Achsen gleichzeitig:
+gleiche Stabilität, 11 dB mehr Unterdrückung. Lee (`H_inf < 2`) bleibt mit Abstand
+erfüllt.
+
+**NTF-Entwurf über `synthesizeChebyshevNTF` statt `synthesizeNTF`.** Ein
+Chebyshev-II-Hochpass, dessen *Sperrband* das Audioband ist, liefert bei ungerader Ordnung
+genau eine Nullstelle bei DC plus (n−1)/2 konjugierte Paare — also exakt die CIFB-Form
+(ein reiner Integrator + Resonatoren). scipy normiert das Durchlassband auf 1, dadurch ist
+`sup|NTF| = 1/k` monoton in der Sperrbanddämpfung und eine Bisektion trifft `H_inf`
+*exakt*. Das braucht nur `scipy.signal.cheby2` statt der iterativen Polsuche von
+`synthesizeNTF` — weniger Code, kein Konvergenzrisiko, gleiches Ergebnis.
+
+Die CIFB-Koeffizienten fallen danach aus **einem linearen Gleichungssystem**: mit
+`NTF(z) = N(z) / (N(z) + C·adj(zI−A)·B)` ist `N` allein durch die Resonatorgains `g`
+festgelegt und der Korrekturterm linear in `a`. Faddeev-LeVerrier liefert `adj`, ein
+7×7-Solve den Rest. Exakt, ohne Iteration — der Realisierungsfehler gegenüber dem
+entworfenen zpk liegt bei 1e-8.
+
+**Komparator-Dither 0,2 statt 1e-3 … 1e-2.** Der vorgeschlagene Bereich tut gemessen
+*nichts*: 2e-3 lässt den Idle Tone eines 1e-3-DC-Offsets unverändert bei 34,5 dB über dem
+In-Band-Median. Der Grund ist strukturell und war im Entwurf übersehen — Dither am
+Komparator wird von der Schleife genauso geformt wie der Quantisierungsfehler, die tiefe
+In-Band-Kerbe nimmt ihm also genau dort die Wirkung, wo man sie bräuchte. Damit er die
+Entscheidung überhaupt stört, muss er ein realer Bruchteil des Quantisierereingangs sein
+(der bei `σ ≈ 0,3` läuft). Bei 0,2 fällt der Idle Tone auf 16,1 dB — rund 2 dB über dem
+Wert, den ein tonfreies Periodogramm ohnehin zeigt — und kostet ~1,2 dB In-Band-Rauschen.
+
+Nebenwirkung, die man kennen muss: der größere Dither kostet Stabilitätsreserve. Die max.
+stabile Amplitude sinkt von 0,753 auf 0,691 (Sinus). Der **Betriebsbereich ist 0 … 0,5** —
+PCM ist auf ±1 begrenzt und die Ceiling-Stufe deckelt den True Peak auf ≤ 0 dBFS, mehr als
+50 % Modulation kann die Pipeline gar nicht liefern —, und dort bleiben mindestens 2,1 dB
+Reserve. Die 71,43 % des Formats sind eine Aussage darüber, was ein DSD-Strom *darstellen*
+kann, nicht ein Pegel, den mint erreicht; dafür bräuchte es PCM bei +3,1 dBFS. Füttert man
+ihn trotzdem, übersteuert die Schleife kontrolliert (Zustandsbegrenzung greift, Zähler
+läuft mit, volle SNR kehrt zurück), statt zu divergieren.
 
 ---
 
@@ -457,15 +520,22 @@ Standard-Driftpunkt und gehört in dieselbe Änderung.
 ### 3.7 Neue Dateien
 
 ```
-src/ops/dsd/mod.rs          Orchestrierung der Blockschleife, DsdRate-Enum, Ratenableitung
-src/ops/dsd/interpolate.rs  Streaming-Wrapper um libsoxr (Latenz, Blockpufferung, INIT_LOCK)
-src/ops/dsd/modulator.rs    1-Bit-Sigma-Delta, CIFB, NTF-Tabelle pro Rate, Dither, Watchdog
+src/ops/dsd/mod.rs          Orchestrierung der Blockschleife, DsdRate-Enum, Ratenableitung  [teilweise: DsdRate]
+src/ops/dsd/interpolate.rs  Streaming-Wrapper um libsoxr (Latenz, Blockpufferung, INIT_LOCK)  [fertig]
+src/ops/dsd/modulator.rs    1-Bit-Sigma-Delta, CIFB, NTF-Tabelle pro Rate, Dither, Watchdog   [fertig]
+src/ops/dsd/decimate.rs     DSD → PCM, Messwerkzeug (pub, nicht cfg(test) — s. Phase 2)       [fertig]
+tools/design_ntf.py         Offline-NTF-Entwurf + CIFB-Realisierung, erzeugt die Tabelle      [fertig]
+tests/dsd_verification.rs   Messharness (Kopfzahlen wie bei dither_/limiter_verification)     [fertig]
 src/ops/dsd/pack.rs         Bit-Packing, Bitreihenfolge als Parameter (LSB-first für DSF)
-src/ops/dsd/decimate.rs     DSD → PCM, #[cfg(test)] — reines Messwerkzeug
 src/audio/io_write_dsd.rs   DSF-Streaming-Writer (Header-Patch via seek)
-tests/dsd_verification.rs   Messharness (Kopfzahlen wie bei dither_/limiter_verification)
 tests/dsd_format.rs         Byte-Layout, Padding, Bitreihenfolge, Fremd-Parser-Gegenprobe
 ```
+
+Die Blockschleife selbst (`mod.rs`) entsteht erst in Phase 4: bis dahin gibt es keinen
+Writer, den sie füttern könnte. Der Modulator ist aber schon dafür gebaut — eine Instanz
+pro Kanal, Zustand über Blockgrenzen hinweg, `modulate_into` hängt an einen
+wiederverwendeten Puffer an, und `tests/dsd_verification.rs` prüft, dass die Blockung das
+Ergebnis nicht um ein Bit verändert.
 
 ---
 
@@ -499,14 +569,68 @@ wir:
 Die gemessenen Zahlen kommen wie bei den anderen beiden Harnesses in den Dateikopf, mit
 den Schranken zwischen bestehendem und durchfallendem Bereich.
 
+### 4.1 Ergebnis (Phase 2, 2026-08-03, Apple Silicon)
+
+`tests/dsd_verification.rs`, 10 Tests, ~15 s im Debug-Build. Pegelkonvention durchgehend:
+**0 dBFS = 50 % Modulationsindex**. Der Dateikopf dort ist die maßgebliche Fassung dieser
+Tabelle; das hier ist die Zusammenfassung.
+
+| Rate | analytisch `sup\|NTF\|` | analytisch In-Band-Max | SNR 20 Hz–20 kHz | THD+N |
+|---|---|---|---|---|
+| DSD64 | 1,300 | −94,6 dB | **121,0 dB** | 120,0 dB |
+| DSD128 | 1,300 | −135,1 dB | 163,8 dB | 162,1 dB |
+| DSD256 | 1,300 | −151,1 dB | 173,7 dB | 171,1 dB |
+| DSD512 | 1,300 | −151,8 dB | 175,1 dB | 171,3 dB |
+
+**Der Zielkorridor aus § 4.1 war ≥ 110 dB; DSD64 liegt 11 dB darüber.** Die beiden
+untersten analytischen In-Band-Werte sind *nicht* die Entwurfswerte (−176,9 / −219,0 dB),
+sondern die Stelle, an der f64-Auslöschung aufhört: ab DSD256 ist die Kerbe tiefer, als
+doppelte Genauigkeit sie überhaupt auswerten kann. Kostet nichts — alles ab DSD128 ist
+40 dB jenseits jeder Relevanz —, ist aber der Grund, warum die Schranken im Harness
+Untergrenzen und Verhältnisse sind statt Gleichheiten.
+
+Der Rest der Liste aus § 4:
+
+| Punkt | Messung | Schranke |
+|---|---|---|
+| 2. Rauschform vs. 2.-Ordnung-Referenz, in-band | 48,2 dB besser | > 40 dB |
+| 2. Messspektrum vs. Schleifenfilter der Tabelle | 0,32 dB rms bei `k` = 2,42 | < 1,5 dB |
+| 3. Durchlassband 19 Hz – 19,8 kHz, ganze Kette | 0,0001 dB | < 0,1 dB |
+| 4. DC bei digitaler Stille | exakt 0 | < 1e-4 |
+| 5. Idle Tone, 1e-3 DC-Offset | 16,1 dB (34,5 dB ohne Dither) | < 25 dB |
+| 6. Clipping bei ≤ 60 % Modulation | keins | keins |
+| 6. SNR nach 90 % Übersteuerung | 120,7 dB | > 110 dB |
+| 7. Modulationsindex bei `ceiling_dbtp = −1` | 44,6 % | < 71,43 % |
+| 9. Determinismus (Seed, Kanal, Blockgrenzen) | bitgleich | bitgleich |
+| — Eigenfehler des Dezimators (das Messgerät) | −185,7 dB | < −160 dB |
+
+Zwei Befunde, die beim Messen aufgefallen sind und die man kennen sollte:
+
+**Die effektive Komparatorverstärkung ist nicht 1, sondern ~2,4.** Ein 1-Bit-Quantisierer
+hat keine Verstärkung, nur ein Vorzeichen; linearisiert ist `k = √(2/π)/σ_y`, und mit
+`σ_y ≈ 0,3` kommt ~2,6 heraus. Die *realisierte* NTF ist deshalb `NTF_k`, nicht die
+entworfene: außerhalb des Bandes steigt sie weiter an, statt bei `H_inf` zu sättigen. Der
+Harness fittet dieses eine Skalar und prüft das Residuum (0,32 dB über 50 kHz – 1,2 MHz) —
+das ist der eigentliche Nachweis, dass die implementierte Rekursion das Schleifenfilter der
+Tabelle realisiert. Wer die gemessene Kurve naiv gegen die entworfene NTF hält, findet
+8 dB „Fehler", die keiner sind.
+
+**Der Dezimator muss besser sein als das, was er misst.** Halfband-Kaskade, 121 Taps pro
+Stufe, Kaiser-Fenster, −174,8 dB Sperrband. Das ist keine Übertreibung: Dezimation um 2
+faltet alles oberhalb der neuen Nyquistfrequenz zurück, und was bei DSD64 nahe 1,4 MHz
+liegt, landet dabei *im Audioband*. Mit einem schwachen Anti-Aliasing-Filter erfindet das
+Messwerkzeug einen Rauschteppich und lässt einen guten Modulator mittelmäßig aussehen.
+Gemessen wird der Eigenfehler differenziell gegen den erwarteten Ton, nicht spektral — ein
+Kaiser-Fenster ist bei rund −170 dB am Ende, eine FFT würde hier sich selbst messen.
+
 ---
 
 ## 5. Risiken & offene Punkte
 
 | Risiko | Bewertung | Umgang |
 |---|---|---|
-| Modulatorqualität unklar bis gemessen | **hoch** — das ist *das* Risiko | Phase 2 früh, Messharness gehört zur Phase, nicht danach; die dB-Tabelle ist das Abnahmekriterium |
-| Stabilität bei heißem Material | mittel | Zustandsbegrenzung + Overload-Zähler + Warnung; optional deterministischer Retry mit −1 dB |
+| ~~Modulatorqualität unklar bis gemessen~~ | **erledigt** | Gemessen (§ 4.1): 121,0 dB bei DSD64, Ziel war ≥ 110. Das größte Einzelrisiko des Projekts ist damit weg |
+| ~~Stabilität bei heißem Material~~ | **erledigt, mit Einschränkung** | Kein Clipping bis 60 % Modulation, Betriebsbereich ist ≤ 50 % (§ 2.3.1). Bei 71,43 % übersteuert die Schleife kontrolliert und erholt sich; ein Retry mit −1 dB ist nicht nötig |
 | ~~libsoxr bei Ratio bis 512 (`vhq`)~~ | **erledigt** | Gemessen (§ 3.3): Kosten hängen nur an den Ausgangssamples, nicht am Verhältnis. Kein Staffeln nötig |
 | Streaming-Latenz/Längenvertrag | mittel | eigener Test: Streaming-Ergebnis == One-Shot-Ergebnis für eine kurze Datei bei kleinem Ratio |
 | Rechenzeit | gering | DSD64 ~Sekunden, DSD256 ~1–2 min/Titel/Kern, DSD512 entsprechend mehr; parallel über Kanäle und Jobs (rayon existiert) |
@@ -538,17 +662,20 @@ nach Phase 4 ist das Feature regulär über die Config nutzbar.
 3. Tests: Streaming-Ergebnis == One-Shot-Ergebnis (kurze Datei, kleines Ratio),
    Gesamtlängenvertrag, Durchlassbandgang, Nebenläufigkeit unter rayon.
 
-### Phase 2 — Modulator + Dezimator + Messharness · 3–4 Tage · **Risiko: hoch**
-1. NTF-Koeffizienten offline berechnen (`synthesizeNTF`, Ordnung 5, `H_inf` 1,5, opt.
-   Nullstellen) — **eine NTF pro DSD-Rate**, damit die In-Band-Nullstellen jeweils in
-   0–20 kHz landen. Ergebnis als Konstantentabelle mit dokumentierter Herkunft im
-   Modulkopf.
-2. CIFB-Modulator mit Zustandsbegrenzung, Quantisierer-Dither (aus dem vorhandenen
-   `seed`), Overload-Zähler.
-3. Dezimator als `#[cfg(test)]`-Messwerkzeug.
-4. `tests/dsd_verification.rs`: Messungen 1–7 aus § 4, Zahlen in den Dateikopf.
-   **Die dB-Tabelle ist das Abnahmekriterium dieser Phase** — nicht „kompiliert und
-   klingt irgendwie".
+### ~~Phase 2 — Modulator + Dezimator + Messharness~~ · **abgeschlossen**
+1. ✅ NTF-Koeffizienten offline berechnet — `tools/design_ntf.py`, eine NTF pro DSD-Rate.
+   **Abweichung:** Ordnung 7 statt 5, `H_inf` 1,30 statt 1,5, `synthesizeChebyshevNTF`
+   statt `synthesizeNTF`. Begründung und Messungen in § 2.3.1.
+2. ✅ CIFB-Modulator mit Zustandsbegrenzung, Komparator-Dither (aus dem `seed`),
+   Overload-Zähler. **Abweichung:** Dither 0,2 statt 1e-3 … 1e-2 (§ 2.3.1).
+3. ✅ Dezimator als Messwerkzeug. **Abweichung:** nicht `#[cfg(test)]`, sondern schlicht
+   `pub` — Integrationstests linken die Bibliothek ohne `cfg(test)`, ein test-gates Modul
+   wäre für `tests/dsd_verification.rs` unsichtbar. Aus keinem Ausgabepfad erreichbar.
+4. ✅ `tests/dsd_verification.rs`: Messungen 1–7 und 9 aus § 4, Zahlen im Dateikopf.
+   Abnahmekriterium erfüllt, Ergebnisse in § 4.1.
+
+Offen aus § 4, bewusst auf Phase 3 verschoben: Punkt 8 (Container/Golden-Bytes) — es gibt
+noch keinen Container.
 
 ### Phase 3 — DSF-Writer (streaming) · 1 Tag · Risiko: gering
 Header-Patch via seek, 4096-Byte-Blöcke pro Kanal, LSB-first-Packing (Bitreihenfolge als
