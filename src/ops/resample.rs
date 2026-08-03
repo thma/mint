@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use libsoxr::{Datatype, IOSpec, QualityFlags, QualityRecipe, QualitySpec, Soxr};
 
 use crate::audio::buffer::AudioBuffer;
 use crate::config::ResampleQuality;
@@ -35,33 +36,15 @@ fn apply_soxr(
     channels: usize,
     in_frames: usize,
 ) -> Result<()> {
-    use anyhow::anyhow;
-    use libsoxr::{Datatype, IOSpec, QualitySpec, Soxr};
-
     let ratio = target_rate as f64 / buffer.sample_rate as f64;
     let expected = (in_frames as f64 * ratio).round() as usize;
 
-    let (recipe, flags) = soxr_quality(quality);
-    let io = IOSpec::new(Datatype::Float64I, Datatype::Float64I);
-    let q = QualitySpec::new(&recipe, flags);
-    // libsoxr lazily builds shared FFT/coefficient tables on first use of a given
-    // configuration; doing that from multiple threads at once races and silently
-    // corrupts output. cli.rs runs the batch under rayon, so serialize construction
-    // (cheap relative to processing, which stays parallel).
-    let soxr = {
-        use std::sync::Mutex;
-        static INIT_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        Soxr::create(
-            buffer.sample_rate as f64,
-            target_rate as f64,
-            channels as u32,
-            Some(&io),
-            Some(&q),
-            None,
-        )
-        .map_err(|e| anyhow!("failed to create libsoxr resampler: {e}"))?
-    };
+    let soxr = create_soxr(
+        buffer.sample_rate as f64,
+        target_rate as f64,
+        channels,
+        quality,
+    )?;
 
     // libsoxr's split-channel buffer path in the wrapper is fragile; interleave instead.
     let mut input = vec![0f64; in_frames * channels];
@@ -119,11 +102,39 @@ fn apply_soxr(
     Ok(())
 }
 
+/// Construct a libsoxr instance with mint's fixed I/O contract: f64 in, f64 out. The
+/// floating-point I/O datatype is deliberate — it keeps libsoxr's internal TPDF dither
+/// from ever engaging (it only applies on INT16 output), so quantization stays the single
+/// final step in `pipeline.rs`.
+///
+/// **Every** Soxr instance in the codebase must be built here. libsoxr lazily builds
+/// shared FFT/coefficient tables on first use of a given configuration, and doing that
+/// from several threads at once races and silently corrupts output; `cli.rs` runs the
+/// batch under rayon. The lock is process-wide precisely so the one-shot path and the DSD
+/// streaming path (`ops::dsd::interpolate`) serialize against *each other* — two separate
+/// locks would not. Construction is cheap next to processing, which stays parallel.
+pub(crate) fn create_soxr(
+    in_rate: f64,
+    out_rate: f64,
+    channels: usize,
+    quality: Option<ResampleQuality>,
+) -> Result<Soxr> {
+    use std::sync::Mutex;
+    static INIT_LOCK: Mutex<()> = Mutex::new(());
+
+    let (recipe, flags) = soxr_quality(quality);
+    let io = IOSpec::new(Datatype::Float64I, Datatype::Float64I);
+    let q = QualitySpec::new(&recipe, flags);
+
+    let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    Soxr::create(in_rate, out_rate, channels as u32, Some(&io), Some(&q), None)
+        .map_err(|e| anyhow!("failed to create libsoxr resampler: {e}"))
+}
+
 /// Map our quality tiers onto libsoxr recipes. `ROLLOFF_SMALL` keeps passband ripple
 /// <= 0.01 dB at every tier (flattest response); the top tier adds `HI_PREC_CLOCK` to
 /// maximize ratio accuracy for irrational conversions (e.g. the 44.1 <-> 48 kHz family).
-fn soxr_quality(quality: Option<ResampleQuality>) -> (libsoxr::QualityRecipe, libsoxr::QualityFlags) {
-    use libsoxr::{QualityFlags, QualityRecipe};
+fn soxr_quality(quality: Option<ResampleQuality>) -> (QualityRecipe, QualityFlags) {
     match quality.unwrap_or(ResampleQuality::Hq) {
         ResampleQuality::Lq => (QualityRecipe::Low, QualityFlags::ROLLOFF_SMALL),
         ResampleQuality::Mq => (QualityRecipe::Medium, QualityFlags::ROLLOFF_SMALL),

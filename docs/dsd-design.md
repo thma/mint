@@ -305,52 +305,61 @@ sind:
 - **Latenz**: `soxr.delay()` liefert die Priming-Frames. Im One-Shot-Pfad werden sie
   hinten weggeschnitten; im Streaming-Pfad müssen sie *am Anfang des ersten Blocks*
   verworfen werden, sonst ist der DSD-Strom gegen die Quelle versetzt.
-- **Exakte Länge**: `out_frames == round(in_frames * ratio)` ist der Vertrag beider
-  Backends und muss über die Blockgrenzen hinweg in Summe gelten, nicht pro Block —
-  soxr gibt pro Aufruf schwankende Mengen zurück. Also: intern puffern, außen feste
-  Blöcke ausgeben.
+- **Exakte Länge**: `out_frames == round(in_frames * ratio)` muss über die Blockgrenzen
+  hinweg in Summe gelten, nicht pro Block — soxr gibt pro Aufruf schwankende Mengen
+  zurück. Umgesetzt als laufender Deckel: nie mehr ausgeben, als der Vertrag für die
+  bisher verfütterten Eingangsframes hergibt, Überschuss intern parken, im `finish`
+  auffüllen. *Abweichung vom Entwurf:* ausgegeben werden **variabel lange** Blöcke, keine
+  festen. Feste Blöcke bringen nichts, weil der Bit-Packer ohnehin einen eigenen
+  Akkumulator auf DSF-Blockgrenze braucht — die Schleife wird stattdessen in DSD-Samples
+  getaktet (32 768 = ein DSF-Block), woraus sich die PCM-Blockgröße ergibt.
 - **Thread-Sicherheit**: der `INIT_LOCK` aus `apply_soxr` gilt weiter — `Soxr::create`
   rennt unter rayon sonst in die bekannte Tabellen-Race. Der Wrapper übernimmt das Muster
   unverändert.
-#### Messergebnis der Ratio-Probe (erledigt)
+#### Messergebnis (Phase 1 abgeschlossen)
 
 `tests/soxr_dsd_probe.rs`, Apple Silicon, `--release`, stereo, ein Kern, `vhq`, jeweils
-4 Mio. Ausgangsframes, Bestwert aus 5 Läufen:
+4 Mio. Ausgangsframes, Bestwert aus 5 Läufen. `PCM-Block` ist die Eingangsblockgröße, die
+sich ergibt, wenn man die Schleife in **DSD-Samples** taktet (32 768 = ein DSF-Block):
 
-| PCM kHz | DSD MHz | Ratio | Setup ms | Proc ms | xRT | Peak |
-|---|---|---|---|---|---|---|
-| 44,1 | 2,8224 | ×64 | 1,1 | 49,4 | 28,7 | 0,5000 |
-| 88,2 | 2,8224 | ×32 | 0,4 | 48,4 | 29,3 | 0,5001 |
-| 44,1 | 5,6448 | ×128 | 1,4 | 50,0 | 14,2 | 0,5000 |
-| 88,2 | 5,6448 | ×64 | 0,7 | 50,8 | 14,0 | 0,5001 |
-| 176,4 | 5,6448 | ×32 | 0,4 | 52,7 | 13,4 | 0,5000 |
-| 88,2 | 11,2896 | ×128 | 1,4 | 53,4 | 6,6 | 0,5001 |
-| 176,4 | 11,2896 | ×64 | 0,7 | 48,8 | 7,3 | 0,5000 |
-| 352,8 | 11,2896 | ×32 | 0,4 | 47,6 | 7,4 | 0,5000 |
-| 44,1 | 22,5792 | **×512** | 6,2 | 50,4 | 3,5 | 0,5000 |
-| 176,4 | 22,5792 | ×128 | 1,4 | 52,4 | 3,4 | 0,5000 |
-| 352,8 | 22,5792 | ×64 | 0,7 | 53,0 | 3,3 | 0,5000 |
+| PCM kHz | DSD MHz | Ratio | PCM-Block | Setup ms | 1-Shot ms | Stream ms | xRT | Resident |
+|---|---|---|---|---|---|---|---|---|
+| 44,1 | 2,8224 | ×64 | 512 | 0,9 | 55,1 | 46,4 | 30,6 | 512 kB |
+| 88,2 | 2,8224 | ×32 | 1024 | 0,4 | 53,0 | 45,2 | 31,4 | 512 kB |
+| 44,1 | 5,6448 | ×128 | 256 | 1,4 | 50,1 | 45,5 | 15,6 | 512 kB |
+| 88,2 | 5,6448 | ×64 | 512 | 0,7 | 50,4 | 46,7 | 15,2 | 512 kB |
+| 176,4 | 5,6448 | ×32 | 1024 | 0,4 | 52,6 | 45,2 | 15,7 | 512 kB |
+| 88,2 | 11,2896 | ×128 | 256 | 1,4 | 46,7 | 45,1 | 7,9 | 512 kB |
+| 176,4 | 11,2896 | ×64 | 512 | 0,7 | 47,5 | 46,4 | 7,6 | 512 kB |
+| 352,8 | 11,2896 | ×32 | 1024 | 0,4 | 47,3 | 45,8 | 7,7 | 512 kB |
+| 44,1 | 22,5792 | **×512** | 64 | 6,5 | 53,3 | 48,8 | 3,6 | 512 kB |
+| 176,4 | 22,5792 | ×128 | 256 | 1,4 | 52,0 | 45,7 | 3,9 | 512 kB |
+| 352,8 | 22,5792 | ×64 | 512 | 0,7 | 53,1 | 46,5 | 3,8 | 512 kB |
 
-`xRT` = Sekunden DSD-Audio pro Sekunde Rechenzeit. Drei Befunde:
+`xRT` = Sekunden DSD-Audio pro Sekunde Rechenzeit im Streaming-Pfad. Fünf Befunde:
 
 1. **libsoxr trägt den ganzen Bereich**, bis hinauf zu ×512. Kein Fehler, kein
    Qualitätsverlust — der Peak liegt in jedem Fall exakt auf den eingespeisten 0,5.
 2. **Die Rechenzeit hängt nicht vom Verhältnis ab, sondern nur an der Zahl der
-   Ausgangssamples**: ~50 ms für 4 Mio. Frames, von ×32 bis ×512, ohne erkennbaren Trend.
+   Ausgangssamples**: ~46 ms für 4 Mio. Frames, von ×32 bis ×512, ohne erkennbaren Trend.
    Der Grund ist die Zweierpotenz: soxr zerlegt in eine Halfband-Kaskade, deren Stufen
    bis auf die letzte auf niedrigeren Raten laufen, also bestimmt die letzte ×2-Stufe die
    Grenzkosten pro Ausgangssample.
-3. **Der Aufbau der Filterbank kostet 0,4–6,2 ms**, einmal pro Datei. Irrelevant.
+3. **Streaming ist nicht langsamer als One-Shot, sondern leicht schneller** (45–49 ms
+   gegenüber 47–55 ms). Der Vorbehalt „Blockaufrufe kosten Overhead" war zu pessimistisch:
+   der Overhead ist kleiner als das, was der One-Shot-Pfad allein für das Allozieren und
+   Deinterleaven seiner Riesenpuffer bezahlt.
+4. **Konstant 512 kB Working Set**, unabhängig von Rate, Ratio und Dateilänge. Derselbe
+   Fall kostet den One-Shot-Pfad 122 MB — und eine echte fünfminütige DSD64-Datei 13,5 GB.
+   Das ist der ganze Grund für den Wrapper.
+5. **Setup 0,4–6,5 ms**, einmal pro Datei. Irrelevant.
 
-**Damit ist die Rückfallebene „manuell staffeln" vom Tisch** — eine Soxr-Instanz pro
-Datei über den ganzen Bereich. Hochgerechnet auf einen 5-Minuten-Stereotitel und nur
-diese Stufe: DSD64 ~10 s, DSD128 ~21 s, DSD256 ~43 s, DSD512 ~88 s (ein Kern; mint
-parallelisiert ohnehin über Jobs).
+Und das Wichtigste, aus `tests/dsd_interpolate.rs`: der Streaming-Pfad ist
+**bit-identisch** zum One-Shot-Pfad — `max |diff| = 0.0`, und zwar unabhängig von der
+Blockgröße (geprüft mit 1, 127, 512, 1000, 4096). Chunking verändert das Ergebnis nicht.
 
-Ein Vorbehalt gehört dazu: gemessen wurde der **One-Shot**-Pfad mit großen Blöcken. Der
-Streaming-Wrapper ruft `process` mit kleinen Blöcken (2048 PCM-Frames → 32 768
-Ausgangsframes) und zahlt dafür Aufrufoverhead. Die Zahlen sind eine Untergrenze, keine
-Zusage; sie werden nachgemessen, sobald der Wrapper steht.
+Hochgerechnet auf einen 5-Minuten-Stereotitel, nur diese Stufe, ein Kern: DSD64 ~10 s,
+DSD128 ~19 s, DSD256 ~39 s, DSD512 ~79 s.
 
 Das rubato-Backend ist inzwischen entfernt (eigener Commit vor der DSD-Arbeit): libsoxr
 ist unbedingte Abhängigkeit, das `soxr`-Feature und der `--no-default-features`-Pfad sind

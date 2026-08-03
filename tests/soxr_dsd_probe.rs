@@ -20,7 +20,13 @@ use std::time::{Duration, Instant};
 
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
 use mint::config::ResampleQuality;
+use mint::ops::dsd::interpolate::SoxrStream;
 use mint::ops::resample;
+
+/// Output block the DSD loop works in: one DSF block is 4096 bytes per channel = 32 768
+/// 1-bit samples. Sizing the loop in *DSD* samples rather than PCM frames keeps the
+/// scratch constant across ratios — the PCM block shrinks as the ratio grows.
+const DSD_BLOCK_FRAMES: usize = 32_768;
 
 /// Every (PCM rate -> DSD rate) pair the derivation rule in section 2.1 can produce.
 const CASES: &[(u32, u32)] = &[
@@ -86,15 +92,52 @@ fn time_apply(pcm_rate: u32, dsd_rate: u32, in_frames: usize) -> (Duration, Audi
     (start.elapsed(), buffer)
 }
 
+/// The same conversion the way the DSD stage will actually run it: one stream over the
+/// whole file, fed in blocks, output consumed and dropped rather than accumulated.
+/// Returns the elapsed time, the frames produced, and a checksum so nothing is optimized
+/// away.
+fn time_stream(
+    pcm_rate: u32,
+    dsd_rate: u32,
+    in_frames: usize,
+    pcm_block: usize,
+) -> (Duration, u64, f64) {
+    let hz = periodic_hz(pcm_rate, in_frames, 997.0);
+    let source = stereo_buffer(pcm_rate, in_frames, hz);
+
+    let start = Instant::now();
+    let mut stream = SoxrStream::new(pcm_rate, dsd_rate, CHANNELS, Some(ResampleQuality::Vhq))
+        .unwrap_or_else(|e| panic!("{pcm_rate} -> {dsd_rate} stream: {e}"));
+    let mut checksum = 0.0f64;
+    let mut pos = 0;
+    while pos < in_frames {
+        let n = pcm_block.min(in_frames - pos);
+        let chunk: Vec<Vec<f64>> = source
+            .channels
+            .iter()
+            .map(|c| c[pos..pos + n].to_vec())
+            .collect();
+        for got in stream.process(&chunk).expect("stream process") {
+            checksum += got.first().copied().unwrap_or(0.0);
+        }
+        pos += n;
+    }
+    for got in stream.finish().expect("stream finish") {
+        checksum += got.first().copied().unwrap_or(0.0);
+    }
+    (start.elapsed(), stream.out_frames_total(), checksum)
+}
+
 #[test]
 #[ignore = "measurement probe; run with --ignored --nocapture"]
 fn soxr_handles_the_full_dsd_ratio_range() {
     println!();
     println!(
-        "{:>9} {:>10} {:>6} {:>12} {:>10} {:>10} {:>9} {:>7}",
-        "PCM kHz", "DSD MHz", "ratio", "out frames", "setup ms", "proc ms", "xRT", "peak"
+        "{:>9} {:>9} {:>6} {:>8} {:>9} {:>9} {:>8} {:>10} {:>10} {:>7}",
+        "PCM kHz", "DSD MHz", "ratio", "PCM blk", "setup ms", "1shot ms", "strm ms", "strm xRT",
+        "resident", "peak"
     );
-    println!("{}", "-".repeat(80));
+    println!("{}", "-".repeat(97));
 
     // Warm up allocator and libsoxr's process-wide tables so the first row measures the
     // same thing as the rest.
@@ -146,25 +189,51 @@ fn soxr_handles_the_full_dsd_ratio_range() {
              of {expected} — signal mangled"
         );
 
-        let proc = total.saturating_sub(setup).as_secs_f64().max(1e-9);
-        // How many seconds of DSD we can produce per second of wall clock.
-        let realtime = (expected as f64 / dsd_rate as f64) / proc;
+        // The streaming path: what the DSD stage will actually run. Blocks are sized in
+        // DSD samples, so the PCM block shrinks as the ratio grows.
+        let pcm_block = (DSD_BLOCK_FRAMES / ratio as usize).max(1);
+        let mut stream = time_stream(pcm_rate, dsd_rate, in_frames, pcm_block);
+        for _ in 1..RUNS {
+            let candidate = time_stream(pcm_rate, dsd_rate, in_frames, pcm_block);
+            if candidate.0 < stream.0 {
+                stream = candidate;
+            }
+        }
+        let (stream_time, stream_frames, _checksum) = stream;
+        assert_eq!(
+            stream_frames, expected as u64,
+            "{pcm_rate} -> {dsd_rate}: streaming length contract broken"
+        );
+
+        let one_shot = total.saturating_sub(setup).as_secs_f64().max(1e-9);
+        let streamed = stream_time.as_secs_f64().max(1e-9);
+        // Seconds of DSD produced per second of wall clock.
+        let realtime = (expected as f64 / dsd_rate as f64) / streamed;
+        // What the streaming stage actually holds: one output block, planar f64. The
+        // one-shot path would hold the whole file instead — the reason this exists.
+        let resident_kb = (DSD_BLOCK_FRAMES * CHANNELS * 8) as f64 / 1024.0;
 
         println!(
-            "{:>9.1} {:>10.4} {:>6} {:>12} {:>10.1} {:>10.1} {:>9.1} {:>7.4}",
+            "{:>9.1} {:>9.4} {:>6} {:>8} {:>9.1} {:>9.1} {:>8.1} {:>10.1} {:>10} {:>7.4}",
             pcm_rate as f64 / 1000.0,
             dsd_rate as f64 / 1_000_000.0,
             format!("x{ratio}"),
-            expected,
+            pcm_block,
             setup.as_secs_f64() * 1000.0,
-            proc * 1000.0,
+            one_shot * 1000.0,
+            streamed * 1000.0,
             realtime,
+            format!("{resident_kb:.0} kB"),
             peak,
         );
     }
     println!();
     println!(
-        "xRT = seconds of DSD produced per second of wall clock, stereo, one core, vhq.\n\
-         A 5-minute stereo track needs 300 / xRT seconds in this stage."
+        "Stereo, one core, vhq, {TARGET_OUT_FRAMES} output frames per case, best of 5.\n\
+         strm xRT = seconds of DSD produced per second of wall clock; a 5-minute stereo\n\
+         track needs 300 / xRT seconds in this stage. `resident` is the streaming stage's\n\
+         working set — the one-shot column would need {:.0} MB for the same case, and\n\
+         13.5 GB for a real five-minute DSD64 file.",
+        (TARGET_OUT_FRAMES * CHANNELS * 8 * 2) as f64 / 1024.0 / 1024.0
     );
 }

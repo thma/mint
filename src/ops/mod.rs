@@ -3,6 +3,7 @@ pub trait Operation {
 }
 
 pub mod bitdepth;
+pub mod dsd;
 pub mod limiter;
 pub mod loudness;
 pub mod resample;
