@@ -40,3 +40,8 @@ mp3 = ["dep:mp3lame-encoder"]
 [dev-dependencies]
 approx = "0.5"
 rustfft = "6.2"
+# Foreign DSF parser, used only as a test oracle in tests/dsd_format.rs: a second opinion
+# on the container we write, from code that has never seen our writer. It validates the
+# magic/version/block-size fields but not the length fields, so the test asserts those
+# itself — that is where an off-by-12 would hide.
+dsf = "0.2.2"

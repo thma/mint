@@ -12,6 +12,7 @@
 pub mod decimate;
 pub mod interpolate;
 pub mod modulator;
+pub mod pack;
 
 /// The four DSD rates mint can write. All are multiples of 44 100 Hz — the reason the
 /// intermediate PCM rate is pulled into the 44.1 kHz family before interpolation, so the

@@ -6,8 +6,9 @@
 
 ## Stand
 
-**Phase 1 und 2 abgeschlossen, Phase 3 ist als Nächstes dran.** Alles unten ist umgesetzt
-und grün (160 Tests, 1 ignorierte Messprobe).
+**Phase 1, 2 und 3 abgeschlossen, Phase 4 ist als Nächstes dran.** Alles unten ist umgesetzt
+und grün (177 Tests, 1 ignorierte Messprobe). **Seit Phase 3 gibt es abspielbare
+`.dsf`-Dateien** — erzeugt aus `tests/dsd_format.rs`, noch nicht über die Config.
 
 Was existiert:
 
@@ -16,16 +17,24 @@ Was existiert:
 | `src/ops/dsd/interpolate.rs` | `SoxrStream` — eine libsoxr-Instanz pro Datei, blockweise gefüttert; bit-identisch zum One-Shot-Pfad |
 | `src/ops/dsd/modulator.rs` | 1-Bit-Sigma-Delta, CIFB **Ordnung 7**, NTF-Tabelle pro Rate, Komparator-Dither, Zustandsbegrenzung, Overload-Zähler |
 | `src/ops/dsd/decimate.rs` | DSD → PCM, Halfband-Kaskade — reines Messwerkzeug, aus keinem Ausgabepfad erreichbar |
+| `src/ops/dsd/pack.rs` | Bit-Packing, Bitreihenfolge als Parameter; `DSD_SILENCE` (0x69) |
 | `src/ops/dsd/mod.rs` | Modulkopf (Streaming-Invariante), `DsdRate` |
+| `src/audio/io_write_dsd.rs` | `DsfWriter` — Streaming-Container, drei Headerfelder per seek nachgetragen |
 | `src/ops/resample.rs` | `create_soxr` — **die** Konstruktionsstelle für Soxr-Instanzen, mit dem prozessweiten Init-Lock |
 | `tools/design_ntf.py` | Offline-NTF-Entwurf + CIFB-Realisierung; erzeugt die Konstantentabelle, wird zur Bauzeit nicht gebraucht |
 | `tests/dsd_interpolate.rs` | 8 Tests um den Wrapper |
 | `tests/dsd_verification.rs` | Messharness, 10 Tests; Ergebnisse in § 4.1 |
+| `tests/dsd_format.rs` | Container: Golden-Header, Bitreihenfolge, Blockung, Padding, Fremdparser, Ende-zu-Ende; 17 Tests, Ergebnisse in § 4.2 |
 | `tests/soxr_dsd_probe.rs` | Durchsatz-/Speicherprobe, `#[ignore]`; Messwerte in § 3.3 |
 
-Was als Nächstes zu bauen ist: **Phase 3** (§ 6) — der DSF-Streaming-Writer (Bit-Packing
-mit Bitreihenfolge als Parameter, 4096-Byte-Blöcke pro Kanal, Header-Patch via seek) und
-`tests/dsd_format.rs`. Ab da existiert die erste abspielbare Datei.
+Was als Nächstes zu bauen ist: **Phase 4** (§ 6) — Config-Oberfläche und
+Pipeline-Integration. Der `DsfWriter` und der Modulator sind dafür fertig; was fehlt, ist
+die Blockschleife in `src/ops/dsd/mod.rs`, die beide verbindet, plus die Codec-Checkliste
+aus `CLAUDE.md`. **Achtung, nicht offensichtlich:** `describe()` in `config.rs` und der
+`match target.codec` in `pipeline.rs` haben beide einen *Catch-all*-Arm für „nicht MP3" —
+neue `OutputCodec`-Varianten erzeugen dort also **keinen Compilerfehler**, sondern schicken
+DSD still durch den PCM-Quantisierer und den WAV-Writer. Das ist die gefährlichste Stelle
+der ganzen Phase 4.
 
 Arbeitsweise in diesem Repo: direkt auf `main`, Commits macht Thomas selbst.
 
@@ -41,6 +50,9 @@ Arbeitsweise in diesem Repo: direkt auf `main`, Commits macht Thomas selbst.
 | Modulator | **CIFB Ordnung 7, `H_inf` 1,30**, eine NTF pro Rate — gemessen besser *und* stabiler als die ursprünglich geplante Ordnung 5 / 1,5 (§ 2.3.1) |
 | Komparator-Dither | **0,2** statt der geplanten 1e-3 … 1e-2; der kleine Bereich tut messbar nichts, weil die Schleife ihn genau im Band wegformt (§ 2.3.1) |
 | Betriebsbereich | **0 … 50 % Modulation** (was die Ceiling-Stufe zulässt), nicht 0 … 71,43 %. Darüber kontrollierte Übersteuerung statt Divergenz |
+| Füllmuster im letzten Block | **0x69 statt der spezifizierten 0x00**, und `sampleCount` **zählt die Polsterung mit** — hergeleitet und gemessen in § 3.4.1 |
+| Kanaltyp | Aus der Kanalzahl abgeleitet (1/2/3/quad/5/5.1); mint kennt kein Layout, ein `channels`-Feld gäbe es später |
+| ffmpeg-Gegenprobe | **Entfällt** — auf der Entwicklungsmaschine ist kein ffmpeg installiert. Ersatz: das fremde `dsf`-Crate als Dev-Dependency plus ein im Test unabhängig geschriebener Entpacker |
 
 ---
 
@@ -454,21 +466,89 @@ weg. Für DSD heißt das: **kein Feature-Gating nötig**, die neuen Module häng
 
 ### 3.4 Container
 
-**DSF** (Sony, Little-Endian) — verifiziertes Layout:
+**DSF** (Sony, Little-Endian) — Layout, in Phase 3 vierfach unabhängig gegengeprüft (das
+PDF koordinatenaufgelöst neu extrahiert, ffmpeg `dsfdec.c`, WavPacks gepackte C-Structs
+kompiliert und `offsetof` gedumpt, plus ein Round-Trip durch drei nachgebaute Parser):
 
 ```
-DSD-Chunk (28 B):  "DSD "  size=28(u64)  totalFileSize(u64)  metadataPtr(u64, 0=keine)
-fmt-Chunk (52 B):  "fmt "  size=52(u64)  version=1(u32)  formatID=0(u32)
-                   channelType(u32)  channelNum(u32)  samplingFreq(u32)
-                   bitsPerSample=1(u32)  sampleCount(u64, pro Kanal)
-                   blockSizePerChannel=4096(u32)  reserved=0(u32)
-data-Chunk:        "data"  size=12+n(u64)  <Blöcke>
+Offset  Feld
+     0  "DSD "                                    (4 B, mit Leerzeichen, kein NUL)
+     4  chunkSize = 28                            (u64)
+    12  totalFileSize                             (u64)  ← per seek nachgetragen
+    20  metadataPtr = 0                           (u64)
+    28  "fmt "
+    32  chunkSize = 52                            (u64)
+    40  formatVersion = 1                         (u32)
+    44  formatID = 0 (DSD raw)                    (u32)
+    48  channelType                               (u32)
+    52  channelNum                                (u32)
+    56  samplingFrequency                         (u32)
+    60  bitsPerSample = 1                         (u32)
+    64  sampleCount, pro Kanal                    (u64)  ← per seek nachgetragen
+    72  blockSizePerChannel = 4096                (u32)
+    76  reserved = 0                              (u32)
+    80  "data"
+    84  chunkSize = 12 + n                        (u64)  ← per seek nachgetragen
+    92  Nutzdaten, n Byte
 ```
+
+Beide `chunkSize`-Felder zählen den eigenen Chunk-Kopf mit — daher `12 + n` und nicht `n`.
+Das ist die mit Abstand häufigste Art, dieses Format still falsch zu schreiben.
 
 Sample-Daten: **planar in 4096-Byte-Blöcken pro Kanal**, rundlaufend
-(ch0-Block, ch1-Block, ch0-Block, …), letzter Block mit 0x00 aufgefüllt. Bei
-`bitsPerSample = 1` ist die Bitreihenfolge **LSB first**. `metadataPtr` darf 0 sein (kein
-ID3v2) — optionale Kür.
+(ch0-Block, ch1-Block, ch0-Block, …). Bei `bitsPerSample = 1` ist die Bitreihenfolge
+**LSB first**. `metadataPtr` darf 0 sein (kein ID3v2) — optionale Kür; wenn er gesetzt wird,
+zeigt er auf `92 + n`, also *hinter* die Nutzdaten.
+
+Drei Felder sind bei realen Lesern hart: `totalFileSize` muss der Dateigröße auf Platte
+entsprechen (WavPack **verweigert** die Datei sonst — das ist der eigentliche Grund für den
+seek-Patch, nicht Bequemlichkeit), `reserved` muss 0 sein (WavPack und der Go-Referenzleser
+verweigern sonst), und `sampleCount` sollte ein Vielfaches von 8 sein (ffmpeg rundet ab,
+WavPack rundet auf und warnt — bei einem krummen Wert liefern die beiden verschieden lange
+Dateien).
+
+#### 3.4.1 Der letzte Block: zwei bewusste Abweichungen von der Spezifikation
+
+Sonys Annotation 3 sagt: letzten Block mit **0x00** auffüllen, `sampleCount` auf der echten
+Sample-Zahl lassen. mint macht **beides nicht**, und beides aus demselben Grund: *0x00 ist
+keine Stille.*
+
+Ein DSD-Bit ist ±1, ein Nullbyte also nicht „kein Signal", sondern das negativste Signal,
+das das Format ausdrücken kann. Durch ffmpegs eigenes Dezimationsfilter gemessen:
+
+| Füllmuster | Pegel in der Polsterung | Spitze am Übergang |
+|---|---|---|
+| 0x00 (laut Spec) | −1,0 (Vollaussteuerung DC) | **1,045 — clippt** |
+| 0x69 (mint) | 0,0 | 0,0100 (−40 dBFS) |
+
+Das ist kein theoretisches Problem: der sacd-ripper-Quelltext trägt an der Füllstelle den
+Kommentar *„This does zero fill … which leads to pop noise in some players"*, und es wurde
+extra ein polsterungsfreier Modus nachgerüstet. 0x69 ist die Stille-Konstante in ffmpeg
+(`DSD_SILENCE`), in MPD und in der ALSA-Formattabelle des Linux-Kernels. Sie ist
+bitreihenfolgeunabhängig: `reverse(0x69) = 0x96`, beide dekodieren zu exakt 0,0.
+
+Ob der Knacks *hörbar* wird, hinge dann an `sampleCount` — und genau da sind sich die Leser
+uneins:
+
+| Leser | bei ungepolstertem `sampleCount` |
+|---|---|
+| ffmpeg | schneidet byte-genau; **Fehler**, wenn der letzte Block komplett Polsterung ist |
+| MPD | rundet auf ganze Blöcke ab — **verliert bis zu 11,6 ms echtes Audio** (DSD64) |
+| WavPack | rundet auf ganze Bytes auf und warnt |
+
+Deshalb: mint polstert mit 0x69 **und** meldet die **gepolsterte** Zahl. Dann gibt es gar
+keinen „unused sample data area", über den man sich uneinig sein könnte — jeder Leser
+spielt die vollen Nutzdaten, Byte-Schnitt und Block-Abrundung kommen zum selben Ergebnis,
+nichts wird abgeschnitten, und der Schluss ist echte digitale Stille statt einer DC-Stufe.
+Preis: die Datei ist bis zu 11,6 ms (DSD64) / 5,8 / 2,9 / 1,5 länger als die Quelle. Für ein
+Distributions-Deliverable irrelevant; für lückenlose Albumfolgen wäre es der eine Grund, das
+noch einmal aufzumachen.
+
+Besser als jede Polsterung ist, sie nicht zu brauchen: `DsfWriter::samples_to_block_boundary`
+sagt, wie viele Samples bis zur Blockgrenze fehlen. Wer die als **modulierte** Stille
+nachschiebt, bekommt dieselben vollen Blöcke ohne jede Spleißstelle — der Schleifenzustand
+läuft durch. Genau das soll die Blockschleife in Phase 4 tun; `tests/dsd_format.rs` macht es
+im Ende-zu-Ende-Test bereits vor.
 
 **DFF/DSDIFF** (Philips, Big-Endian, `FRM8`-Form): interleaved statt planar, **MSB
 first**, Chunks `FVER`/`PROP`(`FS`,`CHNL`,`CMPR`,`ABSS`,`LSCO`)/`DSD `. **Entschieden:
@@ -526,15 +606,34 @@ src/ops/dsd/modulator.rs    1-Bit-Sigma-Delta, CIFB, NTF-Tabelle pro Rate, Dithe
 src/ops/dsd/decimate.rs     DSD → PCM, Messwerkzeug (pub, nicht cfg(test) — s. Phase 2)       [fertig]
 tools/design_ntf.py         Offline-NTF-Entwurf + CIFB-Realisierung, erzeugt die Tabelle      [fertig]
 tests/dsd_verification.rs   Messharness (Kopfzahlen wie bei dither_/limiter_verification)     [fertig]
-src/ops/dsd/pack.rs         Bit-Packing, Bitreihenfolge als Parameter (LSB-first für DSF)
-src/audio/io_write_dsd.rs   DSF-Streaming-Writer (Header-Patch via seek)
-tests/dsd_format.rs         Byte-Layout, Padding, Bitreihenfolge, Fremd-Parser-Gegenprobe
+src/ops/dsd/pack.rs         Bit-Packing, Bitreihenfolge als Parameter (LSB-first für DSF)     [fertig]
+src/audio/io_write_dsd.rs   DSF-Streaming-Writer (Header-Patch via seek)                      [fertig]
+tests/dsd_format.rs         Byte-Layout, Padding, Bitreihenfolge, Fremd-Parser-Gegenprobe     [fertig]
 ```
 
-Die Blockschleife selbst (`mod.rs`) entsteht erst in Phase 4: bis dahin gibt es keinen
-Writer, den sie füttern könnte. Der Modulator ist aber schon dafür gebaut — eine Instanz
-pro Kanal, Zustand über Blockgrenzen hinweg, `modulate_into` hängt an einen
-wiederverwendeten Puffer an, und `tests/dsd_verification.rs` prüft, dass die Blockung das
+Die Blockschleife selbst (`mod.rs`) entsteht erst in Phase 4. Beide Enden sind dafür fertig
+und `tests/dsd_format.rs::modulate_to_file` ist bereits ihre Miniaturausgabe — die Funktion
+hat genau die Form, die die Schleife bekommen soll:
+
+```rust
+// eine Soxr-Instanz, ein Modulator pro Kanal, ein Writer, alles über die ganze Datei
+for chunk in pcm_blocks {
+    let up = src.process(chunk)?;                       // variable Länge
+    let bits = per_channel_modulate(&mut mods, up);
+    writer.write(&bits)?;                               // puffert auf DSF-Blockgrenze
+}
+let tail = src.finish()?;
+writer.write(&per_channel_modulate(&mut mods, tail))?;
+
+// Statt zu polstern: den letzten Block mit modulierter Stille vollmachen (§ 3.4.1).
+let short = writer.samples_to_block_boundary();
+if short > 0 { writer.write(&per_channel_modulate(&mut mods, silence(short)))?; }
+let summary = writer.finish()?;
+```
+
+Der Modulator ist dafür gebaut — eine Instanz pro Kanal, Zustand über Blockgrenzen hinweg,
+`modulate_into` hängt an einen wiederverwendeten Puffer an — und sowohl
+`tests/dsd_verification.rs` als auch `tests/dsd_format.rs` prüfen, dass die Blockung das
 Ergebnis nicht um ein Bit verändert.
 
 ---
@@ -615,6 +714,13 @@ das ist der eigentliche Nachweis, dass die implementierte Rekursion das Schleife
 Tabelle realisiert. Wer die gemessene Kurve naiv gegen die entworfene NTF hält, findet
 8 dB „Fehler", die keiner sind.
 
+**Nachtrag zu Punkt 8 (Container).** In Phase 3 nachgeholt, Ergebnisse in § 4.2. Die
+`#[ignore]`-Gegenprobe gegen ffmpeg entfällt: auf der Entwicklungsmaschine ist kein ffmpeg
+installiert, ein Test, der überall außer hier läuft, wäre schlechter als keiner. An seiner
+Stelle stehen zwei unabhängige Leser — das fremde `dsf`-Crate (Dev-Dependency) und ein im
+Test von Hand geschriebener Entpacker, der `pack.rs` nicht benutzt und deshalb wirklich
+gegen die LSB-first-Regel prüft statt gegen sich selbst.
+
 **Der Dezimator muss besser sein als das, was er misst.** Halfband-Kaskade, 121 Taps pro
 Stufe, Kaiser-Fenster, −174,8 dB Sperrband. Das ist keine Übertreibung: Dezimation um 2
 faltet alles oberhalb der neuen Nyquistfrequenz zurück, und was bei DSD64 nahe 1,4 MHz
@@ -622,6 +728,36 @@ liegt, landet dabei *im Audioband*. Mit einem schwachen Anti-Aliasing-Filter erf
 Messwerkzeug einen Rauschteppich und lässt einen guten Modulator mittelmäßig aussehen.
 Gemessen wird der Eigenfehler differenziell gegen den erwarteten Ton, nicht spektral — ein
 Kaiser-Fenster ist bei rund −170 dB am Ende, eine FFT würde hier sich selbst messen.
+
+### 4.2 Ergebnis (Phase 3, 2026-08-03, Apple Silicon)
+
+`tests/dsd_format.rs`, 17 Tests, ~4,5 s im Debug-Build. Der Dateikopf dort ist die
+maßgebliche Fassung; das hier ist die Zusammenfassung.
+
+| Prüfung | Ergebnis |
+|---|---|
+| 92-Byte-Header gegen ein von Hand geschriebenes Golden-Array | byte-gleich |
+| `totalFileSize` / `dataChunkSize` / `sampleCount` gegen die Datei auf Platte | konsistent, inkl. der `+12` |
+| Bitreihenfolge im Container | LSB first (0x03 für „zwei hohe Samples zuerst") |
+| Blöcke planar und rundlaufend, 4096 B pro Kanal | ja, über zwei Blockrunden geprüft |
+| Kanaltyp 1/2/3/4/5/6 Kanäle | 1, 2, 3, 4, 6, 7 |
+| Blockgröße des Aufrufers (1, 3, 4095, 32768, 100000) | dieselbe Datei, byte-gleich |
+| Bitstrom Modulator → Datei → wieder heraus | bit-gleich, beide Kanäle |
+| Fremdparser (`dsf`-Crate) | akzeptiert, alle fmt-Felder wie erwartet |
+| In-Band-SNR der dekodierten Datei (DSD64, bei 44,1 kHz) | **104,4 dB** (Schranke > 95) |
+| 0x00-Polsterung, dezimiert | −1,000000 (Vollaussteuerung DC) |
+| 0x69-Polsterung, dezimiert | 0,000000 |
+
+Ein Befund, der beim Messen aufgefallen ist und den man kennen sollte:
+
+**Ein breitbandiger Zeitbereichsvergleich misst bei DSD das Ultraschallrauschen, nicht das
+Signal.** Dieselbe Datei, dieselben Bits, dieselbe Ausrichtung (Bestanpassungsverstärkung
+1,0000002, Verzögerung exakt 0) ergibt **39,7 dB**, wenn man bei 88,2 kHz dekodiert, und
+**104,4 dB** bei 44,1 kHz. Der Unterschied ist allein die Analysebandbreite: der Dezimator
+lässt bei 88,2 kHz Ausgang noch bis 35 kHz durch, und genau dort steigt der geformte
+Rauschteppich steil an. Wer die 39,7 dB naiv liest, hält einen korrekten Container für
+kaputt. (Die Zahl des Modulators selbst — 121,0 dB, sauber im Band gemessen — steht in
+§ 4.1; die 104,4 dB sind die ganze Kette inklusive des 17,6–22 kHz-Übergangsbandes.)
 
 ---
 
@@ -632,7 +768,9 @@ Kaiser-Fenster ist bei rund −170 dB am Ende, eine FFT würde hier sich selbst 
 | ~~Modulatorqualität unklar bis gemessen~~ | **erledigt** | Gemessen (§ 4.1): 121,0 dB bei DSD64, Ziel war ≥ 110. Das größte Einzelrisiko des Projekts ist damit weg |
 | ~~Stabilität bei heißem Material~~ | **erledigt, mit Einschränkung** | Kein Clipping bis 60 % Modulation, Betriebsbereich ist ≤ 50 % (§ 2.3.1). Bei 71,43 % übersteuert die Schleife kontrolliert und erholt sich; ein Retry mit −1 dB ist nicht nötig |
 | ~~libsoxr bei Ratio bis 512 (`vhq`)~~ | **erledigt** | Gemessen (§ 3.3): Kosten hängen nur an den Ausgangssamples, nicht am Verhältnis. Kein Staffeln nötig |
-| Streaming-Latenz/Längenvertrag | mittel | eigener Test: Streaming-Ergebnis == One-Shot-Ergebnis für eine kurze Datei bei kleinem Ratio |
+| ~~Streaming-Latenz/Längenvertrag~~ | **erledigt** | `tests/dsd_interpolate.rs`: Streaming == One-Shot, bit-gleich bei jeder Blockgröße. Seit Phase 3 zusätzlich durch den Container abgesichert (`chunking_does_not_change_the_file`) |
+| ~~Container falsch geschrieben (off-by-12, Bitreihenfolge)~~ | **erledigt** | § 4.2: Golden-Header, drei Größenfelder gegen die Datei auf Platte, Fremdparser, unabhängiger Entpacker |
+| Polsterung des letzten Blocks | gering, aber abweichend | Bewusste Abweichung von Annotation 3, gemessen begründet (§ 3.4.1). Wenn lückenlose Albumfolgen ein Thema werden, ist das die Stelle |
 | Rechenzeit | gering | DSD64 ~Sekunden, DSD256 ~1–2 min/Titel/Kern, DSD512 entsprechend mehr; parallel über Kanäle und Jobs (rayon existiert) |
 | Dateigrößen (DSD512: ~1,7 GB / 5 min) | gering, aber sichtbar | Größe vorab in `--dry-run` ausweisen |
 | f64-Puffer-Invariante | gering | Streaming ist auf die DSD-Stufe begrenzt; PCM-Pfad bleibt unberührt |
@@ -650,10 +788,10 @@ wäre dann ein kleiner Zusatzschritt, kein zweites Projekt.
 ## 6. Plan
 
 Reihenfolge nach Risiko, nicht nach Sichtbarkeit: das Unbekannte (soxr bei großen Ratios,
-Modulatorqualität) kommt zuerst. Nach Phase 3 gibt es die erste abspielbare `.dsf`-Datei,
-nach Phase 4 ist das Feature regulär über die Config nutzbar.
+Modulatorqualität) kommt zuerst. Seit Phase 3 gibt es abspielbare `.dsf`-Dateien, nach
+Phase 4 ist das Feature regulär über die Config nutzbar.
 
-### Phase 1 — Streaming-Interpolation auf libsoxr · 1–1,5 Tage · Risiko: mittel
+### ~~Phase 1 — Streaming-Interpolation auf libsoxr~~ · **abgeschlossen**
 1. **Zuerst der Smoke-Test**: Durchsatz und Speicher von libsoxr `vhq` bei den Ratios
    32/64/128/256/512 (bis 22 579 200 Hz Ausgangsrate; ×512 entsteht bei 44,1 kHz → DSD512). Entscheidet, ob eine Soxr-Instanz reicht
    oder manuell gestaffelt wird.
@@ -677,12 +815,31 @@ nach Phase 4 ist das Feature regulär über die Config nutzbar.
 Offen aus § 4, bewusst auf Phase 3 verschoben: Punkt 8 (Container/Golden-Bytes) — es gibt
 noch keinen Container.
 
-### Phase 3 — DSF-Writer (streaming) · 1 Tag · Risiko: gering
-Header-Patch via seek, 4096-Byte-Blöcke pro Kanal, LSB-first-Packing (Bitreihenfolge als
-Parameter), Zero-Padding im letzten Block, `sampleCount`/`totalFileSize` nachtragen.
-`tests/dsd_format.rs`: Golden-Bytes, Padding, Bitreihenfolge, Gegenprobe mit dem fremden
-`dsf`-Crate, optional `#[ignore]`-Test gegen ffmpeg. **Ab hier existiert eine hörbare
-Datei** (noch aus einem Test heraus erzeugt).
+### ~~Phase 3 — DSF-Writer (streaming)~~ · **abgeschlossen**
+1. ✅ `src/ops/dsd/pack.rs`: Bit-Packing mit `BitOrder` als Parameter, plus `DSD_SILENCE`.
+2. ✅ `src/audio/io_write_dsd.rs`: `DsfWriter`, 4096-Byte-Blöcke pro Kanal planar und
+   rundlaufend, `totalFileSize`/`sampleCount`/`dataChunkSize` per seek nachgetragen.
+   **Abweichung:** Polsterung mit 0x69 statt 0x00, und `sampleCount` zählt sie mit
+   (§ 3.4.1). Dazu `samples_to_block_boundary`, damit Phase 4 die Polsterung ganz vermeiden
+   kann.
+3. ✅ `tests/dsd_format.rs`, 17 Tests, Ergebnisse in § 4.2. **Abweichung:** kein
+   ffmpeg-Test (nicht installiert); stattdessen das `dsf`-Crate als Dev-Dependency und ein
+   unabhängig geschriebener Entpacker im Test.
+4. ✅ **Es gibt eine hörbare Datei.** `a_modulated_tone_survives_the_whole_chain` legt sie
+   nach `target/tmp/mint-dsd64-tone.dsf` (0,5 s Stereo, DSD64) und gibt den Pfad aus
+   (`--nocapture`). Fester Pfad, damit ein Player daraufzeigen kann; alle übrigen
+   Testdateien tragen die Prozess-ID im Namen und werden aufgeräumt.
+
+Eine Lehre aus dem Review, die man kennen sollte, weil sie fast zu einer Geisterjagd geführt
+hätte: die Tests schrieben zunächst auf feste Pfade unter `std::env::temp_dir()` (die
+Konvention der älteren Tests im Repo). Zwei überlappende Läufe der Testbinärdatei schreiben
+sich dann gegenseitig die Dateien kaputt — und der Ende-zu-Ende-Test meldet das als
+`the chain lost the signal: -15.2 dB`, was wie ein Modulatorfehler aussieht. Gemessen: drei
+gleichzeitige Läufe mit gemeinsamem Temp-Verzeichnis lassen 1, 3 bzw. 4 Tests fallen, mit
+getrennten Verzeichnissen laufen alle drei sauber durch. Die Kette selbst ist
+bit-deterministisch — 22 isolierte Läufe, ein einziger SHA-256, jedes Mal 104,4 dB.
+
+Nicht gemacht, bewusst: ID3v2 im DSF (steht in Phase 5), DFF (§ 3.4).
 
 ### Phase 4 — Config + Pipeline-Integration · 1,5–2 Tage · Risiko: gering, aber breit
 Entlang der Codec-Checkliste aus `CLAUDE.md`: `OutputCodec::Dsf` (+`ext()`), `dsd`-Feld
