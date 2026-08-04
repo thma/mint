@@ -6,35 +6,36 @@
 
 ## Stand
 
-**Phase 1, 2 und 3 abgeschlossen, Phase 4 ist als Nächstes dran.** Alles unten ist umgesetzt
-und grün (177 Tests, 1 ignorierte Messprobe). **Seit Phase 3 gibt es abspielbare
-`.dsf`-Dateien** — erzeugt aus `tests/dsd_format.rs`, noch nicht über die Config.
+**Phase 1 bis 4 abgeschlossen, Phase 5 ist als Nächstes dran.** Alles unten ist umgesetzt
+und grün (193 Tests, 1 ignorierte Messprobe). **DSD ist seit Phase 4 regulär über die
+Config nutzbar** — `codec = "dsf"`, `dsd = "dsd64"`, fertig.
 
 Was existiert:
 
 | Datei | Rolle |
 |---|---|
+| `src/ops/dsd/mod.rs` | `DsdRate`, die Ratenableitung (`intermediate_pcm_rate`, `interpolation_factor`) und **`encode_dsf`** — die Blockschleife, die Interpolator, Modulator und Writer verbindet |
 | `src/ops/dsd/interpolate.rs` | `SoxrStream` — eine libsoxr-Instanz pro Datei, blockweise gefüttert; bit-identisch zum One-Shot-Pfad |
 | `src/ops/dsd/modulator.rs` | 1-Bit-Sigma-Delta, CIFB **Ordnung 7**, NTF-Tabelle pro Rate, Komparator-Dither, Zustandsbegrenzung, Overload-Zähler |
 | `src/ops/dsd/decimate.rs` | DSD → PCM, Halfband-Kaskade — reines Messwerkzeug, aus keinem Ausgabepfad erreichbar |
 | `src/ops/dsd/pack.rs` | Bit-Packing, Bitreihenfolge als Parameter; `DSD_SILENCE` (0x69) |
-| `src/ops/dsd/mod.rs` | Modulkopf (Streaming-Invariante), `DsdRate` |
 | `src/audio/io_write_dsd.rs` | `DsfWriter` — Streaming-Container, drei Headerfelder per seek nachgetragen |
+| `src/config.rs` | `OutputCodec::Dsf`, `dsd`-Feld durch alle vier Schichten, Validierung, `describe()`, `pcm_stage_rate`/`delivery_rate` |
+| `src/pipeline.rs` | DSD-Zweig (eigener Arm, kein Catch-all mehr), `DsdReport` |
 | `src/ops/resample.rs` | `create_soxr` — **die** Konstruktionsstelle für Soxr-Instanzen, mit dem prozessweiten Init-Lock |
 | `tools/design_ntf.py` | Offline-NTF-Entwurf + CIFB-Realisierung; erzeugt die Konstantentabelle, wird zur Bauzeit nicht gebraucht |
 | `tests/dsd_interpolate.rs` | 8 Tests um den Wrapper |
 | `tests/dsd_verification.rs` | Messharness, 10 Tests; Ergebnisse in § 4.1 |
 | `tests/dsd_format.rs` | Container: Golden-Header, Bitreihenfolge, Blockung, Padding, Fremdparser, Ende-zu-Ende; 17 Tests, Ergebnisse in § 4.2 |
+| `tests/dsd_pipeline.rs` | Config + Pipeline: Ratenableitung, Validierung, Dry-Run, `.wav` → `.dsf` Ende-zu-Ende; 15 Tests, Ergebnisse in § 4.3 |
 | `tests/soxr_dsd_probe.rs` | Durchsatz-/Speicherprobe, `#[ignore]`; Messwerte in § 3.3 |
 
-Was als Nächstes zu bauen ist: **Phase 4** (§ 6) — Config-Oberfläche und
-Pipeline-Integration. Der `DsfWriter` und der Modulator sind dafür fertig; was fehlt, ist
-die Blockschleife in `src/ops/dsd/mod.rs`, die beide verbindet, plus die Codec-Checkliste
-aus `CLAUDE.md`. **Achtung, nicht offensichtlich:** `describe()` in `config.rs` und der
-`match target.codec` in `pipeline.rs` haben beide einen *Catch-all*-Arm für „nicht MP3" —
-neue `OutputCodec`-Varianten erzeugen dort also **keinen Compilerfehler**, sondern schicken
-DSD still durch den PCM-Quantisierer und den WAV-Writer. Das ist die gefährlichste Stelle
-der ganzen Phase 4.
+Was als Nächstes zu bauen ist: **Phase 5** (§ 6) — `sacd`-Preset, Dateigrößenschätzung im
+Dry-Run, optional ID3v2, und vor allem die Doku: `README.md` (Defaults-Tabelle, Abschnitt
+„Audio quality → DSD"), `examples/mint.toml` (per `include_str!` das Bootstrap-Template)
+und `CLAUDE.md`. **Diese drei sind in Phase 4 bewusst nicht angefasst worden**, obwohl die
+Checkliste in `CLAUDE.md` die README-Tabelle als vertraglich führt — sie stehen im Plan
+unter Phase 5, zusammen mit dem Preset, das sie beschreiben sollen.
 
 Arbeitsweise in diesem Repo: direkt auf `main`, Commits macht Thomas selbst.
 
@@ -53,6 +54,7 @@ Arbeitsweise in diesem Repo: direkt auf `main`, Commits macht Thomas selbst.
 | Füllmuster im letzten Block | **0x69 statt der spezifizierten 0x00**, und `sampleCount` **zählt die Polsterung mit** — hergeleitet und gemessen in § 3.4.1 |
 | Kanaltyp | Aus der Kanalzahl abgeleitet (1/2/3/quad/5/5.1); mint kennt kein Layout, ein `channels`-Feld gäbe es später |
 | ffmpeg-Gegenprobe | **Entfällt** — auf der Entwicklungsmaschine ist kein ffmpeg installiert. Ersatz: das fremde `dsf`-Crate als Dev-Dependency plus ein im Test unabhängig geschriebener Entpacker |
+| `[defaults]` vs. DSD-Target | `format`, `rate` und `dsd` werden für die Kollisions- und Sinnprüfung aus der **eigenen Schicht** des Targets gelesen (Preset + explizit), nicht aus `[defaults]` — hergeleitet in § 3.5.1 |
 
 ---
 
@@ -588,6 +590,43 @@ Validierung (`validate_fields`):
 
 Preset-Vorschlag: `"sacd"` = DSD64/DSF, kein `lufs` (wie `cd`), `ceiling_dbtp = -1.0`.
 
+#### 3.5.1 Was daraus geworden ist
+
+Umgesetzt wie oben, mit einer Präzisierung, die der Entwurf offengelassen hatte und die
+sich beim Bauen als die einzige interessante Frage der ganzen Phase herausstellte.
+
+**Gegen welche Schicht wird geprüft?** „`dsd` gesetzt ⇔ Codec ist `dsf`" ist eindeutig,
+solange man nur an das Target selbst denkt. mint hat aber vier Schichten, und die Regel
+naiv gegen den fertig gemergten Wert zu prüfen macht `[defaults]` zur Falle: ein
+`format = "s24"` dort — völlig normal, weil `format` für WAV/FLAC Pflicht ist — würde
+*jedes* DSD-Target in derselben Datei zu einem harten Konfigfehler machen. Umgekehrt würde
+ein `dsd = "dsd128"` in `[defaults]` alle PCM-Targets sprengen. Beides ist absurd: die
+gesamte Config schlägt beim Laden fehl, weil zwei Targets unterschiedliche Codecs haben.
+
+Die Regel ist deshalb nach Richtung getrennt:
+
+| Prüfung | liest | warum |
+|---|---|---|
+| `dsd` **fehlt** bei `codec = "dsf"` | gemergt | `dsd` in `[defaults]` soll als Basis für mehrere DSD-Targets funktionieren |
+| `dsd` **überflüssig** bei PCM-Codec | eigene Schicht | dieselbe Basis darf die PCM-Targets nicht sprengen |
+| `format` bei DSD-Target | eigene Schicht | `[defaults] format` ist eine Basis für die PCM-Geschwister, keine Aussage über *dieses* Deliverable |
+| `rate` bei DSD-Target | eigene Schicht | ebenso; ein geerbtes `rate = 48000` würde sonst eine legale Config unlösbar machen, statt einfach abgeleitet zu werden |
+
+„Eigene Schicht" heißt Preset + explizites Feld, ohne `[defaults]` darunter. Technisch
+kostet das nichts: `overlay` ist feldweise `Option::or` und damit assoziativ, also ist
+`builtin < defaults < (preset < explizit)` dieselbe Reihenfolge wie bisher — die
+Preset-und-explizit-Hälfte wird in `resolve_target` nur zusätzlich separat aufgehoben.
+Der Satz, der hängen bleiben sollte: **`[defaults]` ist eine Basis für einen heterogenen
+Satz von Targets, kein Bestandteil ihrer Beschreibung.**
+
+Zwei kleinere Festlegungen, die der Entwurf nicht getroffen hatte:
+
+- **`{format}` liefert bei DSD-Targets `1bit`.** `ResolvedTarget.format` trägt bei MP3 und
+  DSD einen Platzhalter (`s16`), damit die Struktur ein Feld ohne `Option` behalten kann.
+  Der darf nicht in einen Dateinamen laufen — `song-2822400-s16.dsf` wäre schlicht falsch.
+- **`OutputCodec::is_dsd()` statt `== Dsf`.** DFF kommt später (§ 3.4); mit dem Prädikat
+  ist das ein Arm an einer Stelle und keine Suche durch die Pipeline.
+
 ### 3.6 Reporting
 
 `ProcessingReport` bekommt ein `Option<DsdReport>`:
@@ -597,10 +636,18 @@ max_modulation_percent, overload_events }`. Dazu die DTO-Spiegelung in `json_rep
 `describe()` muss die neuen Schritte spiegeln — das ist laut `CLAUDE.md` der
 Standard-Driftpunkt und gehört in dieselbe Änderung.
 
+Umgesetzt so, plus `resets`, `samples_per_channel` und `file_bytes`. Eine Zahl darin ist
+subtiler, als sie aussieht: **`max_modulation_percent` wird *hinter* der Interpolation
+gemessen**, nicht am PCM-Puffer. Es ist damit eine True-Peak-Aussage, keine
+Sample-Peak-Aussage — bei `ceiling_dbtp = -1` kommen 45,6 % heraus, nicht die 44,6 %, die
+der Ceiling-Wert nahelegt (§ 4.3). Das ist die richtige Zahl für den Zweck (die Stabilität
+der Schleife hängt am momentanen Pegel am Quantisiererknoten), aber wer sie gegen
+`10^(ceiling/20)/2` hält, findet eine Abweichung, die keine ist.
+
 ### 3.7 Neue Dateien
 
 ```
-src/ops/dsd/mod.rs          Orchestrierung der Blockschleife, DsdRate-Enum, Ratenableitung  [teilweise: DsdRate]
+src/ops/dsd/mod.rs          Orchestrierung der Blockschleife, DsdRate-Enum, Ratenableitung  [fertig]
 src/ops/dsd/interpolate.rs  Streaming-Wrapper um libsoxr (Latenz, Blockpufferung, INIT_LOCK)  [fertig]
 src/ops/dsd/modulator.rs    1-Bit-Sigma-Delta, CIFB, NTF-Tabelle pro Rate, Dither, Watchdog   [fertig]
 src/ops/dsd/decimate.rs     DSD → PCM, Messwerkzeug (pub, nicht cfg(test) — s. Phase 2)       [fertig]
@@ -609,11 +656,12 @@ tests/dsd_verification.rs   Messharness (Kopfzahlen wie bei dither_/limiter_veri
 src/ops/dsd/pack.rs         Bit-Packing, Bitreihenfolge als Parameter (LSB-first für DSF)     [fertig]
 src/audio/io_write_dsd.rs   DSF-Streaming-Writer (Header-Patch via seek)                      [fertig]
 tests/dsd_format.rs         Byte-Layout, Padding, Bitreihenfolge, Fremd-Parser-Gegenprobe     [fertig]
+tests/dsd_pipeline.rs       Config-Auflösung, Validierung, Dry-Run, .wav → .dsf Ende-zu-Ende  [fertig]
 ```
 
-Die Blockschleife selbst (`mod.rs`) entsteht erst in Phase 4. Beide Enden sind dafür fertig
-und `tests/dsd_format.rs::modulate_to_file` ist bereits ihre Miniaturausgabe — die Funktion
-hat genau die Form, die die Schleife bekommen soll:
+Die Blockschleife (`encode_dsf` in `mod.rs`) ist in Phase 4 entstanden, praktisch
+unverändert gegenüber `tests/dsd_format.rs::modulate_to_file`, das ihre Miniaturausgabe
+war:
 
 ```rust
 // eine Soxr-Instanz, ein Modulator pro Kanal, ein Writer, alles über die ganze Datei
@@ -635,6 +683,11 @@ Der Modulator ist dafür gebaut — eine Instanz pro Kanal, Zustand über Blockg
 `modulate_into` hängt an einen wiederverwendeten Puffer an — und sowohl
 `tests/dsd_verification.rs` als auch `tests/dsd_format.rs` prüfen, dass die Blockung das
 Ergebnis nicht um ein Bit verändert.
+
+Die Schleife wird in **DSD-Samples** getaktet: ein Durchgang ist ein Containerblock pro
+Kanal (32 768 Samples), woraus sich die PCM-Blockgröße ergibt — 1024 Eingangsframes bei
+×32, 64 bei ×512. Damit bleibt der Akkumulator im `DsfWriter` unabhängig vom Verhältnis
+nahezu leer.
 
 ---
 
@@ -759,6 +812,54 @@ Rauschteppich steil an. Wer die 39,7 dB naiv liest, hält einen korrekten Contai
 kaputt. (Die Zahl des Modulators selbst — 121,0 dB, sauber im Band gemessen — steht in
 § 4.1; die 104,4 dB sind die ganze Kette inklusive des 17,6–22 kHz-Übergangsbandes.)
 
+### 4.3 Ergebnis (Phase 4, 2026-08-04, Apple Silicon)
+
+`tests/dsd_pipeline.rs`, 15 Tests, ~4,5 s im Debug-Build. Der Dateikopf dort ist die
+maßgebliche Fassung; das hier ist die Zusammenfassung.
+
+| Prüfung | Ergebnis |
+|---|---|
+| Zwischenraten-Tabelle aus § 2.1, alle 7 × 4 Felder | wie dokumentiert, jedes Verhältnis eine Zweierpotenz |
+| Explizites `rate` übersteuert; `rate = 48000` bei DSD64 | abgeleitet bzw. abgelehnt („power of two") |
+| `dsd` ohne `dsf`, `dsf` ohne `dsd`, `format` am DSD-Target, `bwf` | alle vier abgelehnt |
+| `[defaults] format`/`rate` neben einem DSD-Target | Config lädt, Rate bleibt abgeleitet (§ 3.5.1) |
+| Kollision zweier DSD-Targets ohne `{dsd}` im Namen | beim Laden abgelehnt |
+| Dry-Run enthält „quantize" oder „WAV" | **nein** — der Catch-all-Regressionstest |
+| Erste vier Bytes der Ausgabedatei | `DSD `, nicht `RIFF` |
+| `totalFileSize` / `sampleCount` / `dataChunkSize` gegen die Datei auf Platte | konsistent; `sampleCount` ein Vielfaches von 32 768 |
+| Fremdparser (`dsf`-Crate) auf der Pipeline-Ausgabe | akzeptiert |
+| In-Band-SNR, 96 kHz s24 → DSD64 → bei 44,1 kHz dekodiert | **104,5 dB** (Schranke > 95) |
+| Spitzenmodulation, Vollpegelquelle bei `ceiling_dbtp = -1` | 45,57 % (Schranke 43–47 %, < 71,43 %) |
+| Overloads und Resets im selben Lauf | 0 / 0 |
+| Zwei Läufe mit demselben Seed | bytegleich |
+
+Die 104,5 dB sind dieselbe Zahl, die § 4.2 für den Container allein meldet: Config und
+Pipeline kosten nichts obendrauf, was sie als reine Verkabelung um dieselben drei Stufen
+auch nicht sollten.
+
+Drei Dinge, die beim Bauen aufgefallen sind:
+
+**Die Spitzenmodulation ist eine True-Peak-Zahl.** 45,57 % statt der 44,6 %, die
+`ceiling_dbtp = -1` nahelegt — weil der Index hinter der Interpolation abgegriffen wird und
+damit die rekonstruierten Zwischensamplespitzen sieht (§ 3.6). Die Differenz von 0,19 dB
+ist genau das, was ein 997-Hz-Ton bei 88,2 kHz an Zwischensamplespitze mitbringt.
+
+**Der Catch-all war die reale Gefahr, als die er angekündigt war.** `describe()` und der
+`match target.codec` in `pipeline.rs` sind jetzt beide vollständig — `OutputCodec::Dsf` und
+`Wav | Flac` sind getrennte Arme, ohne `_`. Eine künftige Variante ist damit ein
+Compilerfehler an genau zwei Stellen statt einer `.dsf`-Datei voller RIFF. Der Test, der das
+von außen festhält, ist
+`a_dsd_target_writes_dsd_and_never_falls_through_to_the_pcm_path`: er prüft die ersten vier
+Bytes und dass der Dry-Run weder „quantize" noch „WAV" enthält.
+
+**Ein Ende-zu-Ende-Test mit `lufs` braucht mindestens 400 ms Material.** Der
+R128-Integrated-Meter gattert in 400-ms-Blöcken und liefert für alles Kürzere `-inf`; der
+Normalisierungsgewinn wird dann `+inf` und der ganze Puffer NaN. Der Modulator meldet das
+als „Overload auf jedem Sample bei 0 % Modulation" — was wie ein Stabilitätsproblem aussieht
+und keines ist. (`max_modulation` bleibt bei 0, weil `NaN > 0` falsch ist. Diese Signatur ist
+das Erkennungszeichen.) Betrifft nur die Tests: eine echte Datei ist nie 0,25 s lang, und die
+Ursache liegt in `loudness::apply`, nicht im DSD-Pfad.
+
 ---
 
 ## 5. Risiken & offene Punkte
@@ -772,9 +873,10 @@ kaputt. (Die Zahl des Modulators selbst — 121,0 dB, sauber im Band gemessen �
 | ~~Container falsch geschrieben (off-by-12, Bitreihenfolge)~~ | **erledigt** | § 4.2: Golden-Header, drei Größenfelder gegen die Datei auf Platte, Fremdparser, unabhängiger Entpacker |
 | Polsterung des letzten Blocks | gering, aber abweichend | Bewusste Abweichung von Annotation 3, gemessen begründet (§ 3.4.1). Wenn lückenlose Albumfolgen ein Thema werden, ist das die Stelle |
 | Rechenzeit | gering | DSD64 ~Sekunden, DSD256 ~1–2 min/Titel/Kern, DSD512 entsprechend mehr; parallel über Kanäle und Jobs (rayon existiert) |
-| Dateigrößen (DSD512: ~1,7 GB / 5 min) | gering, aber sichtbar | Größe vorab in `--dry-run` ausweisen |
-| f64-Puffer-Invariante | gering | Streaming ist auf die DSD-Stufe begrenzt; PCM-Pfad bleibt unberührt |
-| DSD512-Kompatibilität | gering | erlauben, aber im Dry-Run als „eingeschränkt unterstützt" markieren |
+| Dateigrößen (DSD512: ~1,7 GB / 5 min) | gering, aber sichtbar | Größe vorab in `--dry-run` ausweisen — **offen, Phase 5**; im Report steht sie bereits (`file_bytes`) |
+| f64-Puffer-Invariante | **erledigt** | Streaming bleibt auf die DSD-Stufe begrenzt; der PCM-Pfad ist unberührt, und `bitdepth::apply` liegt jetzt strukturell im WAV/FLAC-Arm, kann also gar nicht mehr vor den Modulator geraten |
+| ~~Catch-all-Arme in `describe()`/`pipeline.rs`~~ | **erledigt** | Beide Matches sind vollständig, Regressionstest in § 4.3 |
+| DSD512-Kompatibilität | **erledigt** | Erlaubt, und der Dry-Run schreibt „limited player support" dazu |
 
 Bewusst **nicht** im Scope: DFF/DSDIFF (später, s. § 3.4), DST-Kompression,
 SACD-Image-Authoring, DSD-**Eingabe** (Lesen von DSF/DFF), DoP, 48-kHz-basiertes DSD
@@ -788,8 +890,8 @@ wäre dann ein kleiner Zusatzschritt, kein zweites Projekt.
 ## 6. Plan
 
 Reihenfolge nach Risiko, nicht nach Sichtbarkeit: das Unbekannte (soxr bei großen Ratios,
-Modulatorqualität) kommt zuerst. Seit Phase 3 gibt es abspielbare `.dsf`-Dateien, nach
-Phase 4 ist das Feature regulär über die Config nutzbar.
+Modulatorqualität) kommt zuerst. Seit Phase 3 gibt es abspielbare `.dsf`-Dateien, seit
+Phase 4 ist das Feature regulär über die Config nutzbar; offen ist nur noch die Kür.
 
 ### ~~Phase 1 — Streaming-Interpolation auf libsoxr~~ · **abgeschlossen**
 1. **Zuerst der Smoke-Test**: Durchsatz und Speicher von libsoxr `vhq` bei den Ratios
@@ -841,20 +943,38 @@ bit-deterministisch — 22 isolierte Läufe, ein einziger SHA-256, jedes Mal 104
 
 Nicht gemacht, bewusst: ID3v2 im DSF (steht in Phase 5), DFF (§ 3.4).
 
-### Phase 4 — Config + Pipeline-Integration · 1,5–2 Tage · Risiko: gering, aber breit
-Entlang der Codec-Checkliste aus `CLAUDE.md`: `OutputCodec::Dsf` (+`ext()`), `dsd`-Feld
-durch `RawTarget` → `overlay()` → `builtin_fallback()` → `ResolvedTarget` →
-`resolve_target()` → `validate_fields()` → `describe()`; Ratenableitung (§ 2.1);
-Blockschleife in `pipeline.rs`; `ProcessingReport` + `json_report.rs` (inkl.
-Modulationsindex und Overload-Zähler); `{dsd}`-Platzhalter und Kollisionsprüfung.
+### ~~Phase 4 — Config + Pipeline-Integration~~ · **abgeschlossen**
+1. ✅ `OutputCodec::Dsf` (+`ext()`, +`is_dsd()`), `dsd`-Feld durch `RawTarget` →
+   `overlay()` → `builtin_fallback()` → `ResolvedTarget` → `resolve_target()` →
+   `validate_fields()` → `describe()`.
+2. ✅ Ratenableitung (§ 2.1) als `intermediate_pcm_rate` / `interpolation_factor`, im
+   Target sichtbar über `pcm_stage_rate()` und `delivery_rate()`.
+3. ✅ Blockschleife als `ops::dsd::encode_dsf`, aufgerufen aus einem eigenen
+   `pipeline.rs`-Arm. **Beide Catch-all-Arme sind weg** — der angekündigte gefährlichste
+   Punkt der Phase, jetzt mit Regressionstest (§ 4.3).
+4. ✅ `ProcessingReport.dsd` + DTO in `json_report.rs` + Konsolenzeile, inkl.
+   Modulationsindex, Overload- und Reset-Zähler. Warnung bei Überschreitung der 71,43 %
+   und bei jedem Overload (war für Phase 5 vorgesehen, kostete hier nichts extra).
+5. ✅ `{dsd}`-Platzhalter, `{rate}` = DSD-Rate, `{format}` = `1bit`, Kollisionsprüfung.
+6. ✅ `tests/dsd_pipeline.rs`, 15 Tests, Ergebnisse in § 4.3.
 
-### Phase 5 — Alle Raten, Preset, Doku · 1–1,5 Tage · Risiko: gering
-DSD128/256/512 scharfschalten (NTF pro Rate messen, nicht nur einschalten),
-`sacd`-Preset, Modulationsindex-Warnung, geschätzte Dateigröße im `--dry-run`, optional
-ID3v2 im DSF. README (Defaults-Tabelle, Abschnitt „Audio quality → DSD"),
-`examples/mint.toml` (ist per `include_str!` das Bootstrap-Template — Änderung dort
-ändert die Datei, die `mint` ohne Config anlegt), `CLAUDE.md` (neues Subsystem, neue
-Invariante „die DSD-Stufe streamt, der PCM-Pfad nicht").
+**Abweichung:** die Schichtenregel für `format`/`rate`/`dsd` gegenüber `[defaults]`
+(§ 3.5.1) — im Entwurf nicht bedacht und die einzige echte Entwurfsfrage der Phase.
+
+Nicht gemacht, bewusst: `sacd`-Preset, README, `examples/mint.toml`, `CLAUDE.md`. Die
+stehen unten in Phase 5, zusammen mit dem Preset, das sie beschreiben sollen.
+
+### Phase 5 — Preset, Doku, Feinschliff · 1–1,5 Tage · Risiko: gering
+`sacd`-Preset, geschätzte Dateigröße im `--dry-run`, optional ID3v2 im DSF. README
+(Defaults-Tabelle, Abschnitt „Audio quality → DSD"), `examples/mint.toml` (ist per
+`include_str!` das Bootstrap-Template — Änderung dort ändert die Datei, die `mint` ohne
+Config anlegt), `CLAUDE.md` (neues Subsystem, neue Invariante „die DSD-Stufe streamt, der
+PCM-Pfad nicht"; und die Codec-Checkliste dort erwähnt die beiden Catch-alls, die es nicht
+mehr gibt).
+
+Was hier *nicht* mehr nötig ist: „DSD128/256/512 scharfschalten". Alle vier Raten haben
+seit Phase 2 eine eigene, gemessene NTF (§ 4.1) und sind über die Config erreichbar; die
+Modulationsindex-Warnung steht seit Phase 4.
 
 **Summe: 7–9 Tage.**
 

@@ -250,7 +250,7 @@ fn print_dry_run(inputs: &[PathBuf], targets: &[ResolvedTarget]) -> Result<()> {
             .with_context(|| format!("failed to probe {}", input.display()))?;
         println!("\n{} [{} Hz]", input.display(), source_rate);
         for target in targets {
-            let output = target.render_output_path(input, target.rate.unwrap_or(source_rate))?;
+            let output = target.render_output_path(input, target.delivery_rate(source_rate))?;
             println!("  [{}] -> {}", target.name, output.display());
             for step in target.describe(source_rate) {
                 println!("      - {step}");
@@ -298,6 +298,21 @@ fn print_reports(reports: &[ProcessingReport]) {
             "    {} -> {} Hz | {}/{}{}{}{}",
             report.in_rate, report.out_rate, report.codec, report.format, bwf_tag, dither_tag, limiting,
         );
+        // The DSD stage's own figures. Peak modulation is the level QC number for a 1-bit
+        // deliverable — 50 % is the SACD 0 dB reference — and the overload count is the
+        // only place a loop that was driven past what it can track becomes visible.
+        if let Some(d) = &report.dsd {
+            println!(
+                "    {} via {} Hz x{} | order {} | peak modulation {:.1}% | overload {} | {:.1} MB",
+                d.rate,
+                d.intermediate_pcm_rate,
+                d.interpolation_factor,
+                d.modulator_order,
+                d.max_modulation_percent,
+                d.overload_samples,
+                d.file_bytes as f64 / 1_000_000.0,
+            );
+        }
         // Loudness metering, source -> delivered (integrated + range), plus the loudest
         // delivered momentary/short-term windows.
         println!(

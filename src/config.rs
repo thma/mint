@@ -7,6 +7,8 @@ use serde::Deserialize;
 
 use crate::audio::buffer::OutputSampleFormat;
 use crate::dither::ShapingCurve;
+use crate::ops::dsd::modulator as dsd_modulator;
+use crate::ops::dsd::{self, DsdRate};
 
 /// Top-level config: optional metadata, shared defaults, and one or more named
 /// output targets. Each `[target.NAME]` describes a *deliverable* (rate, depth,
@@ -63,9 +65,13 @@ pub struct RawTarget {
     pub dither_strength: Option<DitherStrength>,
     /// Phase 4.4: Stereo/multi-channel dither correlation mode (default: Decorrelated).
     pub dither_correlation: Option<DitherCorrelation>,
-    /// Output container/codec: `wav` (default), `flac`, or `mp3`. Orthogonal to
-    /// `format` — FLAC reuses the integer bit depth; MP3 ignores it (lossy).
+    /// Output container/codec: `wav` (default), `flac`, `mp3` or `dsf`. Orthogonal to
+    /// `format` — FLAC reuses the integer bit depth; MP3 ignores it (lossy) and DSF
+    /// rejects it outright (the modulator is the quantizer).
     pub codec: Option<OutputCodec>,
+    /// DSD rate for the 1-bit codecs: `dsd64` | `dsd128` | `dsd256` | `dsd512`. Required
+    /// with `codec = "dsf"`, rejected without it.
+    pub dsd: Option<DsdRate>,
     /// Write a Broadcast WAV `bext` chunk (with EBU R128 loudness metadata). WAV only.
     pub bwf: Option<bool>,
     /// MP3 CBR bitrate in kbps (default 320). Only used when `codec = "mp3"`.
@@ -205,13 +211,16 @@ pub enum BitDepthFormat {
 }
 
 /// Output container / codec. Separate axis from `BitDepthFormat`: WAV and FLAC carry an
-/// integer bit depth (FLAC has no float), MP3 is lossy and ignores bit depth entirely.
+/// integer bit depth (FLAC has no float), MP3 is lossy and ignores bit depth entirely, and
+/// DSF is 1-bit so a bit depth is meaningless there.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputCodec {
     Wav,
     Flac,
     Mp3,
+    /// DSD Stream File (Sony). Takes the DSD branch of the pipeline.
+    Dsf,
 }
 
 impl OutputCodec {
@@ -221,7 +230,16 @@ impl OutputCodec {
             OutputCodec::Wav => "wav",
             OutputCodec::Flac => "flac",
             OutputCodec::Mp3 => "mp3",
+            OutputCodec::Dsf => "dsf",
         }
+    }
+
+    /// True for the 1-bit containers. They skip `ops::bitdepth` entirely — the sigma-delta
+    /// modulator *is* the quantizer — and derive their PCM stage rate instead of taking it
+    /// from `rate`. Written as a predicate rather than matched inline so adding DFF later
+    /// is one arm here, not a hunt through the pipeline.
+    pub const fn is_dsd(self) -> bool {
+        matches!(self, OutputCodec::Dsf)
     }
 }
 
@@ -245,8 +263,13 @@ impl From<BitDepthFormat> for OutputSampleFormat {
 #[derive(Debug, Clone)]
 pub struct ResolvedTarget {
     pub name: String,
-    /// `None` keeps the source rate (no resample step is derived).
+    /// Explicit PCM rate. `None` keeps the source rate for PCM targets, and for DSD
+    /// targets means "derive the intermediate rate" — see [`Self::pcm_stage_rate`], which
+    /// is what the pipeline and the dry-run actually read.
     pub rate: Option<u32>,
+    /// Delivered sample format. A placeholder for the codecs that have none of their own
+    /// (MP3, DSF); [`Self::format_placeholder`] is what renders it, and it never reaches
+    /// a file in those cases.
     pub format: OutputSampleFormat,
     /// `None` skips loudness normalization (pure transcode).
     pub lufs: Option<f64>,
@@ -264,6 +287,8 @@ pub struct ResolvedTarget {
     pub dither_strength: DitherStrength,
     pub dither_correlation: DitherCorrelation,
     pub codec: OutputCodec,
+    /// DSD rate; `Some` exactly when `codec.is_dsd()` (enforced in `resolve_target`).
+    pub dsd: Option<DsdRate>,
     /// Write a Broadcast WAV `bext` chunk (WAV only).
     pub bwf: bool,
     /// MP3 CBR bitrate (kbps); only meaningful when `codec == Mp3`.
@@ -274,9 +299,42 @@ pub struct ResolvedTarget {
 }
 
 impl ResolvedTarget {
+    /// Rate the PCM chain delivers at — the rate everything up to and including the
+    /// ceiling stage works in.
+    ///
+    /// For a DSD target this is the *intermediate* rate the modulator is fed from, not the
+    /// rate of the file: an explicit `rate` if the user set one (validated as a power-of-two
+    /// divisor of the DSD rate), otherwise derived from the source
+    /// (`ops::dsd::intermediate_pcm_rate`).
+    pub fn pcm_stage_rate(&self, source_rate: u32) -> u32 {
+        match self.dsd {
+            Some(dsd) => self
+                .rate
+                .unwrap_or_else(|| dsd::intermediate_pcm_rate(source_rate, dsd)),
+            None => self.rate.unwrap_or(source_rate),
+        }
+    }
+
+    /// Sample rate of the delivered file: the 1-bit rate for DSD, the PCM rate otherwise.
+    /// This is what `{rate}` renders and what the report calls `out_rate`.
+    pub fn delivery_rate(&self, source_rate: u32) -> u32 {
+        match self.dsd {
+            Some(dsd) => dsd.hz(),
+            None => self.pcm_stage_rate(source_rate),
+        }
+    }
+
+    /// `{format}` substitution. DSD has no sample format — the stream is one bit — so the
+    /// dummy sitting in `format` must not leak into a file name.
+    pub fn format_placeholder(&self) -> &'static str {
+        match self.dsd {
+            Some(_) => "1bit",
+            None => format_tag(self.format),
+        }
+    }
+
     /// Render the output path for `input`. `out_rate` is the effective delivery
-    /// rate (target rate, or the source rate when no resample happens) and is
-    /// used for the `{rate}` placeholder.
+    /// rate (see [`Self::delivery_rate`]) and is used for the `{rate}` placeholder.
     pub fn render_output_path(&self, input: &Path, out_rate: u32) -> Result<PathBuf> {
         let stem = input
             .file_stem()
@@ -290,7 +348,8 @@ impl ResolvedTarget {
             .replace("{ext}", ext)
             .replace("{target}", &self.name)
             .replace("{rate}", &out_rate.to_string())
-            .replace("{format}", format_tag(self.format))
+            .replace("{format}", self.format_placeholder())
+            .replace("{dsd}", self.dsd.map_or("", DsdRate::tag))
             .replace("{cext}", self.codec.ext());
 
         Ok(self.dir.join(file_name))
@@ -325,16 +384,26 @@ impl ResolvedTarget {
             )),
         }
 
-        let out_rate = self.rate.unwrap_or(source_rate);
-        if out_rate != source_rate {
+        // For DSD this is the *intermediate* rate; the interpolation to the 1-bit rate is
+        // a separate step below.
+        let pcm_rate = self.pcm_stage_rate(source_rate);
+        if pcm_rate != source_rate {
+            let why = if self.dsd.is_some() && self.rate.is_none() {
+                ", derived"
+            } else {
+                ""
+            };
             steps.push(format!(
-                "resample {source_rate} -> {out_rate} Hz ({})",
+                "resample {source_rate} -> {pcm_rate} Hz ({}{why})",
                 quality_tag(self.quality)
             ));
         } else {
             steps.push(format!("keep sample rate {source_rate} Hz"));
         }
 
+        // Exhaustive on purpose: a catch-all arm here would silently describe a new codec
+        // as a quantized WAV, and the dry-run is the only place the derived chain is
+        // visible before any audio is touched.
         match self.codec {
             // MP3 is lossy: no PCM quantization/dither — libmp3lame encodes from the
             // full-precision buffer directly.
@@ -342,7 +411,10 @@ impl ResolvedTarget {
                 "encode MP3 {} kbps (lossy; bit depth & dither not applicable)",
                 self.mp3_bitrate
             )),
-            codec => {
+            // DSD is the second lossy-shaped branch: the sigma-delta loop is the quantizer,
+            // so the bit-depth/dither stage is skipped the same way.
+            OutputCodec::Dsf => steps.extend(self.describe_dsd(pcm_rate)),
+            OutputCodec::Wav | OutputCodec::Flac => {
                 match self.format {
                     f @ (OutputSampleFormat::F32 | OutputSampleFormat::F64) => {
                         steps.push(format!("write {} (no quantization)", format_tag(f)))
@@ -354,15 +426,47 @@ impl ResolvedTarget {
                         dither_strength_tag(self.dither_strength)
                     )),
                 }
-                let container = match codec {
-                    OutputCodec::Flac => "FLAC",
-                    _ if self.bwf => "Broadcast WAV (bext + R128 metadata)",
-                    _ => "WAV",
+                let container = if self.codec == OutputCodec::Flac {
+                    "FLAC"
+                } else if self.bwf {
+                    "Broadcast WAV (bext + R128 metadata)"
+                } else {
+                    "WAV"
                 };
                 steps.push(format!("write {container}"));
             }
         }
 
+        steps
+    }
+
+    /// The DSD tail of `describe`: the three steps `ops::dsd::encode_dsf` performs.
+    fn describe_dsd(&self, pcm_rate: u32) -> Vec<String> {
+        let Some(dsd) = self.dsd else {
+            return vec!["DSD target without a dsd rate (config bug)".to_string()];
+        };
+        let factor = dsd::interpolation_factor(pcm_rate, dsd);
+        let ratio = factor.map_or_else(|| "?".to_string(), |f| format!("x{f}"));
+
+        let mut steps = vec![
+            format!(
+                "interpolate {ratio} -> {} Hz ({}, {}), streaming",
+                dsd.hz(),
+                dsd.tag(),
+                quality_tag(self.quality)
+            ),
+            format!(
+                "sigma-delta modulate to 1 bit (order {}; 0 dBFS -> {:.0} % modulation)",
+                dsd_modulator::ORDER,
+                dsd_modulator::INPUT_SCALE * 100.0
+            ),
+            "write DSF (planar 4096-byte blocks, LSB first)".to_string(),
+        ];
+        // Named in the format's own tables but thinly supported in the wild; worth saying
+        // once, here, rather than after an hour of encoding.
+        if matches!(dsd, DsdRate::Dsd512) {
+            steps.push("note: dsd512 has limited player support".to_string());
+        }
         steps
     }
 }
@@ -390,28 +494,52 @@ impl Config {
             .with_context(|| format!("no such target: '{name}'"))?
             .clone();
 
-        // Precedence (lowest to highest): builtin fallbacks, [defaults], preset, explicit fields.
-        let mut merged = overlay(builtin_fallback(), self.defaults.clone());
-        if let Some(preset_name) = raw.preset.as_deref() {
-            merged = overlay(merged, preset(preset_name)?);
-        }
-        merged = overlay(merged, raw);
+        // What the target says about *itself*: preset < explicit, without the [defaults]
+        // baseline underneath. Kept separate because the DSD checks below have to tell
+        // "the user described this deliverable" apart from "the user set a baseline for a
+        // whole set of mostly-PCM targets" — a `format` in [defaults] must not make every
+        // DSD target in the file a hard error. `overlay` is field-wise `Option::or` and
+        // therefore associative, so folding this in below reproduces the documented
+        // builtin < defaults < preset < explicit precedence exactly.
+        let own = match raw.preset.as_deref() {
+            Some(preset_name) => {
+                let layer = preset(preset_name)?;
+                overlay(layer, raw)
+            }
+            None => raw,
+        };
+        let merged = overlay(overlay(builtin_fallback(), self.defaults.clone()), own.clone());
 
         let codec = merged.codec.unwrap();
+        let dsd = resolve_dsd(name, codec, &own, &merged)?;
+
         // `format` is required for WAV/FLAC (it's the delivered bit depth). MP3 is lossy
-        // and ignores it, so a missing format is allowed there and a dummy is used.
+        // and ignores it; DSD is one bit and has none. Both get a dummy that never reaches
+        // a file — `format_placeholder` is what naming renders.
         let format: OutputSampleFormat = match merged.format.map(Into::into) {
             Some(f) => f,
-            None if codec == OutputCodec::Mp3 => OutputSampleFormat::S16,
+            None if codec == OutputCodec::Mp3 || codec.is_dsd() => OutputSampleFormat::S16,
             None => bail!(
                 "target '{name}': 'format' is required (set it directly or via a preset)"
             ),
         };
+        // Strict rather than tolerated (MP3 ignores a stray `format` for historical
+        // reasons; a new field can afford to be honest). Only the target's own layer
+        // counts — see the comment on `own`.
+        if dsd.is_some() && own.format.is_some() {
+            bail!(
+                "target '{name}': 'format' has no meaning for a DSD target — the \
+                 sigma-delta modulator is the quantizer. Remove it; use 'dsd' to pick the rate"
+            );
+        }
 
         // Builtin fallbacks guarantee these are populated; unwrap is safe.
         let resolved = ResolvedTarget {
             name: name.to_string(),
-            rate: merged.rate,
+            // Same reasoning as `format`: for a DSD target `rate` is the escape hatch that
+            // overrides the derived intermediate rate, so it must be something this target
+            // said, not a baseline meant for its PCM siblings.
+            rate: if dsd.is_some() { own.rate } else { merged.rate },
             format,
             lufs: merged.lufs,
             ceiling_dbtp: merged.ceiling_dbtp.unwrap(),
@@ -426,6 +554,7 @@ impl Config {
             dither_strength: merged.dither_strength.unwrap_or(DitherStrength::Normal),
             dither_correlation: merged.dither_correlation.unwrap_or_default(),
             codec,
+            dsd,
             bwf: merged.bwf.unwrap(),
             mp3_bitrate: merged.mp3_bitrate.unwrap(),
             dir: merged.dir.unwrap(),
@@ -505,6 +634,24 @@ impl ResolvedTarget {
         if self.bwf && self.codec != OutputCodec::Wav {
             bail!("target '{}': bwf=true is only valid for codec=wav", self.name);
         }
+        // A DSD target's `rate` is the *intermediate* PCM rate the modulator is fed from,
+        // so it has to reach the 1-bit rate by an exact power of two. Anything else means
+        // a fractional SRC immediately in front of the most level-sensitive stage in the
+        // chain — see `ops::dsd::intermediate_pcm_rate`. Keeping ultrasonic content in a
+        // low-rate file (rate = 176400 for dsd64) is legitimate and stays allowed.
+        if let Some(dsd) = self.dsd
+            && let Some(rate) = self.rate
+            && dsd::interpolation_factor(rate, dsd).is_none()
+        {
+            bail!(
+                "target '{}': rate {rate} cannot feed {} ({} Hz) — the interpolation ratio \
+                 must be a power of two >= 2. Use a 44.1 kHz-family rate (44100, 88200, \
+                 176400, 352800, 705600) or omit 'rate' to have it derived",
+                self.name,
+                dsd.tag(),
+                dsd.hz()
+            );
+        }
         // MP3 bitrate must be one libmp3lame accepts.
         if self.codec == OutputCodec::Mp3 && !MP3_BITRATES.contains(&self.mp3_bitrate) {
             bail!(
@@ -521,6 +668,35 @@ impl ResolvedTarget {
             );
         }
         Ok(())
+    }
+}
+
+/// Pair up `codec` and `dsd`, rejecting both ways they can disagree.
+///
+/// The two directions read different layers on purpose. *Missing* is checked against the
+/// fully merged value, so `dsd` in `[defaults]` is a usable baseline for several DSD
+/// targets. *Superfluous* is checked against the target's own layer, so that same baseline
+/// does not turn every PCM target in the config into an error. What is rejected either way
+/// is the mismatch a single target actually describes — silently ignoring one half would
+/// sit badly next to `deny_unknown_fields`.
+fn resolve_dsd(
+    name: &str,
+    codec: OutputCodec,
+    own: &RawTarget,
+    merged: &RawTarget,
+) -> Result<Option<DsdRate>> {
+    match (codec.is_dsd(), merged.dsd, own.dsd) {
+        (true, Some(rate), _) => Ok(Some(rate)),
+        (true, None, _) => bail!(
+            "target '{name}': codec={} needs a 'dsd' rate (dsd64 | dsd128 | dsd256 | dsd512)",
+            codec.ext()
+        ),
+        (false, _, Some(rate)) => bail!(
+            "target '{name}': dsd=\"{}\" needs codec=\"dsf\" (got codec={})",
+            rate.tag(),
+            codec.ext()
+        ),
+        (false, _, None) => Ok(None),
     }
 }
 
@@ -543,6 +719,7 @@ fn overlay(base: RawTarget, top: RawTarget) -> RawTarget {
         dither_strength: top.dither_strength.or(base.dither_strength),
         dither_correlation: top.dither_correlation.or(base.dither_correlation),
         codec: top.codec.or(base.codec),
+        dsd: top.dsd.or(base.dsd),
         bwf: top.bwf.or(base.bwf),
         mp3_bitrate: top.mp3_bitrate.or(base.mp3_bitrate),
         dir: top.dir.or(base.dir),
@@ -570,6 +747,7 @@ fn builtin_fallback() -> RawTarget {
         dither_strength: Some(DitherStrength::Normal),
         dither_correlation: None,
         codec: Some(OutputCodec::Wav),
+        dsd: None, // DSD-only; a default here would be a trap for every PCM target
         bwf: Some(false),
         mp3_bitrate: Some(320),
         dir: Some(PathBuf::from("./out")),
@@ -623,12 +801,13 @@ fn check_collisions(targets: &[ResolvedTarget]) -> Result<()> {
     let mut seen: Vec<(PathBuf, &str)> = Vec::new();
 
     for target in targets {
-        // rate unknown here (may follow the source) -> 0 is a safe, conservative stand-in.
-        let path = target.render_output_path(probe, target.rate.unwrap_or(0))?;
+        // Source rate unknown here (the delivery rate may follow it) -> 0 is a safe,
+        // conservative stand-in. DSD targets ignore it: their rate is the DSD rate.
+        let path = target.render_output_path(probe, target.delivery_rate(0))?;
         if let Some((_, other)) = seen.iter().find(|(p, _)| *p == path) {
             bail!(
                 "targets '{}' and '{}' resolve to the same output path; \
-                 add {{target}} (or {{rate}}/{{format}}/{{cext}}) to naming, or give them different dirs",
+                 add {{target}} (or {{rate}}/{{format}}/{{dsd}}/{{cext}}) to naming, or give them different dirs",
                 other,
                 target.name
             );

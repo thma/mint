@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::ops::loudness::LoudnessAnalysis;
-use crate::pipeline::{ProcessingReport, TaskFailure};
+use crate::pipeline::{DsdReport, ProcessingReport, TaskFailure};
 
 #[derive(Serialize)]
 struct JsonReport<'a> {
@@ -24,11 +24,13 @@ struct TaskJson<'a> {
     output: &'a str,
     sample_rate: RateJson,
     codec: &'a str,
-    /// Sample format (s16/s24/f32/f64) for PCM codecs, or "<N> kbps" for MP3.
+    /// Sample format (s16/s24/f32/f64) for PCM codecs, "<N> kbps" for MP3, "1-bit" for DSD.
     format: &'a str,
     /// True when a Broadcast WAV bext chunk was written.
     bwf: bool,
     dither: DitherJson<'a>,
+    /// DSD stage figures; `null` for every PCM and MP3 target.
+    dsd: Option<DsdJson<'a>>,
     /// Peak gain reduction the limiter applied (dB); `null` when none was needed.
     limiter_gain_reduction_db: Option<f64>,
     /// Mean gain reduction (dB) over the limited portion; `null` when none was needed.
@@ -53,6 +55,44 @@ struct DitherJson<'a> {
     applied: bool,
     /// Noise-shaping curve name when shaping ran, else `null`.
     noise_shaping: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct DsdJson<'a> {
+    /// "dsd64" | "dsd128" | "dsd256" | "dsd512".
+    rate: &'a str,
+    rate_hz: u32,
+    /// PCM rate the modulator was fed from — derived unless the target set `rate`.
+    intermediate_pcm_rate_hz: u32,
+    interpolation_factor: u32,
+    modulator_order: usize,
+    /// Peak modulation index in percent; 50 % is the SACD 0 dB reference, 71.43 % the
+    /// format maximum. The QC number for a DSD deliverable.
+    max_modulation_percent: f64,
+    /// Samples on which the sigma-delta loop hit a state clamp; 0 on a healthy run.
+    overload_samples: u64,
+    loop_resets: u64,
+    /// `sampleCount` as written, i.e. including the silence the last block was topped up
+    /// with (`src/audio/io_write_dsd.rs` documents why that counts as audio).
+    samples_per_channel: u64,
+    file_bytes: u64,
+}
+
+impl<'a> From<&'a DsdReport> for DsdJson<'a> {
+    fn from(d: &'a DsdReport) -> Self {
+        Self {
+            rate: d.rate,
+            rate_hz: d.rate_hz,
+            intermediate_pcm_rate_hz: d.intermediate_pcm_rate,
+            interpolation_factor: d.interpolation_factor,
+            modulator_order: d.modulator_order,
+            max_modulation_percent: d.max_modulation_percent,
+            overload_samples: d.overload_samples,
+            loop_resets: d.resets,
+            samples_per_channel: d.samples_per_channel,
+            file_bytes: d.file_bytes,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -110,6 +150,7 @@ pub fn render(
             format: &r.format,
             bwf: r.bwf,
             dither: DitherJson { applied: r.dithered, noise_shaping: r.shaping_curve },
+            dsd: r.dsd.as_ref().map(Into::into),
             limiter_gain_reduction_db: r.limiter_gain_reduction_db,
             limiter_avg_gain_reduction_db: r.limiter_avg_gain_reduction_db,
             limiter_active_percent: r.limiter_active_percent,
@@ -161,6 +202,7 @@ mod tests {
             codec: "wav".into(),
             bwf: true,
             format: "s16".into(),
+            dsd: None,
             warnings: vec!["heavy limiting".into()],
         };
         let failure = TaskFailure {
@@ -187,7 +229,58 @@ mod tests {
         assert_eq!(v["tasks"][0]["delivered"]["integrated_lufs"].as_f64(), Some(-14.0));
         // PLR delivered = true_peak (-1.0) - integrated (-14.0) = 13.0.
         assert_eq!(v["tasks"][0]["delivered"]["plr_db"].as_f64(), Some(13.0));
+        // A PCM task must carry the DSD block as an explicit null, not omit it.
+        assert!(v["tasks"][0]["dsd"].is_null());
         assert_eq!(v["failures"][0]["target"].as_str(), Some("cd"));
         assert_eq!(v["failures"][0]["error"].as_str(), Some("boom"));
+    }
+
+    #[test]
+    fn serializes_the_dsd_block() {
+        let report = ProcessingReport {
+            target: "sacd".into(),
+            input: "in.wav".into(),
+            output: "out/sacd/in.dsf".into(),
+            in_rate: 96_000,
+            out_rate: 2_822_400,
+            source: analysis(-18.0),
+            delivered: analysis(-16.0),
+            limiter_gain_reduction_db: None,
+            limiter_avg_gain_reduction_db: None,
+            limiter_active_percent: None,
+            dithered: false,
+            shaped: false,
+            shaping_curve: None,
+            codec: "dsf".into(),
+            bwf: false,
+            format: "1-bit".into(),
+            dsd: Some(DsdReport {
+                rate: "dsd64",
+                rate_hz: 2_822_400,
+                intermediate_pcm_rate: 88_200,
+                interpolation_factor: 32,
+                modulator_order: 7,
+                max_modulation_percent: 44.6,
+                overload_samples: 0,
+                resets: 0,
+                samples_per_channel: 32_768,
+                file_bytes: 8_284,
+            }),
+            warnings: vec![],
+        };
+
+        let json = render(None, &[report], &[]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let dsd = &v["tasks"][0]["dsd"];
+        assert_eq!(dsd["rate"].as_str(), Some("dsd64"));
+        assert_eq!(dsd["rate_hz"].as_u64(), Some(2_822_400));
+        assert_eq!(dsd["intermediate_pcm_rate_hz"].as_u64(), Some(88_200));
+        assert_eq!(dsd["interpolation_factor"].as_u64(), Some(32));
+        assert_eq!(dsd["max_modulation_percent"].as_f64(), Some(44.6));
+        assert_eq!(dsd["overload_samples"].as_u64(), Some(0));
+        assert_eq!(v["tasks"][0]["format"].as_str(), Some("1-bit"));
+        // The 1-bit rate, not the intermediate PCM one.
+        assert_eq!(v["tasks"][0]["sample_rate"]["out"].as_u64(), Some(2_822_400));
     }
 }

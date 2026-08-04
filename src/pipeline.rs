@@ -7,8 +7,9 @@ use crate::audio::buffer::OutputSampleFormat;
 use crate::audio::io_read;
 use crate::audio::io_write;
 use crate::config::{DitherMode, OnClipPolicy, OutputCodec, ResolvedTarget, format_tag};
+use crate::ops::dsd::modulator::MAX_MODULATION;
 use crate::ops::loudness::LoudnessAnalysis;
-use crate::ops::{bitdepth, limiter, loudness, resample};
+use crate::ops::{bitdepth, dsd, limiter, loudness, resample};
 
 #[derive(Debug, Clone)]
 pub struct ProcessingReport {
@@ -40,13 +41,41 @@ pub struct ProcessingReport {
     /// Name of the shaping family when shaping ran ("gentle" |
     /// "psychoacoustic" | "adaptive"); `None` otherwise. Mirrors the dry-run label.
     pub shaping_curve: Option<&'static str>,
-    /// Output container/codec: "wav" | "flac" | "mp3".
+    /// Output container/codec: "wav" | "flac" | "mp3" | "dsf".
     pub codec: String,
     /// True when a Broadcast WAV `bext` chunk was written.
     pub bwf: bool,
-    /// Sample-format tag for PCM codecs (s16/s24/f32), or "<N> kbps" for MP3.
+    /// Sample-format tag for PCM codecs (s16/s24/f32), "<N> kbps" for MP3, "1-bit" for DSD.
     pub format: String,
+    /// DSD-specific figures; `None` for every PCM and MP3 target.
+    pub dsd: Option<DsdReport>,
     pub warnings: Vec<String>,
+}
+
+/// What the DSD stage did, for the console summary and `--json`.
+///
+/// Two of these are QC numbers rather than trivia. `max_modulation_percent` is the level in
+/// the units the format actually uses (50 % is the SACD 0 dB reference, 71.43 % its
+/// maximum), and `overload_samples` counts the samples on which the sigma-delta loop hit a
+/// state clamp — nonzero means the loop was driven past what a 1-bit quantizer can track.
+#[derive(Debug, Clone)]
+pub struct DsdReport {
+    /// "dsd64" | "dsd128" | "dsd256" | "dsd512".
+    pub rate: &'static str,
+    pub rate_hz: u32,
+    /// PCM rate the modulator was fed from (derived unless the target set `rate`).
+    pub intermediate_pcm_rate: u32,
+    /// `rate_hz / intermediate_pcm_rate`; always a power of two.
+    pub interpolation_factor: u32,
+    pub modulator_order: usize,
+    /// Peak modulation index in percent.
+    pub max_modulation_percent: f64,
+    pub overload_samples: u64,
+    /// Times the loop stayed clamped long enough to be declared diverged and reset.
+    pub resets: u64,
+    /// `sampleCount` as written — includes the silence the last block was topped up with.
+    pub samples_per_channel: u64,
+    pub file_bytes: u64,
 }
 
 /// A task that failed to process. Kept structured (not a pre-formatted string) so both
@@ -129,10 +158,13 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
         false
     };
 
-    // 2. Resample — only when the delivery rate differs from the source rate.
-    let out_rate = target.rate.unwrap_or(source_rate);
-    if out_rate != source_rate {
-        resample::apply(&mut buffer, out_rate, Some(target.quality))?;
+    // 2. Resample — only when the PCM stage's rate differs from the source rate. For a DSD
+    //    target that rate is the *intermediate* one the modulator will be interpolated up
+    //    from, derived from the source unless the target set `rate` explicitly.
+    let pcm_rate = target.pcm_stage_rate(source_rate);
+    let out_rate = target.delivery_rate(source_rate);
+    if pcm_rate != source_rate {
+        resample::apply(&mut buffer, pcm_rate, Some(target.quality))?;
         // SRC can raise inter-sample peaks above the previously enforced ceiling.
         warnings.extend(loudness::recheck_and_limit_if_needed(
             &mut buffer,
@@ -175,12 +207,18 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
             .with_context(|| format!("failed to create output directory: {}", parent.display()))?;
     }
 
-    // 4/5. Quantize (once, if the codec is PCM-based) and encode/write. MP3 is lossy:
-    //      libmp3lame quantizes internally, so the f64 buffer is fed straight in and the
-    //      bit-depth/dither stage is skipped.
+    // 4/5. Quantize (once, if the codec is PCM-based) and encode/write. Two codecs skip the
+    //      bit-depth/dither stage because they carry their own quantizer: MP3 (libmp3lame
+    //      quantizes internally) and DSD (the sigma-delta loop *is* the quantizer, and must
+    //      see the un-quantized buffer — `bitdepth::apply` in front of it would be a real
+    //      bug, which is why it lives in the WAV/FLAC arm only).
+    //
+    //      Matched exhaustively, deliberately: with a catch-all arm a new `OutputCodec`
+    //      variant compiles fine and quietly gets quantized and written as a WAV.
     let mut dithered = false;
     let mut shaped = false;
     let mut shaping_curve = None;
+    let mut dsd_report = None;
     let format_tag_str;
 
     match target.codec {
@@ -188,7 +226,55 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
             io_write::write_mp3(&output_path, &buffer, target.mp3_bitrate)?;
             format_tag_str = format!("{} kbps", target.mp3_bitrate);
         }
-        codec => {
+        OutputCodec::Dsf => {
+            let dsd_rate = target
+                .dsd
+                .context("DSD codec resolved without a dsd rate (config resolution bug)")?;
+            let encoding = dsd::encode_dsf(
+                &output_path,
+                &buffer.channels,
+                pcm_rate,
+                dsd_rate,
+                Some(target.quality),
+                seed,
+            )?;
+            let stats = encoding.stats;
+
+            // Only reachable from PCM hotter than 0 dBFS true peak, which the ceiling stage
+            // exists to prevent — so if it fires, the ceiling stage was bypassed or the
+            // ceiling itself is set above 0.
+            if stats.exceeds_format_maximum() {
+                warnings.push(format!(
+                    "peak modulation {:.1} % exceeds the format maximum of {:.2} % \
+                     (the 20/28 rule); lower ceiling_dbtp",
+                    stats.max_modulation_percent(),
+                    MAX_MODULATION * 100.0
+                ));
+            }
+            if stats.overload_samples > 0 {
+                warnings.push(format!(
+                    "sigma-delta overload on {} of {} samples ({} loop reset(s)); the \
+                     modulator clipped rather than diverged, but the tail of the level \
+                     distribution is past what a 1-bit loop can track",
+                    stats.overload_samples, stats.samples, stats.resets
+                ));
+            }
+
+            format_tag_str = "1-bit".to_string();
+            dsd_report = Some(DsdReport {
+                rate: dsd_rate.tag(),
+                rate_hz: dsd_rate.hz(),
+                intermediate_pcm_rate: encoding.pcm_rate,
+                interpolation_factor: encoding.interpolation,
+                modulator_order: dsd::modulator::ORDER,
+                max_modulation_percent: stats.max_modulation_percent(),
+                overload_samples: stats.overload_samples,
+                resets: stats.resets,
+                samples_per_channel: encoding.file.samples_per_channel,
+                file_bytes: encoding.file.file_bytes,
+            });
+        }
+        OutputCodec::Wav | OutputCodec::Flac => {
             // WAV and FLAC quantize the full-precision buffer exactly once, with dither.
             let mut current = OutputSampleFormat::F32;
             let in_format = current;
@@ -217,29 +303,26 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
 
             format_tag_str = format_tag(target.format).to_string();
 
-            match codec {
-                OutputCodec::Flac => {
-                    io_write::write_flac(
-                        &output_path,
-                        &buffer,
-                        target.format.bits_per_sample() as usize,
-                    )?;
-                }
-                // WAV (with an optional EBU R128 bext chunk built from the delivered metering).
-                _ => {
-                    let bext = target.bwf.then(|| io_write::BextMetadata {
-                        description: "EBU R128 master (mint)".to_string(),
-                        integrated_lufs: delivered.integrated_lufs,
-                        loudness_range_lu: delivered.loudness_range_lu,
-                        max_true_peak_dbtp: delivered.true_peak_dbtp,
-                        max_momentary_lufs: delivered.max_momentary_lufs,
-                        max_short_term_lufs: delivered.max_short_term_lufs,
-                        sample_rate: buffer.sample_rate,
-                        channels: buffer.channels_count(),
-                        bits: target.format.bits_per_sample(),
-                    });
-                    io_write::write_wav(&output_path, &buffer, bext.as_ref())?;
-                }
+            if target.codec == OutputCodec::Flac {
+                io_write::write_flac(
+                    &output_path,
+                    &buffer,
+                    target.format.bits_per_sample() as usize,
+                )?;
+            } else {
+                // WAV, with an optional EBU R128 bext chunk built from the delivered metering.
+                let bext = target.bwf.then(|| io_write::BextMetadata {
+                    description: "EBU R128 master (mint)".to_string(),
+                    integrated_lufs: delivered.integrated_lufs,
+                    loudness_range_lu: delivered.loudness_range_lu,
+                    max_true_peak_dbtp: delivered.true_peak_dbtp,
+                    max_momentary_lufs: delivered.max_momentary_lufs,
+                    max_short_term_lufs: delivered.max_short_term_lufs,
+                    sample_rate: buffer.sample_rate,
+                    channels: buffer.channels_count(),
+                    bits: target.format.bits_per_sample(),
+                });
+                io_write::write_wav(&output_path, &buffer, bext.as_ref())?;
             }
         }
     }
@@ -261,6 +344,7 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
         codec: target.codec.ext().to_string(),
         bwf: target.bwf && target.codec == OutputCodec::Wav,
         format: format_tag_str,
+        dsd: dsd_report,
         warnings,
     })
 }
