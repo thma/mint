@@ -96,6 +96,92 @@ fn added_presets_are_available() {
     assert_eq!(b.ceiling_dbtp, -0.1);
 }
 
+/// The valid-name list in the error message used to be a third hand-maintained copy of the
+/// preset table; this holds it to the arms in `preset()`.
+#[test]
+fn every_listed_preset_resolves_and_the_error_offers_all_of_them() {
+    for name in mint::config::PRESET_NAMES {
+        let config = config_from_str(&format!("[target.x]\npreset = \"{name}\"\n"));
+        config
+            .resolve_target("x")
+            .unwrap_or_else(|e| panic!("preset '{name}' is listed but does not resolve: {e:#}"));
+    }
+
+    let err = config_err("[target.x]\npreset = \"nope\"\n");
+    for name in mint::config::PRESET_NAMES {
+        assert!(err.contains(name), "'{name}' missing from: {err}");
+    }
+}
+
+/// `sacd` is the only preset that is not PCM, and the only one whose value lies in what it
+/// does *not* set: a `format` would be a hard error and a `rate` would silently switch off
+/// the derivation of the intermediate PCM rate.
+#[test]
+fn the_sacd_preset_is_a_complete_dsd_target_on_one_line() {
+    let config = config_from_str("[target.sacd]\npreset = \"sacd\"\n");
+    let t = config.resolve_target("sacd").expect("resolve sacd");
+
+    assert_eq!(t.dsd.map(|d| d.tag()), Some("dsd64"));
+    assert_eq!(t.rate, None, "a preset-set rate would suppress the derivation");
+    assert_eq!(t.ceiling_dbtp, -1.0);
+    assert_eq!(t.lufs, None, "DSD has no loudness standard, like cd");
+    assert_eq!(t.format_placeholder(), "1bit");
+    assert_eq!(t.pcm_stage_rate(96_000), 88_200);
+    assert_eq!(t.delivery_rate(96_000), 2_822_400);
+
+    let steps = t.describe(96_000);
+    assert!(
+        steps.iter().any(|s| s.contains("88200") && s.contains("derived")),
+        "got: {steps:?}"
+    );
+    assert!(steps.iter().any(|s| s.contains("interpolate x32")), "got: {steps:?}");
+    assert!(!steps.iter().any(|s| s.contains("quantize")), "got: {steps:?}");
+}
+
+/// Every PCM preset sets `format`, which a DSD target rejects — so the natural "start from
+/// a preset and swap the codec" move cannot work, and the error has to say why.
+#[test]
+fn a_pcm_preset_cannot_be_repointed_at_a_dsd_codec() {
+    let err = config_err(
+        r#"
+        [target.x]
+        preset = "hires"
+        codec  = "dsf"
+        dsd    = "dsd64"
+        "#,
+    );
+    assert!(err.contains("format"), "got: {err}");
+    assert!(err.contains("preset"), "the error must point at the preset: {err}");
+}
+
+/// `bwf` used to be checked against the merged value, so a broadcast-oriented
+/// `[defaults] bwf = true` made every FLAC/MP3/DSD sibling a load-time error. Same
+/// own-layer rule as `format` and `rate`: rejected when *this* target asks for it, dropped
+/// when it is only inherited.
+#[test]
+fn an_inherited_bwf_does_not_break_non_wav_siblings() {
+    let config = config_from_str(
+        r#"
+        [defaults]
+        bwf = true
+
+        [target.broadcast]
+        preset = "broadcast-ebu-r128"
+
+        [target.lossless]
+        preset = "hires"
+        codec  = "flac"
+
+        [target.sacd]
+        preset = "sacd"
+        "#,
+    );
+
+    assert!(config.resolve_target("broadcast").unwrap().bwf, "wav still gets its bext chunk");
+    assert!(!config.resolve_target("lossless").unwrap().bwf);
+    assert!(!config.resolve_target("sacd").unwrap().bwf);
+}
+
 #[test]
 fn unknown_preset_is_rejected() {
     let dir = std::env::temp_dir().join("mint-cfg-badpreset");

@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::audio::buffer::OutputSampleFormat;
+use crate::audio::{io_write, io_write_dsd};
 use crate::dither::ShapingCurve;
 use crate::ops::dsd::modulator as dsd_modulator;
 use crate::ops::dsd::{self, DsdRate};
@@ -259,6 +260,40 @@ impl From<BitDepthFormat> for OutputSampleFormat {
     }
 }
 
+/// A predicted output size, carrying how much the prediction is worth.
+///
+/// The distinction is not decoration: DSD is the codec that motivated showing sizes at all
+/// (a five-minute DSD512 stereo track is ~1.7 GB), and there the number is exact — an
+/// approximation would be a strictly worse answer to "will this fit". FLAC cannot be
+/// predicted at all before encoding, and saying "~" of an upper bound would be a lie in the
+/// one direction that matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeEstimate {
+    /// Byte-exact: every stage has a deterministic length contract (WAV, DSF).
+    Exact(u64),
+    /// Derived from a nominal bitrate; the real file lands a few kB above (MP3).
+    About(u64),
+    /// Upper bound only — lossless compression is content-dependent (FLAC).
+    AtMost(u64),
+}
+
+impl SizeEstimate {
+    pub fn bytes(self) -> u64 {
+        match self {
+            SizeEstimate::Exact(b) | SizeEstimate::About(b) | SizeEstimate::AtMost(b) => b,
+        }
+    }
+
+    /// Prefix that says how much the number is worth: nothing, `~`, or `<=`.
+    pub fn qualifier(self) -> &'static str {
+        match self {
+            SizeEstimate::Exact(_) => "",
+            SizeEstimate::About(_) => "~",
+            SizeEstimate::AtMost(_) => "<= ",
+        }
+    }
+}
+
 /// A fully-resolved target with every effective value materialized.
 #[derive(Debug, Clone)]
 pub struct ResolvedTarget {
@@ -353,6 +388,64 @@ impl ResolvedTarget {
             .replace("{cext}", self.codec.ext());
 
         Ok(self.dir.join(file_name))
+    }
+
+    /// Size of the file this target will write, as far as it can be known in advance.
+    ///
+    /// `source_frames` is per channel. Returns `None` when the source could not be measured
+    /// (see [`crate::audio::io_read::probe_source`]) — printing a wrong number is worse
+    /// than printing none.
+    ///
+    /// How exact the answer is depends entirely on the codec, which is why the caller gets
+    /// a [`SizeEstimate`] rather than a bare `u64`: for DSD every stage between here and
+    /// the writer has a deterministic length contract, so the prediction is byte-exact,
+    /// while for FLAC only an upper bound exists before the material has been encoded.
+    pub fn estimated_output_bytes(
+        &self,
+        source_rate: u32,
+        source_frames: u64,
+        channels: usize,
+    ) -> Option<SizeEstimate> {
+        if source_rate == 0 || channels == 0 {
+            return None;
+        }
+        let pcm_rate = self.pcm_stage_rate(source_rate);
+        // The one length change in the PCM chain; loudness and limiting are in-place.
+        // Deliberately the same expression as `ops::resample::apply` — a `floor` here would
+        // differ by a frame and, at a DSF block boundary, by a whole 4096-byte block.
+        let frames = if pcm_rate == source_rate {
+            source_frames
+        } else {
+            (source_frames as f64 * (f64::from(pcm_rate) / f64::from(source_rate))).round() as u64
+        };
+
+        // Exhaustive for the same reason as `describe`: a new codec must not inherit a
+        // plausible-looking number computed for a different container.
+        Some(match self.codec {
+            OutputCodec::Dsf => {
+                let dsd = self.dsd?;
+                let interpolation = dsd::interpolation_factor(pcm_rate, dsd)?;
+                SizeEstimate::Exact(io_write_dsd::dsf_file_bytes(
+                    frames * u64::from(interpolation),
+                    channels,
+                ))
+            }
+            OutputCodec::Wav => SizeEstimate::Exact(io_write::wav_file_bytes(
+                frames,
+                pcm_rate,
+                channels,
+                self.format,
+                self.bwf,
+            )),
+            OutputCodec::Flac => SizeEstimate::AtMost(io_write::flac_max_file_bytes(
+                frames,
+                channels,
+                self.format.bits_per_sample(),
+            )),
+            OutputCodec::Mp3 => {
+                SizeEstimate::About(io_write::mp3_file_bytes(frames, pcm_rate, self.mp3_bitrate))
+            }
+        })
     }
 
     /// Human-readable summary of the auto-derived pipeline for `--dry-run`.
@@ -462,8 +555,9 @@ impl ResolvedTarget {
             ),
             "write DSF (planar 4096-byte blocks, LSB first)".to_string(),
         ];
-        // Named in the format's own tables but thinly supported in the wild; worth saying
-        // once, here, rather than after an hour of encoding.
+        // A de-facto extension: the DSF spec names only DSD64 and DSD128 (see the writer's
+        // module doc), and support in the wild is thin. Worth saying once, here, rather
+        // than after an hour of encoding.
         if matches!(dsd, DsdRate::Dsd512) {
             steps.push("note: dsd512 has limited player support".to_string());
         }
@@ -495,12 +589,16 @@ impl Config {
             .clone();
 
         // What the target says about *itself*: preset < explicit, without the [defaults]
-        // baseline underneath. Kept separate because the DSD checks below have to tell
+        // baseline underneath. Kept separate because the checks below have to tell
         // "the user described this deliverable" apart from "the user set a baseline for a
         // whole set of mostly-PCM targets" — a `format` in [defaults] must not make every
         // DSD target in the file a hard error. `overlay` is field-wise `Option::or` and
         // therefore associative, so folding this in below reproduces the documented
         // builtin < defaults < preset < explicit precedence exactly.
+        //
+        // Note a preset counts as part of this layer, and may legally supply `codec` and
+        // `dsd` there — that is exactly what makes the one-line `preset = "sacd"` work.
+        // Anyone narrowing `own` to mean "explicit fields only" breaks that preset.
         let own = match raw.preset.as_deref() {
             Some(preset_name) => {
                 let layer = preset(preset_name)?;
@@ -529,7 +627,21 @@ impl Config {
         if dsd.is_some() && own.format.is_some() {
             bail!(
                 "target '{name}': 'format' has no meaning for a DSD target — the \
-                 sigma-delta modulator is the quantizer. Remove it; use 'dsd' to pick the rate"
+                 sigma-delta modulator is the quantizer. Remove it; use 'dsd' to pick the \
+                 rate. (Every PCM preset sets 'format', so no preset other than 'sacd' can \
+                 be combined with a DSD codec.)"
+            );
+        }
+        // The bext chunk is a WAV (RIFF) extension, so it is meaningless anywhere else —
+        // but this is the same own-layer question as `format` above, and it used to be
+        // asked of the merged value. `[defaults] bwf = true` is a reasonable baseline in a
+        // broadcast-oriented config, and against the merged value it turned every FLAC,
+        // MP3 or DSD sibling in the same file into a load-time error. Rejected here when
+        // *this* target asked for it; inherited-and-irrelevant is dropped below instead.
+        if own.bwf == Some(true) && codec != OutputCodec::Wav {
+            bail!(
+                "target '{name}': bwf=true is only valid for codec=wav (got codec={})",
+                codec.ext()
             );
         }
 
@@ -551,11 +663,14 @@ impl Config {
             max_limiting_db: merged.max_limiting_db.unwrap(),
             quality: merged.quality.unwrap(),
             dither: merged.dither.unwrap(),
-            dither_strength: merged.dither_strength.unwrap_or(DitherStrength::Normal),
-            dither_correlation: merged.dither_correlation.unwrap_or_default(),
+            dither_strength: merged.dither_strength.unwrap(),
+            dither_correlation: merged.dither_correlation.unwrap(),
             codec,
             dsd,
-            bwf: merged.bwf.unwrap(),
+            // Effective, not requested: an inherited `bwf` that this target never asked for
+            // is dropped for the codecs that have no bext chunk (an explicit one already
+            // failed above). So `bwf` here means "a bext chunk will be written".
+            bwf: merged.bwf.unwrap() && codec == OutputCodec::Wav,
             mp3_bitrate: merged.mp3_bitrate.unwrap(),
             dir: merged.dir.unwrap(),
             naming: merged.naming.unwrap(),
@@ -630,10 +745,10 @@ impl ResolvedTarget {
                 format_tag(self.format)
             );
         }
-        // The bext chunk is a WAV (RIFF) extension; it has no meaning in FLAC/MP3.
-        if self.bwf && self.codec != OutputCodec::Wav {
-            bail!("target '{}': bwf=true is only valid for codec=wav", self.name);
-        }
+        // `bwf` is checked in `resolve_target`, against the target's own layer — see the
+        // comment there. By the time it reaches this struct it is already the effective
+        // value, so there is nothing left to reject.
+        //
         // A DSD target's `rate` is the *intermediate* PCM rate the modulator is fed from,
         // so it has to reach the 1-bit rate by an exact power of two. Anything else means
         // a fractional SRC immediately in front of the most level-sensitive stage in the
@@ -745,7 +860,10 @@ fn builtin_fallback() -> RawTarget {
         quality: Some(ResampleQuality::Vhq),
         dither: Some(DitherMode::Tpdf),
         dither_strength: Some(DitherStrength::Normal),
-        dither_correlation: None,
+        // Populated rather than left to `unwrap_or_default()` in `resolve_target`: the
+        // documented invariant is that every non-optional field is materialized *here*, so
+        // that a forgotten entry panics loudly instead of silently defaulting.
+        dither_correlation: Some(DitherCorrelation::Decorrelated),
         codec: Some(OutputCodec::Wav),
         dsd: None, // DSD-only; a default here would be a trap for every PCM target
         bwf: Some(false),
@@ -758,9 +876,32 @@ fn builtin_fallback() -> RawTarget {
     }
 }
 
-/// Built-in distribution presets. Values reflect each platform's published
-/// loudness-normalization target and can be overridden per-target; they drift
-/// over time, so treat them as sensible starting points, not gospel.
+/// Every built-in preset, in the order the error message offers them.
+///
+/// [`preset`] must have an arm for each name and no arm without one; nothing in the type
+/// system enforces that, so `every_listed_preset_resolves_and_the_error_offers_all_of_them`
+/// in `tests/config_parse.rs` holds the two together. Before this list existed the
+/// valid-name enumeration was a third
+/// hand-maintained copy inside the error string, and adding a preset silently left it stale.
+pub const PRESET_NAMES: [&str; 11] = [
+    "spotify",
+    "apple-music",
+    "youtube",
+    "tidal",
+    "amazon-music",
+    "soundcloud",
+    "cd",
+    "broadcast-ebu-r128",
+    "48k",
+    "hires",
+    "sacd",
+];
+
+/// Built-in delivery presets. For the streaming platforms the values reflect each one's
+/// published loudness-normalization target and can be overridden per-target; they drift
+/// over time, so treat them as sensible starting points, not gospel. `cd` and `sacd` are
+/// not loudness specs at all — they are physical-format bundles that deliberately leave
+/// `lufs` unset.
 fn preset(name: &str) -> Result<RawTarget> {
     use BitDepthFormat::{S16, S24};
 
@@ -785,9 +926,22 @@ fn preset(name: &str) -> Result<RawTarget> {
         "broadcast-ebu-r128" => spec(48_000, S24, Some(-23.0), -1.0),
         "48k" => spec(48_000, S16, Some(-16.0), -1.0),
         "hires" => spec(96_000, S24, Some(-16.0), -0.1),
+        // The one preset that is not PCM, and the only one that cannot use `spec`: it must
+        // set *neither* of the two fields `spec` always sets. `format` is a hard error on a
+        // DSD target (the modulator is the quantizer), and a `rate` would suppress the
+        // derivation of the intermediate PCM rate that is the whole point of the DSD
+        // branch — silently, since the preset layer is folded into the target's own layer
+        // and is therefore indistinguishable from something the user typed.
+        // Like `cd`: a physical format, no loudness standard, so no `lufs`.
+        "sacd" => RawTarget {
+            codec: Some(OutputCodec::Dsf),
+            dsd: Some(DsdRate::Dsd64),
+            ceiling_dbtp: Some(-1.0),
+            ..RawTarget::default()
+        },
         other => bail!(
-            "unknown preset '{other}'; valid presets: spotify, apple-music, youtube, \
-             tidal, amazon-music, soundcloud, cd, broadcast-ebu-r128, 48k, hires"
+            "unknown preset '{other}'; valid presets: {}",
+            PRESET_NAMES.join(", ")
         ),
     })
 }

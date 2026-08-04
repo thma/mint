@@ -6,9 +6,10 @@
 
 ## Stand
 
-**Phase 1 bis 4 abgeschlossen, Phase 5 ist als Nächstes dran.** Alles unten ist umgesetzt
-und grün (193 Tests, 1 ignorierte Messprobe). **DSD ist seit Phase 4 regulär über die
-Config nutzbar** — `codec = "dsf"`, `dsd = "dsd64"`, fertig.
+**Alle fünf Phasen abgeschlossen — die Arbeit ist fertig.** Alles unten ist umgesetzt und
+grün (207 Tests, 1 ignorierte Messprobe). DSD ist seit Phase 4 regulär über die Config
+nutzbar (`codec = "dsf"`, `dsd = "dsd64"`) und seit Phase 5 einzeilig über
+`preset = "sacd"`, mit Größenvorhersage im Dry-Run und vollständiger Doku.
 
 Was existiert:
 
@@ -27,15 +28,10 @@ Was existiert:
 | `tests/dsd_interpolate.rs` | 8 Tests um den Wrapper |
 | `tests/dsd_verification.rs` | Messharness, 10 Tests; Ergebnisse in § 4.1 |
 | `tests/dsd_format.rs` | Container: Golden-Header, Bitreihenfolge, Blockung, Padding, Fremdparser, Ende-zu-Ende; 17 Tests, Ergebnisse in § 4.2 |
-| `tests/dsd_pipeline.rs` | Config + Pipeline: Ratenableitung, Validierung, Dry-Run, `.wav` → `.dsf` Ende-zu-Ende; 15 Tests, Ergebnisse in § 4.3 |
+| `tests/dsd_pipeline.rs` | Config + Pipeline: Ratenableitung, Validierung, Dry-Run, `.wav` → `.dsf` Ende-zu-Ende; 17 Tests, Ergebnisse in § 4.3 |
 | `tests/soxr_dsd_probe.rs` | Durchsatz-/Speicherprobe, `#[ignore]`; Messwerte in § 3.3 |
-
-Was als Nächstes zu bauen ist: **Phase 5** (§ 6) — `sacd`-Preset, Dateigrößenschätzung im
-Dry-Run, optional ID3v2, und vor allem die Doku: `README.md` (Defaults-Tabelle, Abschnitt
-„Audio quality → DSD"), `examples/mint.toml` (per `include_str!` das Bootstrap-Template)
-und `CLAUDE.md`. **Diese drei sind in Phase 4 bewusst nicht angefasst worden**, obwohl die
-Checkliste in `CLAUDE.md` die README-Tabelle als vertraglich führt — sie stehen im Plan
-unter Phase 5, zusammen mit dem Preset, das sie beschreiben sollen.
+| `tests/output_size.rs` | Phase 5: die Dry-Run-Größenvorhersagen gegen echte Dateien, plus der Header-Probe; 9 Tests, Ergebnisse in § 4.4 |
+| `README.md`, `examples/mint.toml`, `CLAUDE.md` | Phase 5: DSD dokumentiert; das Preset, die Größen, die Pegelkonvention, die Ratenableitung und die beiden Spec-Abweichungen |
 
 Arbeitsweise in diesem Repo: direkt auf `main`, Commits macht Thomas selbst.
 
@@ -54,7 +50,9 @@ Arbeitsweise in diesem Repo: direkt auf `main`, Commits macht Thomas selbst.
 | Füllmuster im letzten Block | **0x69 statt der spezifizierten 0x00**, und `sampleCount` **zählt die Polsterung mit** — hergeleitet und gemessen in § 3.4.1 |
 | Kanaltyp | Aus der Kanalzahl abgeleitet (1/2/3/quad/5/5.1); mint kennt kein Layout, ein `channels`-Feld gäbe es später |
 | ffmpeg-Gegenprobe | **Entfällt** — auf der Entwicklungsmaschine ist kein ffmpeg installiert. Ersatz: das fremde `dsf`-Crate als Dev-Dependency plus ein im Test unabhängig geschriebener Entpacker |
-| `[defaults]` vs. DSD-Target | `format`, `rate` und `dsd` werden für die Kollisions- und Sinnprüfung aus der **eigenen Schicht** des Targets gelesen (Preset + explizit), nicht aus `[defaults]` — hergeleitet in § 3.5.1 |
+| `[defaults]` vs. DSD-Target | `format`, `rate` und `dsd` werden für die Kollisions- und Sinnprüfung aus der **eigenen Schicht** des Targets gelesen (Preset + explizit), nicht aus `[defaults]` — hergeleitet in § 3.5.1. In Phase 5 kam `bwf` dazu (§ 6, Phase 5) |
+| ID3v2 im DSF | **Verworfen**, nicht verschoben — begründet in § 3.4.2. `metadataPtr` bleibt 0, was spec-konform ist |
+| Größenschätzung im Dry-Run | **Für alle Codecs**, nicht nur DSD, mit qualifizierter Genauigkeit (exakt / `~` / `<=`) — § 3.7 |
 
 ---
 
@@ -552,6 +550,34 @@ nachschiebt, bekommt dieselben vollen Blöcke ohne jede Spleißstelle — der Sc
 läuft durch. Genau das soll die Blockschleife in Phase 4 tun; `tests/dsd_format.rs` macht es
 im Ende-zu-Ende-Test bereits vor.
 
+#### 3.4.2 ID3v2: verworfen, nicht verschoben
+
+Phase 5 führte „optional ID3v2" als Kür. Umgesetzt ist es nicht, und zwar bewusst.
+
+Der Grund ist nicht Aufwand — der Writer-Teil sind rund 40 Zeilen: ein
+`OFF_METADATA_POINTER = 20`, ein `with_id3()`-Builder analog zu `with_pad_byte`, das Tag
+hinter die Nutzdaten, `totalFileSize` schließt es ein, `dataChunkSize` nicht. Ein minimaler
+ID3v2.3-Tag mit einem TSSE-Frame sind 31 Byte, und das fremde `dsf`-Crate im Test parst ihn
+mit, wäre also gratis Gegenprobe. Das wurde ausprobiert und funktioniert.
+
+Der Grund ist, dass **mint nichts hat, was in so ein Tag gehörte.** Es gibt in der ganzen
+Pipeline kein Titel-, Interpreten- oder Albumfeld: `SourceInfo` trägt Pfad, Kanäle, Rate und
+ein hartkodiertes `"decoded"`, `[meta] name` ist ein Label für den *Lauf* (in einem
+Batch über zwölf Dateien wäre es als TALB schlicht falsch), und die Tags, die symphonia beim
+Einlesen bereits parst, wirft `io_read` eine Zeile später weg. Ehrlich schreibbar wäre genau
+`TSSE = "mint 0.1.0"` — etwas, das kein Player anzeigt und kein Downloadshop einliest.
+
+Dazu kommt der Preis auf der Testseite: `file_len - 92 == payload` ist eine Redewendung, die
+in `tests/dsd_format.rs` und `tests/dsd_pipeline.rs` acht Zusicherungen trägt, plus der von
+Hand geschriebene Golden-Header. Für 31 Byte Provenienz ist das der falsche Handel.
+
+Wenn Metadaten kommen, dann als **codec-übergreifendes Feature**, das bei `io_read`
+anfängt (die verworfenen Quelltags behalten) und bexts Description, ein FLAC
+VORBIS_COMMENT und ein MP3-ID3 genauso bedient. Diese Hälfte zuerst zu bauen hieße, das
+Datenmodell unter der Nebenbedingung einer Container-Eigenheit zu entwerfen. `metadataPtr`
+bleibt 0; die Spezifikation erlaubt das ausdrücklich, und der Zeiger ist in § 3.4
+dokumentiert, falls es später doch jemand macht.
+
 **DFF/DSDIFF** (Philips, Big-Endian, `FRM8`-Form): interleaved statt planar, **MSB
 first**, Chunks `FVER`/`PROP`(`FS`,`CHNL`,`CMPR`,`ABSS`,`LSCO`)/`DSD `. **Entschieden:
 vorerst nicht.** DSF ist das, was Player und Downloadshops erwarten, und es trägt
@@ -586,7 +612,8 @@ Validierung (`validate_fields`):
   — bei einem neuen Feld können wir es gleich streng machen)
 - explizites `rate` muss die DSD-Rate ganzzahlig und als Zweierpotenz teilen
 - `bwf = true` bei DSD → Fehler (analog zur bestehenden WAV-only-Regel)
-- DSD512 nur mit Hinweis (Formatspezifikation listet es, Player-Unterstützung ist dünn)
+- DSD512 nur mit Hinweis (die DSF-Spezifikation nennt nur DSD64 und DSD128, alles darüber
+  ist eine De-facto-Erweiterung, und die Player-Unterstützung ist dünn)
 
 Preset-Vorschlag: `"sacd"` = DSD64/DSF, kein `lufs` (wie `cd`), `ceiling_dbtp = -1.0`.
 
@@ -644,7 +671,94 @@ der Ceiling-Wert nahelegt (§ 4.3). Das ist die richtige Zahl für den Zweck (di
 der Schleife hängt am momentanen Pegel am Quantisiererknoten), aber wer sie gegen
 `10^(ceiling/20)/2` hält, findet eine Abweichung, die keine ist.
 
-### 3.7 Neue Dateien
+### 3.7 Größenvorhersage im Dry-Run (Phase 5)
+
+Der Anlass steht in der Risikotabelle: DSD512 sind ~1,7 GB pro fünf Stereominuten, und das
+erfährt man besser vor als nach dem Encode. Umgesetzt ist es aber **für alle Codecs**, weil
+der teure Teil ohnehin gemeinsam ist — der Frame-Count der Quelle — und weil eine Zahl, die
+nur bei einem Codec erscheint, wie ein Sonderfall aussieht statt wie eine Eigenschaft des
+Dry-Runs.
+
+Die Genauigkeit ist pro Codec verschieden, und weil sie das ist, trägt sie ein Qualifikat
+(`SizeEstimate::Exact | About | AtMost`, gedruckt als nichts / `~` / `<=`):
+
+| Codec | Aussage | warum |
+|---|---|---|
+| WAV, DSF | exakt | jede Stufe dazwischen hat einen deterministischen Längenvertrag |
+| MP3 | `~` | CBR mal Dauer; LAME hängt einen Xing-Frame an und polstert den letzten |
+| FLAC | `<=` | die echte Größe entsteht erst beim Encodieren; typisch 50–70 % davon |
+
+Eine Schätzung mit `~` wäre für DSD eine *schlechtere* Antwort auf „passt das noch": die
+Kette ist `source_frames → round(× pcm_rate/source_rate) → × interpolation →
+div_ceil(32768) → 92 + Blöcke·4096·Kanäle`, und jedes Glied ist exakt. Nachgemessen:
+0,25 s / 96 kHz / Stereo nach DSD64 sagt 180 316 Byte voraus, `ls -l` sagt 180 316.
+
+Zwei Dinge, die dabei aufgefallen sind:
+
+**Die Byte-Rechnung gehört neben den Writer, nicht in den Dry-Run.** `dsf_file_bytes` liegt
+in `io_write_dsd` und wird von `DsfWriter::finish` *selbst* benutzt — die Vorhersage und die
+geschriebene Datei können damit nicht auseinanderlaufen, sondern nur gemeinsam falsch sein,
+und das fängt der Test. Dasselbe Muster für `wav_file_bytes` (die Header-Größe hängt daran,
+ob hound `PCMWAVEFORMAT` oder `WAVEFORMATEXTENSIBLE` schreibt: 44 vs. 68 Byte, und 56 für
+den handgeschriebenen f64-Pfad).
+
+**symphonias AIFF-Frame-Zahl ist um `floor(8 / block_align)` zu hoch.** Der SSND-Reader
+konsumiert die 8 Byte `offset`/`blockSize`, gibt aber die volle Chunk-Länge an
+`append_data_params` weiter — 16-Bit-Stereo meldet 24 002 statt 24 000, Mono 24 004. Bei WAV
+gibt es dieses Präambel-Problem nicht, dort stimmt die Zahl. `probe_source` korrigiert das,
+und `tests/output_size.rs` hält beide Container-Familien fest: wird der Fehler upstream
+behoben, schlägt der Test in die andere Richtung aus, statt still eine neue Abweichung
+einzubauen. Dazu ein Deckel auf die Dateigröße, weil ein per Pipe geschriebenes WAV
+`0xFFFFFFFF` als Data-Chunk-Länge trägt und sonst eine Terabyte-„Schätzung" ergäbe.
+
+Drei Nachbesserungen daran kamen aus dem Review, und alle drei hingen an derselben Stelle —
+die Rahmenbreite, aus der sowohl die AIFF-Korrektur als auch der Deckel gerechnet werden:
+
+- **symphonia setzt `bits_per_sample` für jedes PCM-Format außer 64-Bit-Float.** Genau dort
+  war der Deckel also wirkungslos: ein per Pipe geschriebenes f64-WAV von 1,5 MB meldete
+  268 435 455 Frames. Die Breite steht in dem Fall nur im Codec-Typ (`PCM_F64LE/BE`), und da
+  mint f64-Eingaben ausdrücklich als bit-exakten Durchreichfall führt, wird sie von dort
+  geholt statt drumherum degradiert. Zusätzlich ein Fußboden von einem Byte pro Kanal, damit
+  ein künftiges unbekanntes Format wieder nur eine lockere Schranke bekommt statt Terabytes.
+- **Die Container-Familie wird jetzt an der Magic entschieden, nicht an der Endung.**
+  `is_supported_input` akzeptiert `.wav` und `.aiff` für beide Inhalte; die Endung als
+  Kriterium wandte die SSND-Korrektur auf ein WAV namens `.aiff` an (2 Frames zu wenig) und
+  ließ sie bei einem AIFF namens `.wav` aus (2 zu viel) — beides dann als *exakte* Größe
+  gedruckt. Vier Byte lesen und zurückspulen kostet nichts.
+- **Ohne bekannte Rahmenbreite meldet ein AIFF gar keine Frame-Zahl mehr.** Die Korrektur
+  ließe sich dann nicht rechnen, und eine unkorrigierte Zahl würde als exakt ausgewiesen.
+  Lieber keine Größe als eine falsche.
+
+Und zwei an den lossy/lossless-Schätzern selbst:
+
+- **LAME hält sich nicht an die verlangte Bitrate.** `write_mp3` setzt nur die
+  Eingangsrate, also wählt LAME die MPEG-Version daraus und *klemmt* die Bitrate
+  anschließend still in die Tabelle dieser Version: unter 32 kHz ist bei 160 kbps Schluss
+  (MPEG-2), unter 16 kHz bei 64 (MPEG-2.5). Ein 22,05-kHz-Target auf dem 320-Default liefert
+  also exakt die Hälfte, und die Schätzung lag um 100 % daneben (1 201 024 vorhergesagt,
+  600 293 geschrieben). `effective_mp3_bitrate` bildet die Klemmung jetzt nach; gegengeprüft
+  an echten Encodes bei 96 kHz/320 (200 640 vs. ~201 000) und 22,05 kHz/320 (100 310 vs.
+  ~101 000). Nebenbefund, nicht behoben: die Report-Zeile nennt weiterhin die *verlangte*
+  Bitrate — eine ältere Ungenauigkeit, für die diese Funktion die Grundlage wäre.
+- **Die FLAC-Obergrenze war keine.** Der Aufschlag war eine feste Konstante von 8 kB, der
+  echte Overhead wächst aber linear (~11 Byte pro 4096er-Block, also ~128 B/s bei 48 kHz
+  Stereo). Bei inkompressiblem Material war das Budget nach ~64 s aufgebraucht und die
+  „Obergrenze" wurde ab da überschritten (60 s: 534 B darunter, 65 s: 106 B darüber). Der
+  Term ist jetzt proportional, und der Test misst 75 s Rauschen statt 0,5 s Sinus — ein
+  Sinus komprimiert auf ~40 % und konnte die Grenze nie erreichen, weshalb die Konstante
+  überhaupt durchs Review kam.
+
+**Ein Defekt, der dabei aufgefallen und *nicht* behoben ist**, weil er nicht zu dieser
+Phase gehört: `flacenc` bläht *limitiertes* Vollpegel-Rauschen bei s24 um das ~13,6-fache
+auf, statt auf Verbatim-Frames zurückzufallen (1 s Stereo: 264 600 B PCM → 3 607 497 B
+FLAC). Reproduzierbar auch, wenn man die limitierte WAV-Datei erst schreibt und in einem
+zweiten Lauf ohne Limiter encodiert — es liegt also am Inhalt, nicht am Pufferzustand.
+Gewöhnliches Programmmaterial ist nicht betroffen (derselbe Sinus: 0,44–0,66 × PCM), und
+unlimitiertes Rauschen auch nicht (1,0006 ×, also Verbatim). Solange das offen ist, kann
+die `<=`-Zusage in genau diesem Fall gebrochen werden; der Kopf von `flac_max_file_bytes`
+sagt das ausdrücklich.
+
+### 3.8 Neue Dateien
 
 ```
 src/ops/dsd/mod.rs          Orchestrierung der Blockschleife, DsdRate-Enum, Ratenableitung  [fertig]
@@ -862,6 +976,32 @@ Ursache liegt in `loudness::apply`, nicht im DSD-Pfad.
 
 ---
 
+### 4.4 Ergebnis (Phase 5, 2026-08-04, Apple Silicon)
+
+`tests/output_size.rs`, 9 Tests, davon einer nur mit `--features mp3`, plus zwei neue in
+`tests/dsd_pipeline.rs` und vier in `tests/config_parse.rs`.
+
+| Prüfung | Ergebnis |
+|---|---|
+| Vorhergesagte vs. geschriebene WAV-Größe, 6 Kombinationen aus Kanälen und Format | byte-gleich |
+| dasselbe mit `bwf = true` (bext ist variabel lang) | byte-gleich |
+| FLAC unter seiner Obergrenze, Obergrenze nicht sinnlos weit | 55 643 ≤ 152 192 B |
+| FLAC, 75 s inkompressibles Rauschen (der Fall, an dem die feste Konstante brach) | unter der Grenze, Grenze < 1 % über der Nutzlast |
+| MP3 gegen einen echten LAME-Lauf, 48 kHz | < 5 % |
+| MP3-Bitratenklemmung 48 k/44,1 k/24 k/22,05 k/12 k | 320 / 128 / 160 / 160 / 64 kbps |
+| DSF: Vorhersage == `report.file_bytes` == Datei auf Platte | byte-gleich |
+| Frame-Zahl aus dem Header: WAV, AIFF Stereo, AIFF Mono | 24 000 / 24 000 / 24 000 (roh: 24 000 / 24 002 / 24 004) |
+| WAV mit `0xFFFFFFFF`-Data-Chunk (Pipe-Ausgabe), s16/s24/f32/f64 | alle vier auf die Dateigröße gedeckelt |
+| Vertauschte Endung: WAV als `.aiff`, AIFF als `.wav` | beide korrekt, die Magic entscheidet |
+| `preset = "sacd"` vs. dieselben drei Felder von Hand, Ende zu Ende | bytegleiche `.dsf` |
+| Jeder Name in `PRESET_NAMES` löst auf und steht in der Fehlermeldung | 11/11 |
+
+Und die Gegenprobe an einer echten Datei (2 s / 96 kHz / s24 / Stereo, alle Targets in
+einem Lauf): `cd` 352 844, `hires` 1 152 068, `sacd` 1 417 308, `sacd512` 11 296 860 Byte
+vorhergesagt — und exakt so auf der Platte.
+
+---
+
 ## 5. Risiken & offene Punkte
 
 | Risiko | Bewertung | Umgang |
@@ -873,14 +1013,14 @@ Ursache liegt in `loudness::apply`, nicht im DSD-Pfad.
 | ~~Container falsch geschrieben (off-by-12, Bitreihenfolge)~~ | **erledigt** | § 4.2: Golden-Header, drei Größenfelder gegen die Datei auf Platte, Fremdparser, unabhängiger Entpacker |
 | Polsterung des letzten Blocks | gering, aber abweichend | Bewusste Abweichung von Annotation 3, gemessen begründet (§ 3.4.1). Wenn lückenlose Albumfolgen ein Thema werden, ist das die Stelle |
 | Rechenzeit | gering | DSD64 ~Sekunden, DSD256 ~1–2 min/Titel/Kern, DSD512 entsprechend mehr; parallel über Kanäle und Jobs (rayon existiert) |
-| Dateigrößen (DSD512: ~1,7 GB / 5 min) | gering, aber sichtbar | Größe vorab in `--dry-run` ausweisen — **offen, Phase 5**; im Report steht sie bereits (`file_bytes`) |
+| ~~Dateigrößen (DSD512: ~1,7 GB / 5 min)~~ | **erledigt** | `--dry-run` weist die Größe vorab aus, für DSD exakt (§ 3.7, § 4.4) |
 | f64-Puffer-Invariante | **erledigt** | Streaming bleibt auf die DSD-Stufe begrenzt; der PCM-Pfad ist unberührt, und `bitdepth::apply` liegt jetzt strukturell im WAV/FLAC-Arm, kann also gar nicht mehr vor den Modulator geraten |
 | ~~Catch-all-Arme in `describe()`/`pipeline.rs`~~ | **erledigt** | Beide Matches sind vollständig, Regressionstest in § 4.3 |
 | DSD512-Kompatibilität | **erledigt** | Erlaubt, und der Dry-Run schreibt „limited player support" dazu |
 
 Bewusst **nicht** im Scope: DFF/DSDIFF (später, s. § 3.4), DST-Kompression,
 SACD-Image-Authoring, DSD-**Eingabe** (Lesen von DSF/DFF), DoP, 48-kHz-basiertes DSD
-(3,072 MHz) und Multibit-„DSD-wide".
+(3,072 MHz), Multibit-„DSD-wide" und ID3v2 im DSF (§ 3.4.2).
 
 Wenn DSD-Eingabe später gewünscht ist, ist der Dezimator aus Phase 0 bereits da — das
 wäre dann ein kleiner Zusatzschritt, kein zweites Projekt.
@@ -964,15 +1104,47 @@ Nicht gemacht, bewusst: ID3v2 im DSF (steht in Phase 5), DFF (§ 3.4).
 Nicht gemacht, bewusst: `sacd`-Preset, README, `examples/mint.toml`, `CLAUDE.md`. Die
 stehen unten in Phase 5, zusammen mit dem Preset, das sie beschreiben sollen.
 
-### Phase 5 — Preset, Doku, Feinschliff · 1–1,5 Tage · Risiko: gering
-`sacd`-Preset, geschätzte Dateigröße im `--dry-run`, optional ID3v2 im DSF. README
-(Defaults-Tabelle, Abschnitt „Audio quality → DSD"), `examples/mint.toml` (ist per
-`include_str!` das Bootstrap-Template — Änderung dort ändert die Datei, die `mint` ohne
-Config anlegt), `CLAUDE.md` (neues Subsystem, neue Invariante „die DSD-Stufe streamt, der
-PCM-Pfad nicht"; und die Codec-Checkliste dort erwähnt die beiden Catch-alls, die es nicht
-mehr gibt).
+### ~~Phase 5 — Preset, Doku, Feinschliff~~ · **abgeschlossen**
+1. ✅ `sacd`-Preset: `dsf` + `dsd64` + `ceiling_dbtp = -1,0`, ohne `format` und ohne
+   `rate`. Dazu `PRESET_NAMES` — die Liste gültiger Namen in der Fehlermeldung war eine
+   dritte handgepflegte Kopie der Preset-Tabelle und wird jetzt aus einer Konstante
+   erzeugt, die ein Test gegen die `match`-Arme hält.
+2. ✅ Größenvorhersage im `--dry-run`, für alle Codecs, mit Genauigkeitsqualifikat
+   (§ 3.7). Dafür `probe_source_rate` → `probe_source` (Rate, Frames, Kanäle aus dem
+   Header, ohne Decode) und je eine Größenfunktion neben ihrem Writer.
+3. ✅ Doku: `README.md` (Feature-Liste, Config-Beispiel, Preset- und Defaults-Tabelle,
+   Codec-Regeln, `--json`-Schema, ein eigener Abschnitt „DSD (1-bit / SACD)" mit
+   Pegelkonvention, Ratentabelle, Messwerten und den Spec-Abweichungen),
+   `examples/mint.toml` (ein `sacd`-Target, korrigierte Platzhalterliste),
+   `CLAUDE.md` (DSD-Subsystem, Streaming-Invariante, „quantize exactly once" als
+   Ein-Quantisierer-pro-Zweig, `create_soxr` als einzige Konstruktionsstelle,
+   Codec-Checkliste mit den drei erschöpfenden `match`es).
+4. ✅ ID3v2: **verworfen statt verschoben**, begründet in § 3.4.2.
 
-Was hier *nicht* mehr nötig ist: „DSD128/256/512 scharfschalten". Alle vier Raten haben
+**Abweichungen und Nebenbefunde:**
+
+- **`bwf` gehörte in dieselbe Schichtenregel wie `format`/`rate`** (§ 3.5.1) und war
+  übersehen worden: die Prüfung las den gemergten Wert, weshalb ein
+  `[defaults] bwf = true` — in einer broadcastlastigen Config völlig normal — *jedes*
+  FLAC-, MP3- und DSD-Geschwister zum Ladefehler machte. Vorher nur theoretisch, mit dem
+  einzeiligen `preset = "sacd"` einen Tippfehler entfernt. Jetzt: abgelehnt, wenn das
+  Target es selbst verlangt, sonst fallengelassen (`ResolvedTarget.bwf` heißt damit „es
+  wird ein bext geschrieben", nicht „es wurde gewünscht").
+- **`builtin_fallback()` populiert wieder jedes Feld.** `dither_correlation` stand dort auf
+  `None` und wurde in `resolve_target` per `unwrap_or_default()` materialisiert — das ist
+  genau die Absicherung, die `CLAUDE.md` als Invariante führt („vergessenes Feld = Panik,
+  nicht stiller Default"), und sie war für ein Feld ausgehebelt. Zwei Zeilen, damit die
+  Checkliste wieder von etwas erzwungen wird.
+- **Kein Preset außer `sacd` funktioniert mit `codec = "dsf"`**, weil alle zehn PCM-Presets
+  `format` setzen und das in der eigenen Schicht landet. Das ist richtig so, aber die
+  Fehlermeldung nannte nur `format`; sie sagt den Zusammenhang jetzt dazu, und der README
+  warnt vorab.
+- **Kanal-Vorabprüfung im Dry-Run:** DSF kann höchstens 6 Kanäle, die Config kennt die
+  Kanalzahl der Quelle aber nicht — eine 7.1-Datei plante sauber und starb erst nach
+  Loudness und Resample. Da der Probe die Kanalzahl jetzt ohnehin liefert, sagt der
+  Dry-Run es vorher.
+
+Was hier *nicht* mehr nötig war: „DSD128/256/512 scharfschalten". Alle vier Raten haben
 seit Phase 2 eine eigene, gemessene NTF (§ 4.1) und sind über die Config erreichbar; die
 Modulationsindex-Warnung steht seit Phase 4.
 

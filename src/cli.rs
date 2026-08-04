@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
-use crate::audio::io_read;
+use crate::audio::{io_read, io_write_dsd};
 use crate::config::{Config, ResolvedTarget};
 use crate::json_report;
 use crate::pipeline::{self, ProcessingReport, TaskFailure};
@@ -245,19 +245,57 @@ fn print_dry_run(inputs: &[PathBuf], targets: &[ResolvedTarget]) -> Result<()> {
         targets.len()
     );
     for input in inputs {
-        // Probe the source rate so the planned chain can show whether resampling is needed.
-        let source_rate = io_read::probe_source_rate(input)
+        // Header only: the planned chain needs the rate, the planned size needs the frame
+        // and channel counts, and none of it is worth a decode.
+        let probe = io_read::probe_source(input)
             .with_context(|| format!("failed to probe {}", input.display()))?;
+        let source_rate = probe.sample_rate;
         println!("\n{} [{} Hz]", input.display(), source_rate);
         for target in targets {
             let output = target.render_output_path(input, target.delivery_rate(source_rate))?;
-            println!("  [{}] -> {}", target.name, output.display());
+            // Sizes are the reason this is worth printing at all: a five-minute DSD512
+            // stereo track is ~1.7 GB, which is better learned here than after the encode.
+            let size = probe
+                .frames
+                .zip(probe.channels)
+                .and_then(|(frames, channels)| {
+                    target.estimated_output_bytes(source_rate, frames, channels)
+                })
+                .map(|est| format!("  ({}{})", est.qualifier(), fmt_bytes(est.bytes())))
+                .unwrap_or_default();
+            println!("  [{}] -> {}{}", target.name, output.display(), size);
             for step in target.describe(source_rate) {
                 println!("      - {step}");
+            }
+            // The DSF writer's channel limit is the one thing a config cannot be validated
+            // against at load time (it does not know the input), so a 7.1 source into a
+            // DSD target currently fails only after the loudness and resample work.
+            if target.codec.is_dsd()
+                && let Some(channels) = probe.channels
+                && channels > io_write_dsd::MAX_CHANNELS
+            {
+                println!(
+                    "      ! {channels} channels exceeds the DSF limit of {} — this target will fail",
+                    io_write_dsd::MAX_CHANNELS
+                );
             }
         }
     }
     Ok(())
+}
+
+/// Byte count for humans. `MB` is 10^6, matching how storage and DSD data rates are
+/// quoted. Both ends need a step: DSD512 files run into the gigabytes, and a short clip
+/// would otherwise be reported as "0.0 MB".
+fn fmt_bytes(bytes: u64) -> String {
+    let mb = bytes as f64 / 1_000_000.0;
+    if mb >= 1000.0 {
+        format!("{:.2} GB", mb / 1000.0)
+    } else if mb < 1.0 {
+        format!("{:.0} kB", bytes as f64 / 1000.0)
+    } else {
+        format!("{mb:.1} MB")
+    }
 }
 
 /// Format a dB/LU/LUFS figure, or "n/a" when the meter returned a non-finite value
@@ -303,14 +341,14 @@ fn print_reports(reports: &[ProcessingReport]) {
         // only place a loop that was driven past what it can track becomes visible.
         if let Some(d) = &report.dsd {
             println!(
-                "    {} via {} Hz x{} | order {} | peak modulation {:.1}% | overload {} | {:.1} MB",
+                "    {} via {} Hz x{} | order {} | peak modulation {:.1}% | overload {} | {}",
                 d.rate,
                 d.intermediate_pcm_rate,
                 d.interpolation_factor,
                 d.modulator_order,
                 d.max_modulation_percent,
                 d.overload_samples,
-                d.file_bytes as f64 / 1_000_000.0,
+                fmt_bytes(d.file_bytes),
             );
         }
         // Loudness metering, source -> delivered (integrated + range), plus the loudest

@@ -29,9 +29,9 @@
 use std::path::{Path, PathBuf};
 
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
-use mint::audio::io_write;
 use mint::audio::io_write_dsd::{BLOCK_BYTES, BLOCK_SAMPLES, HEADER_BYTES};
-use mint::config::Config;
+use mint::audio::{io_read, io_write};
+use mint::config::{Config, SizeEstimate};
 use mint::ops::dsd::DsdRate;
 use mint::ops::dsd::decimate::Decimator;
 use mint::pipeline;
@@ -507,6 +507,63 @@ fn a_dsd_target_writes_dsd_and_never_falls_through_to_the_pcm_path() {
         report.output,
         dsd.file_bytes as f64 / 1e6,
         dsd.max_modulation_percent
+    );
+}
+
+/// The `--dry-run` size for DSD is advertised as exact, not as an estimate — so it has to
+/// be checked against a real file, not against a re-derivation of the same formula. The
+/// chain it predicts through is `source frames -> resample -> interpolate -> whole blocks`,
+/// and a `floor` instead of a `round` anywhere in it is worth 4096 bytes per channel.
+#[test]
+fn the_dry_run_predicts_the_dsd_file_size_exactly() {
+    let dir = tmp("e2e-size");
+    let (report, bytes) = render(&dir, &sacd_config(&dir), "sacd", 96_000);
+
+    let resolved = config(&dir, &sacd_config(&dir)).unwrap().resolve_target("sacd").unwrap();
+    // 0.25 s at 96 kHz, the same master `render` wrote.
+    let estimate = resolved
+        .estimated_output_bytes(96_000, 24_000, 2)
+        .expect("a DSD target must be predictable");
+
+    assert_eq!(estimate, SizeEstimate::Exact(bytes.len() as u64));
+    assert_eq!(estimate.bytes(), report.dsd.as_ref().unwrap().file_bytes);
+
+    // The probe is what feeds those numbers in production; it must read the same master.
+    let probe = io_read::probe_source(Path::new(&report.input)).expect("probe the master");
+    assert_eq!(probe.sample_rate, 96_000);
+    assert_eq!(probe.frames, Some(24_000));
+    assert_eq!(probe.channels, Some(2));
+}
+
+/// The one-line `preset = "sacd"` has to produce the same deliverable as spelling the three
+/// fields out — through config resolution, the pipeline and onto disk.
+#[test]
+fn the_sacd_preset_renders_the_same_file_as_the_spelled_out_target() {
+    let dir = tmp("e2e-preset");
+    let toml = format!(
+        r#"
+        [defaults]
+        dir = "{}"
+
+        [target.spelled]
+        codec        = "dsf"
+        dsd          = "dsd64"
+        ceiling_dbtp = -1.0
+
+        [target.preset]
+        preset = "sacd"
+        "#,
+        dir.display()
+    );
+
+    let (spelled_report, spelled) = render(&dir, &toml, "spelled", 96_000);
+    let (preset_report, from_preset) = render(&dir, &toml, "preset", 96_000);
+
+    assert_eq!(&from_preset[0..4], b"DSD ");
+    assert_eq!(spelled, from_preset, "the preset must be a pure abbreviation");
+    assert_eq!(
+        spelled_report.dsd.as_ref().unwrap().rate,
+        preset_report.dsd.as_ref().unwrap().rate
     );
 }
 

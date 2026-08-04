@@ -13,8 +13,11 @@ name = "mint-masters"
 [defaults]
 dir     = "./out"
 quality = "vhq"            # lq | mq | hq | vhq
-# naming defaults to "{target}/{stem}.wav"
-# placeholders: {stem} {ext} {target} {rate} {format}
+# naming defaults to "{target}/{stem}.{cext}"
+# placeholders: {stem} {ext} {target} {rate} {format} {cext} {dsd}
+#   {cext} is the codec's extension (wav/flac/mp3/dsf); {dsd} is "dsd64"... and
+#   empty for PCM targets. On a DSD target {rate} is the 1-bit rate and {format}
+#   renders "1bit".
 
 # Streaming master from the Apple Music preset (44.1k / s16 / -16 LUFS / -1 dBTP).
 [target.streaming]
@@ -66,7 +69,18 @@ codec       = "mp3"          # lossy: bit depth/dither not applicable
 mp3_bitrate = 320            # default 320; needs `--features mp3`
 lufs        = -14.0
 
-# 8. Limiter character controls (used when on_clip = "limit").
+# DSD / SACD (1-bit). The `sacd` preset is dsd64 + DSF + -1 dBTP and nothing else:
+# `rate` is deliberately unset so the intermediate PCM rate is derived from the source
+# (a 96 kHz master goes 96k -> 88.2k, then x32), and `format` must not be set — the sigma-delta
+# modulator is the quantizer, so there is no bit depth to pick. Add `lufs` if you want
+# loudness normalization; like `cd`, DSD has no loudness standard.
+# Files are large: five stereo minutes is ~212 MB at dsd64 and ~1.7 GB at dsd512.
+# `--dry-run` prints the exact size before you commit to it.
+[target.sacd]
+preset = "sacd"            # -> dsd64 / DSF / -1.0 dBTP
+# dsd  = "dsd128"          # dsd64 | dsd128 | dsd256 | dsd512
+
+# Limiter character controls (used when on_clip = "limit").
 [target.punchy]
 preset                = "spotify"
 limiter_character     = "transient"   # faster adaptive release

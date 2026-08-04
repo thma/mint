@@ -107,6 +107,20 @@ pub const HEADER_BYTES: u64 = 92;
 /// The channel-type table tops out at 5.1.
 pub const MAX_CHANNELS: usize = 6;
 
+/// Size of the file [`DsfWriter`] will produce for `samples_per_channel` samples.
+///
+/// The whole payload is whole 4096-byte blocks per channel, so the count rounds up: a
+/// stream that ends mid-block is filled out either by the caller's modulated silence or by
+/// [`finish`](DsfWriter::finish)'s pad byte, and either way the file is the same size.
+///
+/// Lives here rather than in the dry-run that consumes it so the planned size and the
+/// written size cannot drift — a container change (a metadata chunk, say) has to pass
+/// through this function.
+pub const fn dsf_file_bytes(samples_per_channel: u64, channels: usize) -> u64 {
+    let blocks = samples_per_channel.div_ceil(BLOCK_SAMPLES);
+    HEADER_BYTES + blocks * BLOCK_BYTES as u64 * channels as u64
+}
+
 // Absolute offsets of the fields `finish` patches.
 const OFF_TOTAL_FILE_SIZE: u64 = 12;
 const OFF_SAMPLE_COUNT: u64 = 64;
@@ -263,7 +277,10 @@ impl DsfWriter {
             padding_samples: samples_per_channel - self.audio_samples,
             blocks: self.blocks,
             payload_bytes,
-            file_bytes: HEADER_BYTES + payload_bytes,
+            // Via the shared helper on purpose: it is what `--dry-run` predicts, so routing
+            // the real number through it makes any divergence a test failure rather than a
+            // dry-run that quietly lies.
+            file_bytes: dsf_file_bytes(samples_per_channel, self.channels),
         };
 
         self.patch(OFF_TOTAL_FILE_SIZE, summary.file_bytes)?;

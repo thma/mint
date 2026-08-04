@@ -190,16 +190,18 @@ impl BextMetadata {
         v.extend_from_slice(&[0u8; 180]); // Reserved
         debug_assert_eq!(v.len(), 602);
 
-        // CodingHistory (free ASCII; one line describing the PCM source).
-        let history = format!(
-            "A=PCM,F={},W={},M={},T=mint\r\n",
-            self.sample_rate,
-            self.bits,
-            if self.channels >= 2 { "stereo" } else { "mono" },
-        );
-        v.extend_from_slice(history.as_bytes());
+        v.extend_from_slice(coding_history(self.sample_rate, self.bits, self.channels).as_bytes());
         v
     }
+}
+
+/// CodingHistory (free ASCII; one line describing the PCM source). Split out so the size
+/// prediction below can measure the real string instead of guessing at it.
+fn coding_history(sample_rate: u32, bits: u16, channels: usize) -> String {
+    format!(
+        "A=PCM,F={sample_rate},W={bits},M={},T=mint\r\n",
+        if channels >= 2 { "stereo" } else { "mono" },
+    )
 }
 
 /// Encode one EBU R128 loudness field: value×100 as a signed 16-bit LE integer, or the
@@ -366,4 +368,96 @@ fn map_bitrate(kbps: u32) -> Result<mp3lame_encoder::Bitrate> {
 #[cfg(not(feature = "mp3"))]
 pub fn write_mp3(_path: &Path, _buffer: &AudioBuffer, _bitrate_kbps: u32) -> Result<()> {
     anyhow::bail!("MP3 output requires building with `--features mp3`")
+}
+
+// ---------------------------------------------------------------------------
+// Planned output size — what `--dry-run` prints before anything is written.
+// ---------------------------------------------------------------------------
+//
+// Each function mirrors one writer above and lives next to it for the same reason
+// `dsf_file_bytes` lives next to the DSF writer: a container change that does not pass
+// through here turns the dry-run into a confident lie. The DSD counterpart is
+// `io_write_dsd::dsf_file_bytes`; it is exact, these are not (see each doc comment).
+
+/// Bytes `write_wav` will produce. Exact.
+///
+/// The header is the only subtle part, and it is fixed by what the writers do: hound picks
+/// `PCMWAVEFORMAT` (44 bytes of header) for up to 2 channels at up to 16 bits and
+/// `WAVEFORMATEXTENSIBLE` (68) otherwise, while `encode_wav_f64` hand-writes
+/// `RIFF`+`fmt `+`fact`+`data` = 56.
+pub fn wav_file_bytes(
+    frames: u64,
+    sample_rate: u32,
+    channels: usize,
+    format: OutputSampleFormat,
+    bwf: bool,
+) -> u64 {
+    let bytes_per_sample = u64::from(format.bits_per_sample()) / 8;
+    let header = match format {
+        OutputSampleFormat::F64 => 56,
+        _ if channels > 2 || format.bits_per_sample() > 16 => 68,
+        _ => 44,
+    };
+    let bext = if bwf {
+        // 8-byte chunk header + the 602-byte v2 structure + CodingHistory, word-aligned.
+        // The history is measured, not guessed: its length follows the rate's digit count.
+        let data = 602 + coding_history(sample_rate, format.bits_per_sample(), channels).len() as u64;
+        8 + data + data % 2
+    } else {
+        0
+    };
+    header + bext + frames * channels as u64 * bytes_per_sample
+}
+
+/// Upper bound on what `write_flac` will produce — a lossless codec's real size depends on
+/// the material, so this is the only honest number available before encoding.
+///
+/// FLAC stores a frame verbatim when nothing compresses, so a well-behaved encoder never
+/// meaningfully exceeds the PCM payload; typical masters land at 50–70 % of it. On top of
+/// the payload the bound allows 8 kB for STREAMINFO and the metadata blocks, plus 16 bytes
+/// per 1024 frames for frame headers, subframe headers and CRCs. That second term is the
+/// point: it is *linear*, and a fixed allowance was measured to run out after about a
+/// minute of incompressible material (~11 bytes per 4096-frame block, i.e. ~128 B/s at
+/// 48 kHz stereo), after which the "bound" was quietly no longer one.
+///
+/// Known exception, and it is a defect rather than a modelling gap: `flacenc` expands
+/// *limited* full-scale high-entropy 24-bit material by ~14x instead of falling back to
+/// verbatim frames (`docs/dsd-design.md` § 3.7). Ordinary program material and unlimited
+/// noise both stay inside the bound.
+pub fn flac_max_file_bytes(frames: u64, channels: usize, bits_per_sample: u16) -> u64 {
+    let payload = frames * channels as u64 * (u64::from(bits_per_sample) / 8);
+    8_192 + frames.div_ceil(1_024) * 16 + payload
+}
+
+/// Bytes `write_mp3` will produce, approximately: CBR makes this duration × bitrate, but
+/// LAME emits a Xing/LAME info frame and the last frame is padded, so the real file lands a
+/// few kB above.
+pub fn mp3_file_bytes(frames: u64, sample_rate: u32, bitrate_kbps: u32) -> u64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    let seconds = frames as f64 / f64::from(sample_rate);
+    let bitrate = effective_mp3_bitrate(sample_rate, bitrate_kbps);
+    1_024 + (seconds * f64::from(bitrate) * 1000.0 / 8.0) as u64
+}
+
+/// The bitrate LAME will actually use, which is not always the one that was asked for.
+///
+/// `write_mp3` sets only the input rate, so LAME picks the MPEG version from it — and then
+/// silently clamps the bitrate into that version's table. Below 32 kHz that is MPEG-2,
+/// which stops at 160 kbps, and below 16 kHz MPEG-2.5, which stops at 64. A 22.05 kHz
+/// target left at the 320 kbps default therefore delivers exactly half of what the
+/// requested bitrate implies, with no error and no warning.
+///
+/// Note the per-file report still quotes the *requested* bitrate in its format tag; that
+/// is a separate, older inaccuracy, and this function is what a fix for it would use.
+pub fn effective_mp3_bitrate(sample_rate: u32, requested_kbps: u32) -> u32 {
+    // LAME rounds the output rate up to the nearest one MPEG supports, so the version
+    // boundaries sit at the top of each family: 12 kHz for MPEG-2.5, 24 kHz for MPEG-2.
+    let ceiling = match sample_rate {
+        0..=12_000 => 64,
+        12_001..=24_000 => 160,
+        _ => 320,
+    };
+    requested_kbps.min(ceiling)
 }
