@@ -165,7 +165,7 @@ pub fn encode_dsf(
         )
     })?;
 
-    let mut src = SoxrStream::new(pcm_rate, rate.hz(), channels, quality)?;
+    let mut src = SoxrStream::new_power_of_two(pcm_rate, rate.hz(), channels, quality)?;
     let mut mods: Vec<Modulator> = (0..channels)
         .map(|c| Modulator::for_channel(rate, seed, c))
         .collect();

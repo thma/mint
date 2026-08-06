@@ -16,7 +16,7 @@ Was existiert:
 | Datei | Rolle |
 |---|---|
 | `src/ops/dsd/mod.rs` | `DsdRate`, die Ratenableitung (`intermediate_pcm_rate`, `interpolation_factor`) und **`encode_dsf`** — die Blockschleife, die Interpolator, Modulator und Writer verbindet |
-| `src/ops/dsd/interpolate.rs` | `SoxrStream` — eine libsoxr-Instanz pro Datei, blockweise gefüttert; bit-identisch zum One-Shot-Pfad |
+| `src/ops/dsd/interpolate.rs` | `SoxrStream` — eine libsoxr-Instanz pro Datei, blockweise gefüttert; bit-identisch zum One-Shot-Pfad. Inzwischen **nicht mehr DSD-exklusiv**: `ops::resample::apply` treibt seine PCM-Konvertierungen durch dieselbe Struktur, damit auch dort kein ganzdateigroßes Interleave-Scratch mehr anfällt. Die Zweierpotenz-Bedingung sitzt deshalb auf `new_power_of_two` (nur `encode_dsf`), nicht auf `new` |
 | `src/ops/dsd/modulator.rs` | 1-Bit-Sigma-Delta, CIFB **Ordnung 7**, NTF-Tabelle pro Rate, Komparator-Dither, Zustandsbegrenzung, Overload-Zähler |
 | `src/ops/dsd/decimate.rs` | DSD → PCM, Halfband-Kaskade — reines Messwerkzeug, aus keinem Ausgabepfad erreichbar |
 | `src/ops/dsd/pack.rs` | Bit-Packing, Bitreihenfolge als Parameter; `DSD_SILENCE` (0x69) |

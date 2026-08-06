@@ -219,12 +219,18 @@ fn empty_blocks_are_harmless() {
 fn non_power_of_two_ratio_is_rejected() {
     // 48k -> DSD64 is 58.8:1. The rate derivation is supposed to prevent this; if it ever
     // lets one through, failing loudly beats writing a subtly wrong-length file.
-    let err = SoxrStream::new(48_000, DSD64, 2, Some(ResampleQuality::Vhq))
+    //
+    // The guard is on `new_power_of_two`, not `new`: the PCM resampler drives the same
+    // stream and legitimately runs irrational ratios, so the DSD-specific constraint has
+    // to sit on the DSD-specific constructor. `encode_dsf` is the only caller of it.
+    let err = SoxrStream::new_power_of_two(48_000, DSD64, 2, Some(ResampleQuality::Vhq))
         .expect_err("48k -> DSD64 must be rejected");
     assert!(
         err.to_string().contains("power-of-two"),
         "unhelpful error: {err}"
     );
+    SoxrStream::new(48_000, DSD64, 2, Some(ResampleQuality::Vhq))
+        .expect("the unconstrained constructor must still accept it");
 }
 
 #[test]

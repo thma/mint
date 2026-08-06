@@ -72,6 +72,9 @@ impl std::fmt::Debug for SoxrStream {
 }
 
 impl SoxrStream {
+    /// A stream at any ratio libsoxr accepts. `ops::resample` drives its one-shot
+    /// conversions through this too, so the interleaved scratch there is one block rather
+    /// than the whole file.
     pub fn new(
         in_rate: u32,
         out_rate: u32,
@@ -85,7 +88,7 @@ impl SoxrStream {
             bail!("SoxrStream needs non-zero rates (got {in_rate} -> {out_rate})");
         }
 
-        let soxr = create_stream_soxr(in_rate, out_rate, channels, quality)?;
+        let soxr = resample::create_soxr(in_rate as f64, out_rate as f64, channels, quality)?;
         // Query before any processing: this is the steady-state latency, and after the
         // first `process` call libsoxr reports the *current* fill instead.
         let priming_left = soxr.delay().round() as usize;
@@ -247,18 +250,23 @@ impl SoxrStream {
     }
 }
 
-/// Wrap `create_soxr` with the one thing that is DSD-specific: the ratio must be an exact
-/// power of two. Everything upstream (the intermediate-rate derivation) guarantees it, so
-/// a violation is a programming error, not user input — but it is worth catching here,
-/// because the failure mode otherwise is a subtly wrong-length file rather than an error.
-fn create_stream_soxr(
-    in_rate: u32,
-    out_rate: u32,
-    channels: usize,
-    quality: Option<ResampleQuality>,
-) -> Result<Soxr> {
-    if !out_rate.is_multiple_of(in_rate) || !(out_rate / in_rate).is_power_of_two() {
-        bail!("DSD interpolation needs a power-of-two ratio, got {in_rate} -> {out_rate}");
+impl SoxrStream {
+    /// [`SoxrStream::new`] plus the one thing that is DSD-specific: the ratio must be an
+    /// exact power of two. Everything upstream (the intermediate-rate derivation)
+    /// guarantees it, so a violation is a programming error, not user input — but it is
+    /// worth catching here, because the failure mode otherwise is a subtly wrong-length
+    /// file rather than an error. It lives on its own constructor rather than in `new`
+    /// because the PCM resampler shares the stream and legitimately runs 96k -> 44.1k.
+    pub fn new_power_of_two(
+        in_rate: u32,
+        out_rate: u32,
+        channels: usize,
+        quality: Option<ResampleQuality>,
+    ) -> Result<Self> {
+        if in_rate == 0 || !out_rate.is_multiple_of(in_rate) || !(out_rate / in_rate).is_power_of_two()
+        {
+            bail!("DSD interpolation needs a power-of-two ratio, got {in_rate} -> {out_rate}");
+        }
+        Self::new(in_rate, out_rate, channels, quality)
     }
-    resample::create_soxr(in_rate as f64, out_rate as f64, channels, quality)
 }
