@@ -281,8 +281,10 @@ pub fn write_flac(path: &Path, buffer: &AudioBuffer, bits_per_sample: usize) -> 
         .map_err(|(_, e)| anyhow!("invalid flac encoder config: {e:?}"))?;
     let source =
         MemSource::from_samples(&interleaved, channels, bits_per_sample, buffer.sample_rate as usize);
-    let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+    let mut stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
         .map_err(|e| anyhow!("flac encode failed: {e:?}"))?;
+
+    normalize_fixed_blocksize_streaminfo(&mut stream)?;
 
     let mut sink = ByteSink::new();
     stream
@@ -291,6 +293,48 @@ pub fn write_flac(path: &Path, buffer: &AudioBuffer, bits_per_sample: usize) -> 
     std::fs::write(path, sink.as_slice())
         .with_context(|| format!("failed to write flac: {}", path.display()))?;
     Ok(())
+}
+
+/// Make STREAMINFO declare the fixed-blocksize stream that `encode_with_fixed_block_size`
+/// actually produced, by restoring `min_blocksize == max_blocksize`.
+///
+/// This works around a flacenc 0.5 bug rather than overriding the library: its
+/// `encode_with_fixed_block_size` deliberately sets `set_block_sizes(block_size,
+/// block_size)` up front — its comment says it does so "to follow the FLAC reference
+/// encoder's behavior" — and then every `add_frame` runs `update_frame_info`, whose
+/// running `min_block_size = min(frame, min_block_size)` quietly undoes it as soon as the
+/// short *final* frame arrives. The declared minimum ends up at `total_samples %
+/// block_size`: 1542 against a 4096 max for a 136 710-frame file. RFC 9639 §8.2 excludes
+/// the last block from that minimum precisely so this cannot happen.
+///
+/// The mismatch is not cosmetic. `min != max` declares a *variable*-blocksize stream while
+/// every frame carries a fixed-blocksize (frame-number) header, and Apple CoreAudio
+/// rejects that combination outright — `ExtAudioFileRead` fails with −50, so the file will
+/// not play on any Apple platform even though the bitstream decodes losslessly elsewhere.
+///
+/// The direction matters: it must be `min` that moves up to `max`, never `max` down to `min`.
+/// `set_block_sizes(min, min)` would equally satisfy "min == max" and equally pass a naive
+/// test, but it would declare 1000 where the frames are really 4096 — still unplayable on
+/// Apple, and a four-fold under-allocation for any decoder that sizes its buffer from
+/// `max_block_size`. `max` is the honest figure: `update_frame_info` only ever *raises* it
+/// and no frame can exceed the fixed block size, so it stays exactly `config.block_size`
+/// at any file length. A stream with no frames at all never had `min` lowered, so the
+/// early-out takes it.
+///
+/// (`set_block_sizes` itself will not catch a mistake here — flacenc's `verify_block_size!`
+/// bounds the value only from above, at `MAX_BLOCK_SIZE`.)
+fn normalize_fixed_blocksize_streaminfo(stream: &mut flacenc::component::Stream) -> Result<()> {
+    use anyhow::anyhow;
+
+    let info = stream.stream_info();
+    let (min, max) = (info.min_block_size(), info.max_block_size());
+    if min == max {
+        return Ok(());
+    }
+    stream
+        .stream_info_mut()
+        .set_block_sizes(max, max)
+        .map_err(|e| anyhow!("flac streaminfo blocksize fixup failed: {e:?}"))
 }
 
 // ---------------------------------------------------------------------------

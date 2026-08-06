@@ -41,6 +41,11 @@ const MASK_CLAMP_DB: f64 = 9.0;
 /// (Beyond ~18 dB the low-order cepstral reconstruction destabilizes.)
 const FLOOR_CLAMP_DB: f64 = 16.0;
 
+/// Floor on a target magnitude before `design_minimal_phase_fir` takes its log — −240 dB
+/// relative to full scale, well under any real threshold. A guard rail, not a shaping
+/// parameter; the ceiling is `f64::MAX`, which only rejects `+inf`. See the clamp site.
+const TARGET_MAG_MIN: f64 = 1e-12;
+
 /// An adaptive noise-shaper built from psychoacoustic masking thresholds.
 ///
 /// For each analysis frame, a minimal-phase FIR is designed such that its
@@ -230,7 +235,20 @@ fn design_minimal_phase_fir(
     // normalization is enforced in step 3 (DC of the cepstrum zeroed), so here we
     // only need the mean to center the clamp window.
     let max_ln = max_shape_db * std::f64::consts::LN_10 / 20.0;
-    let mut logmag: Vec<f64> = target_spectrum.iter().map(|&m| m.max(1e-12).ln()).collect();
+    // Force the target finite before taking logs. The clamp window below is measured
+    // against the *mean* log-magnitude, so one non-finite bin makes that mean `inf` and
+    // every deviation `inf − inf = NaN` — poisoning all taps and rendering the file as
+    // digital zero rather than failing. That was the 176.4/192 kHz `adaptive` silent-output
+    // bug; `psychoacoustic::ATH_MAX_AMPLITUDE` now stops it at the source, and this keeps
+    // any future non-finite threshold from reaching the taps.
+    // `max`/`min` rather than the `clamp` clippy asks for: clamp *propagates* NaN (its own
+    // docs say so), which is the case being guarded. The ceiling is `f64::MAX`, so nothing
+    // representable is altered.
+    #[allow(clippy::manual_clamp)]
+    let mut logmag: Vec<f64> = target_spectrum
+        .iter()
+        .map(|&m| m.max(TARGET_MAG_MIN).min(f64::MAX).ln())
+        .collect();
     // Two-sided mean of the log magnitude (DC & Nyquist count once, the rest twice).
     let mean = (logmag[0]
         + logmag[n_bins - 1]
@@ -599,5 +617,24 @@ mod tests {
         let coeffs = design(&flat_spectrum(513), 9, MASK_CLAMP_DB);
         let max = coeffs.iter().map(|c| c.abs()).fold(0.0, f64::max);
         assert!(max < 1e-6, "flat target should produce ~zero feedback (got {max:.2e})");
+    }
+
+    /// A non-finite bin must never reach the taps. This pins the guard directly, because
+    /// nothing else can: `psychoacoustic::ATH_MAX_AMPLITUDE` stops the only known source
+    /// upstream, so with that in place the whole suite passes even with the guard deleted
+    /// — and clippy actively suggests replacing it with `clamp`, which propagates NaN.
+    /// Without the guard a single `+inf` bin makes the mean log-magnitude `inf` and every
+    /// deviation `inf − inf = NaN`, which is what silenced 176.4/192 kHz output.
+    #[test]
+    fn minimal_phase_fir_survives_a_non_finite_target() {
+        for bad in [f64::INFINITY, f64::NAN, f64::MAX] {
+            let mut target = lowpass_spectrum(513);
+            target[400] = bad;
+            let coeffs = design(&target, 9, FLOOR_CLAMP_DB);
+            assert!(
+                coeffs.iter().all(|c| c.is_finite()),
+                "a {bad} bin produced non-finite taps: {coeffs:?}",
+            );
+        }
     }
 }

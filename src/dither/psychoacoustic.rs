@@ -190,11 +190,40 @@ pub fn ath_amplitude(sample_rate: u32, num_bins: usize) -> Vec<f64> {
     build_ath(sample_rate, num_bins)
 }
 
+/// Saturation ceiling for the ATH, as a linear amplitude relative to full scale.
+///
+/// Terhardt's `1e-3·f⁴` term diverges violently once extrapolated past the audible
+/// band — 236.7 dB SPL at 22.05 kHz, 5308.6 dB at 48 kHz, 60 516.7 dB at 88.2 kHz. Above
+/// a ~50 kHz *bin* — i.e. any sample rate over ~100 kHz — `db_to_linear` exceeds
+/// `f64::MAX` and returns `+inf`, and that is not a cosmetic overflow:
+/// `adaptive::design_minimal_phase_fir` takes `ln()` of the threshold and subtracts its
+/// mean, so `inf − inf` gives `NaN` taps and every `dither = "adaptive"` deliverable at
+/// 176.4/192 kHz is written as digital silence, with no error raised and a report still
+/// claiming adaptive shaping ran. 96 kHz peaks at 4.3e260, still 39 decades under the
+/// ceiling, so every rate that worked before is untouched.
+///
+/// So: saturate rather than truncate the band. The obvious alternative — clamping the
+/// evaluation frequency to the fit's ~20 kHz validity limit — is worse, and measurably:
+/// it costs 0.59 dB on the quiet-passage safeguard at 44.1 kHz (+10.35 → +9.76 dB,
+/// i.e. below the fixed Lipshitz curve's +9.88, inverting the guarantee that harness
+/// exists to prove). The ultrasonic rise is physically meaningless as an *absolute*
+/// level, but its monotonic shape is real information — it is what tells the FIR design
+/// to dump noise above the audible band — and flattening it throws that away.
+///
+/// The value sits deliberately just below the overflow point rather than at any
+/// perceptually motivated level: it engages from a ~49.7 kHz bin upward, essentially
+/// only where the old code produced `+inf`, so 44.1/48/88.2/96 kHz output is
+/// bit-identical to before. At 192 kHz it pins the top 48 % of bins. Downstream,
+/// `1/(t·t)` on a saturated bin underflows to a zero weight, which is the right reading
+/// anyway — nothing up there is audible.
+const ATH_MAX_AMPLITUDE: f64 = 1e300;
+
 /// Absolute Threshold of Hearing (ATH) per FFT bin, as a linear amplitude
 /// relative to normalized full scale (0 dBFS = 96 dBSPL for s16).
 ///
 /// Uses Terhardt's four-parameter formula (1979). Values below 20 Hz are
-/// clamped to 20 Hz to avoid the singularity at DC.
+/// clamped to 20 Hz to avoid the singularity at DC, and the result is saturated at
+/// [`ATH_MAX_AMPLITUDE`] so the curve stays finite at every sample rate.
 fn build_ath(sample_rate: u32, num_bins: usize) -> Vec<f64> {
     let nyquist = sample_rate as f64 / 2.0;
     (0..num_bins)
@@ -210,7 +239,9 @@ fn build_ath(sample_rate: u32, num_bins: usize) -> Vec<f64> {
 
             // Normalize to 0 dBFS = 96 dBSPL (standard for 16-bit PCM at typical
             // calibration). ATH_normalized_dBFS = ATH_SPL − 96.
-            db_to_linear(ath_spl - 96.0)
+            // `min` (not `clamp`) so a NaN collapses to the ceiling rather than
+            // propagating — `f64::min` returns the non-NaN operand.
+            db_to_linear(ath_spl - 96.0).min(ATH_MAX_AMPLITUDE)
         })
         .collect()
 }
@@ -394,6 +425,43 @@ mod tests {
         );
         // All values positive.
         assert!(ath.iter().all(|&v| v > 0.0), "ATH must be strictly positive");
+    }
+
+    /// Regression: Terhardt's `1e-3·f⁴` term overflowed `db_to_linear` to `+inf` above
+    /// ~50 kHz, so at 176.4/192 kHz the ATH — and every masking threshold floored by it
+    /// — went non-finite, which `design_minimal_phase_fir` turned into `NaN` taps and a
+    /// digitally silent deliverable. Every supported rate must yield a finite curve.
+    #[test]
+    fn ath_is_finite_at_every_supported_rate() {
+        for rate in [44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 384_000] {
+            let ath = build_ath(rate, 513);
+            assert!(
+                ath.iter().all(|v| v.is_finite() && *v > 0.0),
+                "ATH must be finite and positive at {rate} Hz",
+            );
+            // The audio band must keep its real shape — saturation may only touch the
+            // ultrasonic extrapolation, never the part that does the perceptual work.
+            let nyquist = rate as f64 / 2.0;
+            let bin = |hz: f64| (hz * 512.0 / nyquist).round() as usize;
+            assert!(
+                ath[bin(4_000.0)] < ath[bin(1_000.0)] && ath[bin(4_000.0)] < ath[bin(10_000.0)],
+                "ATH must still dip near 4 kHz at {rate} Hz",
+            );
+        }
+    }
+
+    /// The saturation ceiling must engage *only* where the old code overflowed, so the
+    /// rates that already worked are untouched. 96 kHz is the closest one to the edge —
+    /// and even there the top bin only reaches ~4.3e260, 39 decades under the clamp.
+    #[test]
+    fn ath_saturation_does_not_bite_at_or_below_96k() {
+        for rate in [44_100, 48_000, 88_200, 96_000] {
+            let ath = build_ath(rate, 513);
+            assert!(
+                ath.iter().all(|&v| v < ATH_MAX_AMPLITUDE),
+                "ATH clamp must not engage at {rate} Hz",
+            );
+        }
     }
 
     #[test]
