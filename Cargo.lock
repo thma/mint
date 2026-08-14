@@ -604,6 +604,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mint-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mint",
+]
+
+[[package]]
 name = "mp3lame-encoder"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

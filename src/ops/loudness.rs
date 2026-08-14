@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use ebur128::{EbuR128, Mode};
+use ebur128::{Channel, EbuR128, Mode};
 
 use crate::audio::buffer::AudioBuffer;
 use crate::config::OnClipPolicy;
@@ -244,10 +244,32 @@ fn apply_maximize(
     })
 }
 
-fn measure_lufs(buffer: &AudioBuffer) -> Result<f64> {
+/// Build a BS.1770 meter for `buffer` with the channel map the *delivery* implies.
+///
+/// The default ebur128 map is right for everything except mono, where it treats a
+/// 1-channel file as a single `Left` speaker. That is not how a mono deliverable is heard:
+/// it is played through both, and BS.1770-4 gives L and R the same +0 dB weight, so the
+/// same programme is 3.01 LU louder as dual mono than as one channel (measured on mint's
+/// own path: -12.03 vs -15.04 LUFS). Metering it as one channel therefore normalizes every
+/// mono master 3.01 LU too loud — a -14 LUFS mono track plays back at about -11.
+/// `Channel::DualMono` is libebur128's answer: it doubles that channel's energy.
+///
+/// The single construction site for every meter in the crate, so no measurement path can
+/// pick up a different map than the one the delivered gain was computed from.
+fn meter_for(buffer: &AudioBuffer, mode: Mode) -> Result<EbuR128> {
     let channels = buffer.channels_count() as u32;
-    let mut meter = EbuR128::new(channels, buffer.sample_rate, Mode::I)
-        .context("failed to initialize ebur128 loudness meter")?;
+    let mut meter = EbuR128::new(channels, buffer.sample_rate, mode)
+        .context("failed to initialize ebur128 meter")?;
+    if channels == 1 {
+        meter
+            .set_channel(0, Channel::DualMono)
+            .context("failed to set the dual-mono channel map")?;
+    }
+    Ok(meter)
+}
+
+fn measure_lufs(buffer: &AudioBuffer) -> Result<f64> {
+    let mut meter = meter_for(buffer, Mode::I)?;
 
     let planar: Vec<&[f64]> = buffer.channels.iter().map(Vec::as_slice).collect();
     meter
@@ -260,8 +282,9 @@ fn measure_lufs(buffer: &AudioBuffer) -> Result<f64> {
 
 pub fn measure_true_peak_dbtp(buffer: &AudioBuffer) -> Result<f64> {
     let channels = buffer.channels_count() as u32;
-    let mut meter = EbuR128::new(channels, buffer.sample_rate, Mode::TRUE_PEAK)
-        .context("failed to initialize ebur128 true-peak meter")?;
+    // Goes through `meter_for` for uniformity only: true peak is a per-channel sample
+    // maximum and the channel map never enters it. Nothing here changes for mono.
+    let mut meter = meter_for(buffer, Mode::TRUE_PEAK)?;
 
     let planar: Vec<&[f64]> = buffer.channels.iter().map(Vec::as_slice).collect();
     meter
@@ -325,8 +348,7 @@ pub fn analyze(buffer: &AudioBuffer) -> Result<LoudnessAnalysis> {
     let channels = buffer.channels_count() as u32;
     let rate = buffer.sample_rate;
     // LRA ⊇ S ⊇ M, and TRUE_PEAK adds the peak meter — one meter covers every figure.
-    let mut meter = EbuR128::new(channels, rate, Mode::I | Mode::LRA | Mode::TRUE_PEAK)
-        .context("failed to initialize ebur128 meter")?;
+    let mut meter = meter_for(buffer, Mode::I | Mode::LRA | Mode::TRUE_PEAK)?;
 
     let frames = buffer.frame_len();
     let hop = ((rate as f64 * METER_HOP_MS / 1000.0) as usize).max(1);
@@ -477,6 +499,18 @@ pub fn enforce_ceiling(
     }
 }
 
+/// Outcome of the post-SRC ceiling re-check.
+///
+/// `true_peak_dbtp` is the peak of the buffer as it now stands. It is handed back rather
+/// than left to be re-measured because [`correct_loudness_after_resample`] runs straight
+/// afterwards and needs exactly this number; a second true-peak pass over a half-gigabyte
+/// buffer to recover a value that was just computed is real time for nothing.
+#[derive(Debug, Clone)]
+pub struct RecheckResult {
+    pub warnings: Vec<String>,
+    pub true_peak_dbtp: f64,
+}
+
 /// Re-measure the true peak after an operation that can introduce new inter-sample peaks
 /// (most importantly sample-rate conversion) and apply the limiter if the ceiling is exceeded.
 ///
@@ -485,18 +519,19 @@ pub fn enforce_ceiling(
 /// loudness step in the pipeline config.
 ///
 /// Deliberately does NOT re-run maximize's makeup-gain convergence: it trims only the
-/// new inter-sample overshoots (hundredths of a dB), whose loudness effect is far below
-/// the ±0.1 LU reporting threshold.
+/// new inter-sample overshoots (hundredths of a dB). The *loudness* side of the same
+/// question — the SRC changing the integrated figure itself — is
+/// [`correct_loudness_after_resample`]'s job.
 ///
-/// Returns warnings if the limiter was actually invoked.
+/// Warnings are non-empty only when the limiter was actually invoked.
 pub fn recheck_and_limit_if_needed(
     buffer: &mut AudioBuffer,
     ceiling_dbtp: f64,
     limiter_options: limiter::LimiterOptions,
-) -> Result<Vec<String>> {
+) -> Result<RecheckResult> {
     let tp = measure_true_peak_dbtp(buffer)?;
     if tp <= ceiling_dbtp {
-        return Ok(Vec::new());
+        return Ok(RecheckResult { warnings: Vec::new(), true_peak_dbtp: tp });
     }
     let (final_tp, passes) = limit_and_verify(buffer, ceiling_dbtp, limiter_options, None)?;
     let mut warnings = vec![format!(
@@ -505,6 +540,106 @@ pub fn recheck_and_limit_if_needed(
     if final_tp - ceiling_dbtp > TP_TOLERANCE_DB {
         warnings.push(format!(
             "true peak still {final_tp:.2} dBTP after {passes} limiter passes"
+        ));
+    }
+    Ok(RecheckResult { warnings, true_peak_dbtp: final_tp })
+}
+
+/// How far the delivered integrated loudness may sit from its target before the report says
+/// so. What every reference tool promises (±0.1–0.2 LU). `pipeline` makes that check against
+/// the *delivered* measurement; this module only borrows the number, so that "corrected in
+/// silence" and "reported" cannot end up meaning different sizes of miss.
+pub const LUFS_TOLERANCE: f64 = 0.1;
+
+/// Smallest post-SRC loudness drift worth correcting: half the reporting threshold, for the
+/// same reason `MAKEUP_TOLERANCE_LU` is half it — a correction that lands inside this can
+/// never leave the delivery outside the figure that gets reported. Ordinary band-limited
+/// programme drifts about 0.03 LU across a 96 → 44.1 kHz conversion, so this is a no-op on
+/// nearly every real job.
+const SRC_DRIFT_TOLERANCE_LU: f64 = LUFS_TOLERANCE / 2.0;
+
+/// Re-verify the integrated loudness after a sample-rate conversion and pull it back onto
+/// target with a static gain.
+///
+/// The normalization gain was computed from the loudness of the *source* rate. A conversion
+/// changes that figure: BS.1770's K-weighting keeps rising above 20 kHz, so band-limiting a
+/// 96 kHz master to 44.1 kHz removes energy the meter had been counting. On ordinary
+/// programme the drift is ~0.03 LU; on an ultrasonic-heavy source it was measured at
+/// **2.54 LU**, delivered silently because the target check ran on the pre-SRC number.
+///
+/// The correction is a single static gain, and an upward one is capped at the true-peak
+/// headroom (`ceiling − true_peak`, which is why the caller passes the peak it just
+/// measured). That cap is the whole design: within it the delivered dynamics are untouched
+/// and no limiter runs, so the correction cannot compound a second limiter generation into
+/// the audio or eat back the loudness it just added. What the headroom cannot buy is
+/// reported instead — the pipeline's delivered-loudness check then quotes the real residual.
+///
+/// Integrated loudness moves dB-for-dB with a static gain: BS.1770's relative gate shifts
+/// with the signal and selects the same blocks. Only the fixed −70 LUFS absolute gate can
+/// make it inexact, and only for material sitting on that threshold — hence one pass, not a
+/// convergence loop, with the delivered measurement as the check.
+///
+/// Applies to every `on_clip` policy, `warn` included. `warn`'s contract is about *clipping*
+/// — report the overshoot, do not correct it — and it says nothing about loudness; the
+/// headroom cap means the correction cannot push a peak up anyway. Excluding it would also
+/// have been inconsistent with the ceiling re-check on the line above, which already ignores
+/// `on_clip` after a resample.
+///
+/// `pre_src_lufs` is the loudness the buffer had before the conversion, used only to say in
+/// the warning how much of the shortfall the resampler is actually responsible for — the
+/// rest is loudness the limiter ate on the way here, which is a different story about the
+/// same file.
+pub fn correct_loudness_after_resample(
+    buffer: &mut AudioBuffer,
+    target_lufs: f64,
+    ceiling_dbtp: f64,
+    true_peak_dbtp: f64,
+    pre_src_lufs: f64,
+) -> Result<Vec<String>> {
+    let measured = measure_lufs(buffer)?;
+    // Digital silence meters as -inf: there is no gain that makes it -14 LUFS, and the
+    // delivered-loudness check reports the miss.
+    if !measured.is_finite() {
+        return Ok(Vec::new());
+    }
+
+    let shortfall = target_lufs - measured;
+    if shortfall.abs() <= SRC_DRIFT_TOLERANCE_LU {
+        return Ok(Vec::new());
+    }
+
+    // Attenuation is always available; gain is only what sits under the ceiling.
+    let headroom = (ceiling_dbtp - true_peak_dbtp).max(0.0);
+    let applied_db = if shortfall > 0.0 { shortfall.min(headroom) } else { shortfall };
+
+    if applied_db.abs() > f64::EPSILON {
+        let gain_lin = 10_f64.powf(applied_db / 20.0);
+        for channel in &mut buffer.channels {
+            for sample in channel {
+                *sample *= gain_lin;
+            }
+        }
+    }
+
+    // Small corrections happen in silence — the number is noise. One large enough to have
+    // tripped the delivery check is worth saying out loud even though it succeeded: it means
+    // the source carries content the delivery rate cannot, and the same master at a different
+    // rate will not measure the same.
+    let mut warnings = Vec::new();
+    if shortfall.abs() > LUFS_TOLERANCE {
+        let src_drift = if pre_src_lufs.is_finite() {
+            format!("{:+.2} LU of that across the resample", measured - pre_src_lufs)
+        } else {
+            "source loudness unmeasurable".to_string()
+        };
+        warnings.push(format!(
+            "delivered loudness was {measured:.2} LUFS against a {target_lufs:.2} target \
+             ({src_drift}); corrected by {applied_db:+.2} dB{}",
+            if applied_db < shortfall - 1e-9 {
+                format!(", capped by the {ceiling_dbtp:.2} dBTP ceiling")
+            } else {
+                String::new()
+            }
         ));
     }
     Ok(warnings)

@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
-use crate::audio::{io_read, io_write_dsd};
-use crate::config::{Config, ResolvedTarget};
+use crate::audio::io_read;
+use crate::config::{self, Config, PlannedOutput, ResolvedTarget};
 use crate::json_report;
 use crate::pipeline::{self, ProcessingReport, TaskFailure};
+use crate::util::{fmt_bytes, fmt_db, is_supported_input};
 
 #[derive(Debug, Parser)]
 #[command(name = "mint")]
@@ -42,7 +43,8 @@ pub struct Args {
     #[arg(long)]
     fail_fast: bool,
 
-    /// Allow output path to match input path.
+    /// Replace files that are already at the output paths, the input file included
+    /// (equivalent to overwrite = true on every target).
     #[arg(long)]
     force: bool,
 
@@ -79,6 +81,15 @@ pub fn run() -> Result<()> {
         bail!("no supported input files resolved from provided arguments");
     }
 
+    // Pre-flight: the whole batch's plan, before any of it runs. Two jobs writing one path
+    // is only visible from up here — `pipeline::process` sees one job at a time, and by the
+    // time the second one looks at its destination the first has already written it (or, in
+    // parallel, has not looked yet). Ahead of the `--dry-run` branch on purpose: a plan that
+    // cannot be executed should not be printed as if it could.
+    let probed = probe_inputs(&inputs);
+    let planned = plan_outputs(&probed, &targets)?;
+    config::check_planned_outputs(&planned, &inputs)?;
+
     // Keep stdout pure JSON when --json: route the config banner to stderr instead.
     if let Some(meta) = &config.meta
         && let Some(name) = &meta.name
@@ -89,7 +100,7 @@ pub fn run() -> Result<()> {
     }
 
     if args.dry_run {
-        return print_dry_run(&inputs, &targets);
+        return print_dry_run(&probed, &targets);
     }
 
     // Cross product: every input is rendered into every selected target.
@@ -238,17 +249,72 @@ fn resolve_selected_targets(
         .collect()
 }
 
-fn print_dry_run(inputs: &[PathBuf], targets: &[ResolvedTarget]) -> Result<()> {
+/// An input with its header read, so the batch pays one probe per file no matter how many
+/// consumers want the rate: the pre-flight, the dry-run's chain, and the dry-run's sizes.
+///
+/// `probe` is an `Err` for a file whose header cannot be read. That is deliberately **not**
+/// fatal to the batch: an unreadable input has always been one task's failure, with the rest
+/// of the run continuing and `--json` still producing a document, and making the pre-flight
+/// strict about it would have quietly turned one bad file into "nothing ran".
+struct ProbedInput<'a> {
+    path: &'a Path,
+    probe: Result<io_read::SourceProbe>,
+}
+
+/// Read every input's header. Cheap next to what follows (a decode, or nothing at all in a
+/// dry run) and it is what makes the batch's plan knowable before the batch starts.
+fn probe_inputs(inputs: &[PathBuf]) -> Vec<ProbedInput<'_>> {
+    inputs
+        .iter()
+        .map(|path| ProbedInput {
+            path,
+            probe: io_read::probe_source(path)
+                .with_context(|| format!("failed to probe {}", path.display())),
+        })
+        .collect()
+}
+
+/// Where every (input, target) pair will write. The delivery rate — and therefore `{rate}`
+/// in the name — can follow the source, which is why this needs the probes.
+///
+/// Inputs whose header could not be read contribute nothing: their output path is not
+/// computable, so they cannot be shown to collide with anything. They still become jobs, and
+/// `pipeline::process` re-raises the same probe error as that job's own failure.
+fn plan_outputs<'a>(
+    probed: &[ProbedInput<'a>],
+    targets: &'a [ResolvedTarget],
+) -> Result<Vec<PlannedOutput<'a>>> {
+    let mut planned = Vec::with_capacity(probed.len() * targets.len());
+    for input in probed {
+        let Ok(probe) = &input.probe else { continue };
+        for target in targets {
+            planned.push(PlannedOutput {
+                input: input.path,
+                target: &target.name,
+                output: target
+                    .render_output_path(input.path, target.delivery_rate(probe.sample_rate))?,
+            });
+        }
+    }
+    Ok(planned)
+}
+
+fn print_dry_run(probed: &[ProbedInput<'_>], targets: &[ResolvedTarget]) -> Result<()> {
     println!(
         "dry-run: {} file(s) x {} target(s)",
-        inputs.len(),
+        probed.len(),
         targets.len()
     );
-    for input in inputs {
-        // Header only: the planned chain needs the rate, the planned size needs the frame
-        // and channel counts, and none of it is worth a decode.
-        let probe = io_read::probe_source(input)
-            .with_context(|| format!("failed to probe {}", input.display()))?;
+    for ProbedInput { path: input, probe } in probed {
+        // A file the dry run cannot read is reported as such rather than skipped: the run
+        // would fail on it too, and that is the thing worth knowing in advance.
+        let probe = match probe {
+            Ok(probe) => probe,
+            Err(e) => {
+                println!("\n{} — cannot be read: {e:#}", input.display());
+                continue;
+            }
+        };
         let source_rate = probe.sample_rate;
         println!("\n{} [{} Hz]", input.display(), source_rate);
         for target in targets {
@@ -263,45 +329,33 @@ fn print_dry_run(inputs: &[PathBuf], targets: &[ResolvedTarget]) -> Result<()> {
                 })
                 .map(|est| format!("  ({}{})", est.qualifier(), fmt_bytes(est.bytes())))
                 .unwrap_or_default();
-            println!("  [{}] -> {}{}", target.name, output.display(), size);
+            // Whether a file is about to be lost is the one thing a dry run has no business
+            // being quiet about — and the only place the user can learn it before it happens.
+            // `symlink_metadata`, matching `pipeline::guard_output_path`: a dangling symlink
+            // is something the rename replaces, and `exists()` would call it free.
+            let replaces = if std::fs::symlink_metadata(&output).is_ok() {
+                if target.overwrite {
+                    "  (replaces existing)"
+                } else {
+                    "  (exists — will fail without --force)"
+                }
+            } else {
+                ""
+            };
+            println!("  [{}] -> {}{}{}", target.name, output.display(), size, replaces);
             for step in target.describe(source_rate) {
                 println!("      - {step}");
             }
-            // The DSF writer's channel limit is the one thing a config cannot be validated
-            // against at load time (it does not know the input), so a 7.1 source into a
-            // DSD target currently fails only after the loudness and resample work.
-            if target.codec.is_dsd()
-                && let Some(channels) = probe.channels
-                && channels > io_write_dsd::MAX_CHANNELS
-            {
-                println!(
-                    "      ! {channels} channels exceeds the DSF limit of {} — this target will fail",
-                    io_write_dsd::MAX_CHANNELS
-                );
+            // The compatibility rules a config cannot be validated against because they
+            // depend on the input: the delivered rate for a target that follows the source,
+            // and the channel count. Same function the pipeline refuses the job with, so
+            // the dry-run cannot promise a file the run will decline to write.
+            if let Some(reason) = target.delivery_blocker(source_rate, probe.channels) {
+                println!("      ! {reason} — this target will fail");
             }
         }
     }
     Ok(())
-}
-
-/// Byte count for humans. `MB` is 10^6, matching how storage and DSD data rates are
-/// quoted. Both ends need a step: DSD512 files run into the gigabytes, and a short clip
-/// would otherwise be reported as "0.0 MB".
-fn fmt_bytes(bytes: u64) -> String {
-    let mb = bytes as f64 / 1_000_000.0;
-    if mb >= 1000.0 {
-        format!("{:.2} GB", mb / 1000.0)
-    } else if mb < 1.0 {
-        format!("{:.0} kB", bytes as f64 / 1000.0)
-    } else {
-        format!("{mb:.1} MB")
-    }
-}
-
-/// Format a dB/LU/LUFS figure, or "n/a" when the meter returned a non-finite value
-/// (silence, or a clip shorter than the meter's integration time).
-fn fmt_db(v: f64) -> String {
-    if v.is_finite() { format!("{v:.1}") } else { "n/a".to_string() }
 }
 
 fn print_reports(reports: &[ProcessingReport]) {
@@ -384,14 +438,33 @@ fn resolve_inputs(raw_inputs: &[String]) -> Result<Vec<PathBuf>> {
     let mut resolved = Vec::new();
     let mut seen = HashSet::new();
 
+    // Deduped by identity, not by spelling: `mint song.wav ./song.wav` — or, more often, a
+    // glob whose matches overlap an explicit argument — named one file twice and got two
+    // jobs racing onto one output. `canonicalize` needs the file to exist, which every input
+    // here does; if it fails anyway, fall back to the path as written rather than dropping
+    // the input.
+    //
+    // Announced rather than silent, because it is not always what the user meant: two
+    // spellings of one file with `{stem}` in the naming would have rendered the same audio
+    // under two names, and this collapses them to one.
+    let mut accept = |path: PathBuf, resolved: &mut Vec<PathBuf>| {
+        if !is_supported_input(&path) {
+            return;
+        }
+        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if seen.insert(key) {
+            resolved.push(path);
+        } else {
+            eprintln!("skipping {}: already named by another argument", path.display());
+        }
+    };
+
     for token in raw_inputs {
         if looks_like_glob(token) {
             let mut matches_for_pattern = 0usize;
             for entry in glob::glob(token).with_context(|| format!("invalid glob pattern: {token}"))? {
                 let path = entry.with_context(|| format!("failed resolving glob path: {token}"))?;
-                if is_supported_input(&path) && seen.insert(path.clone()) {
-                    resolved.push(path);
-                }
+                accept(path, &mut resolved);
                 matches_for_pattern += 1;
             }
 
@@ -403,9 +476,7 @@ fn resolve_inputs(raw_inputs: &[String]) -> Result<Vec<PathBuf>> {
             if !path.exists() {
                 bail!("input path does not exist: {}", path.display());
             }
-            if is_supported_input(&path) && seen.insert(path.clone()) {
-                resolved.push(path);
-            }
+            accept(path, &mut resolved);
         }
     }
 
@@ -414,15 +485,6 @@ fn resolve_inputs(raw_inputs: &[String]) -> Result<Vec<PathBuf>> {
 
 fn looks_like_glob(input: &str) -> bool {
     input.contains('*') || input.contains('?') || input.contains('[')
-}
-
-fn is_supported_input(path: &Path) -> bool {
-    let ext = match path.extension().and_then(|x| x.to_str()) {
-        Some(ext) => ext.to_ascii_lowercase(),
-        None => return false,
-    };
-
-    matches!(ext.as_str(), "wav" | "wave" | "aif" | "aiff")
 }
 
 fn init_logging(verbose: bool, quiet: bool) {

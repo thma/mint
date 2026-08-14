@@ -8,7 +8,7 @@ use crate::audio::io_read;
 use crate::audio::io_write;
 use crate::config::{DitherMode, OnClipPolicy, OutputCodec, ResolvedTarget, format_tag};
 use crate::ops::dsd::modulator::MAX_MODULATION;
-use crate::ops::loudness::LoudnessAnalysis;
+use crate::ops::loudness::{LUFS_TOLERANCE, LoudnessAnalysis};
 use crate::ops::{bitdepth, dsd, limiter, loudness, resample};
 
 #[derive(Debug, Clone)]
@@ -87,16 +87,112 @@ pub struct TaskFailure {
     pub error: String,
 }
 
+/// Refuse to write over something the user did not agree to lose.
+///
+/// The old check compared `output_path == input` as raw `PathBuf`s, which asked the wrong
+/// question twice: it missed `./master.wav` against `master.wav` (or a symlink, or a
+/// different-case spelling on a case-insensitive volume), and it said nothing at all about a
+/// *pre-existing output* — so `overwrite = false`, the documented default, protected only
+/// the input and silently clobbered the previous render.
+///
+/// Both are one question now, asked in the right order and only when it can be answered:
+/// nothing needs comparing unless something is already at the output path, and if something
+/// is, [`same_file`] can compare the two as the files they actually name rather than as the
+/// strings they were spelled with.
+fn guard_output_path(input: &Path, output_path: &Path, overwrite: bool) -> Result<()> {
+    // `symlink_metadata` rather than `exists()`: a dangling symlink at the output path is
+    // something the rename will replace, so it counts as occupied.
+    if std::fs::symlink_metadata(output_path).is_err() {
+        return Ok(());
+    }
+    if overwrite {
+        return Ok(());
+    }
+    if same_file(output_path, input) {
+        bail!(
+            "refusing to overwrite the input file without --force or overwrite=true: {}",
+            input.display()
+        );
+    }
+    bail!(
+        "output file already exists: {} (pass --force, or set overwrite = true on the target, \
+         to replace it)",
+        output_path.display()
+    )
+}
+
+/// Whether two existing paths name the same file on disk.
+///
+/// Both are known to exist by the time this is asked, which is what makes it answerable:
+/// the identity of a file that is not there yet has no meaning.
+///
+/// On Unix this is `(device, inode)`, which is the only comparison that catches a *hard
+/// link* — two directory entries for one file, indistinguishable to `canonicalize` because
+/// both are already canonical. Elsewhere `canonicalize` is the best available answer: it
+/// resolves `.`, `..` and symlinks and applies the volume's own case rules, and misses only
+/// the hard-link case.
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// Process a single input file for a single resolved target.
 ///
 /// The DSP chain is *derived* from the target and the source format rather than
 /// listed in config — only the steps that are actually needed run, in the one
 /// canonical order:
-///   loudness (if `lufs`) -> resample (if rate differs) -> ceiling enforcement
+///   loudness (if `lufs`) -> resample (if rate differs) -> re-verify ceiling and loudness
+///   (only after a resample) -> ceiling enforcement (only if no loudness step ran)
 ///   -> quantize once -> write.
+///
+/// Ahead of all of it: everything that can make the job impossible is settled from the input
+/// header, so a doomed target costs a header read rather than the whole chain.
 pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Result<ProcessingReport> {
+    // Everything that can be known to be impossible is decided from the *header*, before the
+    // file is even decoded. All of it used to surface from inside a writer instead — a
+    // 192 kHz FLAC target or a 7.1 DSD one failed after the whole chain had run, and
+    // `overwrite = false` discovered the pre-existing output only once it had been replaced.
+    // A doomed job now costs one header read, which matters in a batch: a hundred of them
+    // used to cost a hundred decodes to say the same thing a hundred times.
+    let probe = io_read::probe_source(input)?;
+    let source_rate = probe.sample_rate;
+    let out_rate = target.delivery_rate(source_rate);
+    if let Some(reason) = target.delivery_blocker(source_rate, probe.channels) {
+        bail!("target '{}': {reason}", target.name);
+    }
+    let output_path = target.render_output_path(input, out_rate)?;
+    // Before `create_dir_all`, so a refused job leaves no empty directories behind. The
+    // guard does not need the parent to exist: a path whose parent is missing has nothing
+    // sitting at it, which is the only case it cares about.
+    guard_output_path(input, &output_path, target.overwrite)?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create output directory: {}", parent.display()))?;
+    }
+
     let mut buffer = io_read::read_audio(input)?;
-    let source_rate = buffer.sample_rate;
+    // The two read the same track parameters out of the same container, so this cannot
+    // differ — but the output path was already rendered from the header's answer, and a
+    // silent disagreement would put the wrong `{rate}` in the file name.
+    debug_assert_eq!(buffer.sample_rate, source_rate, "probe and decode disagree on the rate");
+    // Asked again with the decoded channel count: `probe.channels` is `None` for a container
+    // that does not declare one, and the check above cannot fire on what it cannot see.
+    if let Some(reason) = target.delivery_blocker(source_rate, Some(buffer.channels_count())) {
+        bail!("target '{}': {reason}", target.name);
+    }
+
     let ceiling = target.ceiling_dbtp;
     let limiter_options = limiter::LimiterOptions {
         character: target.limiter_character,
@@ -107,6 +203,10 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     let mut limiter_gain_reduction = None;
     let mut limiter_avg_gain_reduction = None;
     let mut limiter_active_percent = None;
+    // Loudness as the normalization stage left it. Only the post-resample report reads it,
+    // and only to separate the loudness the *resampler* removed from the loudness the
+    // limiter had already eaten before it — two different stories about one shortfall.
+    let mut pre_src_lufs = None;
 
     // Full source metering, measured once on the untouched input so the report shows
     // loudness/dynamics uniformly whether or not a loudness step runs.
@@ -125,6 +225,7 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
             target.max_limiting_db,
         )?;
         warnings.extend(result.warnings);
+        pre_src_lufs = Some(result.out_lufs);
 
         // Heavy-limiting check: hitting the LUFS target required squashing peaks.
         // Both delivered loudness and true peak look clean afterwards, so this
@@ -147,12 +248,8 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
             }
         }
 
-        if (result.out_lufs - lufs).abs() > 0.1 {
-            warnings.push(format!(
-                "loudness target not met within +/-0.1 LU (target {lufs:.2}, actual {:.2})",
-                result.out_lufs
-            ));
-        }
+        // No "target not met" check here: at this point the resampler has not run yet.
+        // It is made once, against the delivered measurement, further down.
         true
     } else {
         false
@@ -162,15 +259,27 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     //    target that rate is the *intermediate* one the modulator will be interpolated up
     //    from, derived from the source unless the target set `rate` explicitly.
     let pcm_rate = target.pcm_stage_rate(source_rate);
-    let out_rate = target.delivery_rate(source_rate);
     if pcm_rate != source_rate {
         resample::apply(&mut buffer, pcm_rate, Some(target.quality))?;
         // SRC can raise inter-sample peaks above the previously enforced ceiling.
-        warnings.extend(loudness::recheck_and_limit_if_needed(
-            &mut buffer,
-            ceiling,
-            limiter_options,
-        )?);
+        let recheck = loudness::recheck_and_limit_if_needed(&mut buffer, ceiling, limiter_options)?;
+        warnings.extend(recheck.warnings);
+
+        // ...and it moves the integrated loudness too, which the gain computed at the source
+        // rate could not have known about. Corrected here rather than merely reported,
+        // because what a deliverable is judged on is the loudness of the file that ships.
+        // Every `on_clip` policy, for the same reason the ceiling re-check above ignores
+        // `on_clip`: the correction cannot exceed the headroom, so no policy's promise about
+        // peaks is broken by it.
+        if let Some(lufs) = target.lufs {
+            warnings.extend(loudness::correct_loudness_after_resample(
+                &mut buffer,
+                lufs,
+                ceiling,
+                recheck.true_peak_dbtp,
+                pre_src_lufs.unwrap_or(f64::NAN),
+            )?);
+        }
     }
 
     // 3. Ceiling enforcement for the pure-transcode path (no loudness step ran).
@@ -194,17 +303,25 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     // Delivered metering for the report, measured before any quantization/encode.
     let delivered = loudness::analyze(&buffer)?;
 
-    // Resolve + guard the output path.
-    let output_path = target.render_output_path(input, out_rate)?;
-    if !target.overwrite && output_path == input {
-        bail!(
-            "refusing to overwrite input file without --force or overwrite=true: {}",
-            input.display()
-        );
-    }
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create output directory: {}", parent.display()))?;
+    // The loudness verdict is read off `delivered`, not off the loudness step's own output.
+    // Those are the same number only when nothing followed it; a resample changes the
+    // integrated loudness (band-limiting a 96 kHz master to 44.1 kHz drops the ultrasonic
+    // energy BS.1770's K-weighting was counting), and the post-SRC ceiling pass can change
+    // it again. Checking the pre-SRC figure hid a measured -2.54 LU delivery error behind a
+    // clean report.
+    // `is_finite` keeps the digitally-silent case out of this branch explicitly rather than
+    // by accident: a silent source normalizes with an infinite gain, so the buffer is NaN
+    // and every comparison against it is already false. Being explicit means the reporting
+    // of that case (report.md defect 11) can be changed without tripping over this line.
+    if let Some(lufs) = target.lufs
+        && delivered.integrated_lufs.is_finite()
+        && (delivered.integrated_lufs - lufs).abs() > LUFS_TOLERANCE
+    {
+        warnings.push(format!(
+            "loudness target not met within +/-{LUFS_TOLERANCE:.1} LU \
+             (target {lufs:.2}, delivered {:.2})",
+            delivered.integrated_lufs
+        ));
     }
 
     // 4/5. Quantize (once, if the codec is PCM-based) and encode/write. Two codecs skip the

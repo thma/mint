@@ -1,0 +1,18 @@
+[package]
+name = "mint-gui"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+# One-way dependency: mint knows nothing about mint-gui, so eframe and wgpu never enter
+# the CLI binary's graph. Deliberately no `features = ["mp3"]` here — `cargo build
+# --workspace` unions features even under resolver 3, so asking for it would pull
+# LGPL-3.0 libmp3lame into the CLI build as well. `mint::MP3_AVAILABLE` reports the
+# truth instead; the GUI greys the codec out.
+mint = { path = ".." }
+anyhow = "1.0"
+
+# eframe/egui land here in spike S2 (see docs/gui-proposal.md §8 Phase 0). Held back
+# deliberately: everything in Tier 0 is stack-independent and should not be entangled
+# with a toolkit choice that has not been de-risked yet.

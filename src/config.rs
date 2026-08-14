@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -82,7 +83,7 @@ pub struct RawTarget {
     pub overwrite: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ResampleQuality {
     Lq,
@@ -91,7 +92,16 @@ pub enum ResampleQuality {
     Vhq,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+impl ResampleQuality {
+    pub const ALL: [ResampleQuality; 4] = [
+        ResampleQuality::Lq,
+        ResampleQuality::Mq,
+        ResampleQuality::Hq,
+        ResampleQuality::Vhq,
+    ];
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OnClipPolicy {
     Limit,
@@ -104,7 +114,16 @@ pub enum OnClipPolicy {
     Maximize,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+impl OnClipPolicy {
+    pub const ALL: [OnClipPolicy; 4] = [
+        OnClipPolicy::Limit,
+        OnClipPolicy::ReduceGain,
+        OnClipPolicy::Warn,
+        OnClipPolicy::Maximize,
+    ];
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LimiterCharacter {
     Balanced,
@@ -114,12 +133,28 @@ pub enum LimiterCharacter {
     Dense,
 }
 
+impl LimiterCharacter {
+    pub const ALL: [LimiterCharacter; 3] = [
+        LimiterCharacter::Balanced,
+        LimiterCharacter::Transient,
+        LimiterCharacter::Dense,
+    ];
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DitherStrength {
     Low,
     Normal,
     High,
+}
+
+impl DitherStrength {
+    pub const ALL: [DitherStrength; 3] = [
+        DitherStrength::Low,
+        DitherStrength::Normal,
+        DitherStrength::High,
+    ];
 }
 
 /// Phase 4.4: Stereo and multi-channel dither correlation mode.
@@ -159,7 +194,15 @@ impl Default for DitherCorrelation {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+impl DitherCorrelation {
+    pub const ALL: [DitherCorrelation; 3] = [
+        DitherCorrelation::Decorrelated,
+        DitherCorrelation::Correlated,
+        DitherCorrelation::MidSide,
+    ];
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DitherMode {
     Tpdf,
@@ -183,6 +226,14 @@ pub enum DitherMode {
 }
 
 impl DitherMode {
+    pub const ALL: [DitherMode; 5] = [
+        DitherMode::Tpdf,
+        DitherMode::None,
+        DitherMode::Shaped,
+        DitherMode::Psychoacoustic,
+        DitherMode::Adaptive,
+    ];
+
     /// The error-feedback curve this mode applies, or `None` for the flat/no-dither
     /// modes. Single source of truth for *which* modes shape and *with which* curve —
     /// shared by `bitdepth::apply` (the run), `shapes`, and `describe` (the dry-run),
@@ -202,13 +253,22 @@ impl DitherMode {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum BitDepthFormat {
     S16,
     S24,
     F32,
     F64,
+}
+
+impl BitDepthFormat {
+    pub const ALL: [BitDepthFormat; 4] = [
+        BitDepthFormat::S16,
+        BitDepthFormat::S24,
+        BitDepthFormat::F32,
+        BitDepthFormat::F64,
+    ];
 }
 
 /// Output container / codec. Separate axis from `BitDepthFormat`: WAV and FLAC carry an
@@ -225,6 +285,13 @@ pub enum OutputCodec {
 }
 
 impl OutputCodec {
+    pub const ALL: [OutputCodec; 4] = [
+        OutputCodec::Wav,
+        OutputCodec::Flac,
+        OutputCodec::Mp3,
+        OutputCodec::Dsf,
+    ];
+
     /// File extension and the value substituted for the `{cext}` naming placeholder.
     pub fn ext(self) -> &'static str {
         match self {
@@ -448,6 +515,40 @@ impl ResolvedTarget {
         })
     }
 
+    /// Why this target cannot be delivered from this source, if it cannot.
+    ///
+    /// The compatibility rules a *config* cannot be validated against, because they depend
+    /// on the input file: the delivery rate when the target has no `rate` of its own, and
+    /// the channel count, which nothing in the TOML mentions. Both used to surface from
+    /// inside a writer, i.e. after loudness, resampling, limiting and (for DSD) an hour of
+    /// modulation had already run.
+    ///
+    /// One function so the two callers cannot drift: `pipeline::process` turns it into the
+    /// job's error before touching the audio, and `--dry-run` prints it as the "this target
+    /// will fail" line. `channels` is `None` when the header does not declare it — the
+    /// dry-run's case, where the rate check still applies.
+    pub fn delivery_blocker(&self, source_rate: u32, channels: Option<usize>) -> Option<String> {
+        if self.codec == OutputCodec::Flac {
+            let rate = self.pcm_stage_rate(source_rate);
+            if rate > io_write::FLAC_MAX_SAMPLE_RATE {
+                return Some(flac_rate_error(rate));
+            }
+        }
+        // The DSF channel-type table stops at 5.1, so a 7.1 source has no container to go
+        // into. Nothing in the config knows the channel count, which is why this cannot be
+        // a load-time check like the rest of the codec rules.
+        if self.codec.is_dsd()
+            && let Some(channels) = channels
+            && channels > io_write_dsd::MAX_CHANNELS
+        {
+            return Some(format!(
+                "{channels} channels exceeds the DSF limit of {}",
+                io_write_dsd::MAX_CHANNELS
+            ));
+        }
+        None
+    }
+
     /// Human-readable summary of the auto-derived pipeline for `--dry-run`.
     pub fn describe(&self, source_rate: u32) -> Vec<String> {
         let mut steps = Vec::new();
@@ -490,6 +591,16 @@ impl ResolvedTarget {
                 "resample {source_rate} -> {pcm_rate} Hz ({}{why})",
                 quality_tag(self.quality)
             ));
+            // The two verification passes the resample brings with it. Both are conditional
+            // at run time (each is a no-op when its measurement comes back clean), but they
+            // are unconditional *steps* of a resampling chain and the dry-run has to say so
+            // — a static gain applied after the loudness stage is exactly the kind of thing
+            // a reader of this list would otherwise not know had happened.
+            let mut recheck = "re-check true peak against the ceiling".to_string();
+            if self.lufs.is_some() {
+                recheck.push_str(" and re-verify loudness (corrected within the headroom)");
+            }
+            steps.push(recheck);
         } else {
             steps.push(format!("keep sample rate {source_rate} Hz"));
         }
@@ -571,6 +682,18 @@ impl Config {
             .with_context(|| format!("failed to read config: {}", path.display()))?;
         let parsed: Self = toml::from_str(&raw)
             .with_context(|| format!("invalid TOML config: {}", path.display()))?;
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    /// Parse and validate config text that is not (yet) a file — an editor buffer being
+    /// typed into, say. Same two steps as `from_path` minus the read, so a front end
+    /// validating an unsaved document does not have to stage a temp file to do it. The
+    /// two are kept as separate three-liners rather than one wrapping the other because
+    /// `from_path`'s context string names the file and its validation errors deliberately
+    /// carry no context at all — several tests read those messages verbatim.
+    pub fn from_toml_str(text: &str) -> Result<Self> {
+        let parsed: Self = toml::from_str(text).context("invalid TOML config")?;
         parsed.validate()?;
         Ok(parsed)
     }
@@ -682,7 +805,7 @@ impl Config {
     }
 
     /// Resolve every target and reject configs that cannot produce valid output.
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.targets.is_empty() {
             bail!("config must define at least one [target.NAME] entry");
         }
@@ -744,6 +867,16 @@ impl ResolvedTarget {
                 self.name,
                 format_tag(self.format)
             );
+        }
+        // The FLAC backend tops out at 96 kHz. Only an *explicit* rate can be judged here;
+        // a target that follows the source rate is caught by `delivery_blocker` the moment
+        // the source rate is known. Both exist because the old behaviour was to discover it
+        // inside the encoder, after the whole DSP chain had run.
+        if self.codec == OutputCodec::Flac
+            && let Some(rate) = self.rate
+            && rate > io_write::FLAC_MAX_SAMPLE_RATE
+        {
+            bail!("target '{}': {}", self.name, flac_rate_error(rate));
         }
         // `bwf` is checked in `resolve_target`, against the target's own layer — see the
         // comment there. By the time it reaches this struct it is already the effective
@@ -946,11 +1079,134 @@ fn preset(name: &str) -> Result<RawTarget> {
     })
 }
 
+/// One planned (input, target) render, for the pre-flight in `cli.rs`.
+#[derive(Debug, Clone)]
+pub struct PlannedOutput<'a> {
+    pub input: &'a Path,
+    pub target: &'a str,
+    pub output: PathBuf,
+}
+
+/// Reject a *batch* whose jobs would fight over files, before any audio is touched.
+///
+/// [`check_collisions`] answers the same question for targets and cannot answer this one:
+/// it holds the stem constant on purpose, and the stem is exactly what differs here. Two
+/// inputs called `song.wav` in different directories render to one output under any naming
+/// mint can express — none of the placeholders (`{stem} {ext} {target} {rate} {format}
+/// {dsd} {cext}`) carries the input's parent directory — so both jobs used to run, in
+/// parallel, and whichever finished last won.
+///
+/// The second rule catches the case a per-job guard structurally cannot see: one job's
+/// *output* landing on another job's *input* (`naming = "{stem}_master.{ext}"` over a batch
+/// that already contains `song_master.wav`). By the time that job checks its destination the
+/// other one may not have read its source yet.
+pub fn check_planned_outputs(planned: &[PlannedOutput<'_>], inputs: &[PathBuf]) -> Result<()> {
+    // Hashed rather than a linear scan: `planned` is inputs x targets, so an album batch is
+    // already in the thousands and the quadratic version was measurable there.
+    // One `current_dir` for the whole batch; `plan_key` is pure given it.
+    let cwd = std::env::current_dir().ok();
+    let key = |path: &Path| plan_key(path, cwd.as_deref());
+
+    let input_set: HashSet<PathBuf> = inputs.iter().map(|p| key(p)).collect();
+    let mut seen: HashMap<PathBuf, &PlannedOutput> = HashMap::with_capacity(planned.len());
+    for entry in planned {
+        let output = key(&entry.output);
+        if let Some(other) = seen.get(&output) {
+            bail!(
+                "inputs '{}' and '{}' both render to '{}' for target '{}' — they share a stem \
+                 and no naming placeholder carries the input's directory. Render the two \
+                 sources in separate runs (with different `dir`s), or rename one of them",
+                other.input.display(),
+                entry.input.display(),
+                entry.output.display(),
+                entry.target
+            );
+        }
+        // A job writing over its *own* input is the documented in-place render, and whether
+        // it is allowed is `overwrite`'s question, asked by `pipeline::guard_output_path`.
+        // Only writing over a *different* input of the same run is rejected here, and it is
+        // rejected even under `--force`: with the jobs running concurrently, the other one
+        // may read that file before or after this one replaces it, so the batch's output
+        // would depend on scheduling.
+        //
+        // Compared on `plan_key`, not on the paths as written. The two sides of *this* rule
+        // come from different places — the output from `dir` in the config, the input from
+        // argv or a glob — so they routinely disagree about spelling while naming one file:
+        // the shipped default is `dir = "./out"`, and an input given as an absolute path or
+        // reached by a glob is neither `./`-prefixed nor necessarily relative.
+        //
+        // What this deliberately does not do is touch the filesystem. The identity question
+        // — is this path *the file* that path names, through symlinks and hard links — needs
+        // both ends to exist, and an output usually does not yet. `guard_output_path` asks
+        // that one per job, of paths that are really there. It cannot cover this rule
+        // though: under `--force` it returns before comparing, which is exactly the regime
+        // where one job silently overwrites another job's source.
+        if output != key(entry.input) && input_set.contains(&output) {
+            bail!(
+                "target '{}' would write '{}' over a different input of this same run; the \
+                 job that reads it may or may not have got there first",
+                entry.target,
+                entry.output.display()
+            );
+        }
+        seen.insert(output, entry);
+    }
+    Ok(())
+}
+
+/// The form two paths in the batch plan are compared in: absolute (against `cwd`) and
+/// lexically normal.
+///
+/// Deliberately does not consult the filesystem — see the caller. Making paths absolute is
+/// the half that matters most in practice, because the output side comes from `dir` in the
+/// config and the input side from the command line, and there is nothing keeping those two
+/// to the same convention. When there is no `cwd` to resolve against, relative and absolute
+/// spellings simply do not match, which is the same answer the check gave before.
+fn plan_key(path: &Path, cwd: Option<&Path>) -> PathBuf {
+    match cwd {
+        Some(cwd) if path.is_relative() => lexically_normal(&cwd.join(path)),
+        _ => lexically_normal(path),
+    }
+}
+
+/// `path` with `.` components dropped and `..` folded into the component before it, without
+/// consulting the filesystem.
+///
+/// A leading `..`, or one following a component that might be a symlink, is left in place:
+/// resolving those correctly requires the filesystem, and guessing is how a "normalizer"
+/// starts reporting two different files as one.
+fn lexically_normal(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    let mut popped_ok = 0usize; // components we put there ourselves and may take back
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if popped_ok > 0 => {
+                out.pop();
+                popped_ok -= 1;
+            }
+            Component::Normal(_) => {
+                out.push(component);
+                popped_ok += 1;
+            }
+            other => {
+                out.push(other);
+                popped_ok = 0; // a root or prefix: nothing before it can be popped
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
 /// Reject targets that would write to the same path. Uses a probe stem so the
 /// check is independent of the actual input file names: two targets collide only
 /// when their `dir` + `naming` lack a distinguishing placeholder ({target},
 /// {rate}, {format}).
-fn check_collisions(targets: &[ResolvedTarget]) -> Result<()> {
+pub fn check_collisions(targets: &[ResolvedTarget]) -> Result<()> {
     let probe = Path::new("__render_probe__.wav");
     let mut seen: Vec<(PathBuf, &str)> = Vec::new();
 
@@ -972,6 +1228,18 @@ fn check_collisions(targets: &[ResolvedTarget]) -> Result<()> {
     Ok(())
 }
 
+/// The one wording for "this FLAC target asks for a rate the encoder cannot reach", shared
+/// by the load-time check (explicit `rate`) and the per-source one (derived `rate`). Names
+/// both ways out, because "not supported" without them just moves the guessing earlier.
+fn flac_rate_error(rate: u32) -> String {
+    format!(
+        "codec=flac cannot deliver {rate} Hz — mint's FLAC encoder tops out at {} Hz. \
+         Set rate = {} (or lower) on this target, or use codec = \"wav\" to keep {rate} Hz",
+        io_write::FLAC_MAX_SAMPLE_RATE,
+        io_write::FLAC_MAX_SAMPLE_RATE
+    )
+}
+
 pub fn format_tag(format: OutputSampleFormat) -> &'static str {
     match format {
         OutputSampleFormat::S16 => "s16",
@@ -981,7 +1249,7 @@ pub fn format_tag(format: OutputSampleFormat) -> &'static str {
     }
 }
 
-fn quality_tag(quality: ResampleQuality) -> &'static str {
+pub fn quality_tag(quality: ResampleQuality) -> &'static str {
     match quality {
         ResampleQuality::Lq => "lq",
         ResampleQuality::Mq => "mq",
@@ -990,7 +1258,7 @@ fn quality_tag(quality: ResampleQuality) -> &'static str {
     }
 }
 
-fn on_clip_tag(policy: OnClipPolicy) -> &'static str {
+pub fn on_clip_tag(policy: OnClipPolicy) -> &'static str {
     match policy {
         OnClipPolicy::Limit => "limit",
         OnClipPolicy::ReduceGain => "reduce_gain",
@@ -999,7 +1267,7 @@ fn on_clip_tag(policy: OnClipPolicy) -> &'static str {
     }
 }
 
-fn limiter_character_tag(character: LimiterCharacter) -> &'static str {
+pub fn limiter_character_tag(character: LimiterCharacter) -> &'static str {
     match character {
         LimiterCharacter::Balanced => "balanced",
         LimiterCharacter::Transient => "transient",
@@ -1031,7 +1299,7 @@ fn limiter_policy_tag(
     }
 }
 
-fn dither_tag(dither: DitherMode) -> &'static str {
+pub fn dither_tag(dither: DitherMode) -> &'static str {
     match dither {
         DitherMode::Tpdf => "tpdf",
         DitherMode::None => "none",
@@ -1041,7 +1309,7 @@ fn dither_tag(dither: DitherMode) -> &'static str {
     }
 }
 
-fn dither_strength_tag(strength: DitherStrength) -> &'static str {
+pub fn dither_strength_tag(strength: DitherStrength) -> &'static str {
     match strength {
         DitherStrength::Low => "low",
         DitherStrength::Normal => "normal",
@@ -1049,9 +1317,19 @@ fn dither_strength_tag(strength: DitherStrength) -> &'static str {
     }
 }
 
+/// No dry-run line renders this today — it exists so a front end labelling the
+/// `dither_correlation` dropdown spells the variants the way the TOML does.
+pub fn dither_correlation_tag(correlation: DitherCorrelation) -> &'static str {
+    match correlation {
+        DitherCorrelation::Decorrelated => "decorrelated",
+        DitherCorrelation::Correlated => "correlated",
+        DitherCorrelation::MidSide => "mid_side",
+    }
+}
+
 /// Dry-run label that reflects what the quantizer will *actually* do, including
 /// the s16-only downgrade of the shaped modes to flat TPDF at higher bit depths.
-fn effective_dither_tag(
+pub fn effective_dither_tag(
     dither: DitherMode,
     strength: DitherStrength,
     format: OutputSampleFormat,
@@ -1079,4 +1357,31 @@ fn effective_dither_tag(
         };
     }
     format!("{} dither", dither_tag(dither))
+}
+
+/// `Display` for the config enums = the exact spelling the TOML accepts and the dry-run
+/// prints. A macro rather than eight near-identical impls; the tag functions above stay
+/// the single source of truth and this only forwards to them, so a dropdown label and a
+/// `--dry-run` line cannot disagree.
+macro_rules! display_via_tag {
+    ($($ty:ty => $tag:expr),+ $(,)?) => {
+        $(impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&($tag)(*self))
+            }
+        })+
+    };
+}
+
+display_via_tag! {
+    ResampleQuality => quality_tag,
+    OnClipPolicy => on_clip_tag,
+    LimiterCharacter => limiter_character_tag,
+    DitherMode => dither_tag,
+    DitherStrength => dither_strength_tag,
+    DitherCorrelation => dither_correlation_tag,
+    // These two carry their spelling elsewhere: bit depth through the `OutputSampleFormat`
+    // the pipeline actually uses, and a codec through the extension it writes.
+    BitDepthFormat => |f: BitDepthFormat| format_tag(f.into()),
+    OutputCodec => OutputCodec::ext,
 }

@@ -166,7 +166,12 @@ When a field is set by neither a preset nor an explicit value, these apply:
 | `mp3_bitrate` | 320 |
 | `dir` | `./out` |
 | `naming` | `{target}/{stem}.{cext}` |
-| `overwrite` | `false` |
+| `overwrite` | `false` — refuse to replace whatever is already at the output path |
+
+`overwrite` governs *both* kinds of file that can be sitting at a target's output path: a
+previous render and (if the naming points there) an input master. Left at `false`, mint
+refuses either and says which one it found. `--force` is the same thing for one run, on
+every target. See [Notes](#notes).
 
 `format` has no default. Every WAV/FLAC target must get one from a preset or an explicit
 `format`; MP3 ignores it, and a DSD target **rejects** it — the modulator is the quantizer,
@@ -275,10 +280,20 @@ limiter_link_channels = false          # independent L/R envelopes
 
 `codec` is `wav` (default), `flac`, `mp3`, or `dsf`; the default `naming` ends in `{cext}`,
 which expands to the codec's extension. Compatibility rules, all enforced when the config
-loads: `bwf` is WAV-only, FLAC requires an integer format (s16/s24), `dsf` requires `dsd`,
-`dsd` requires `dsf`, and a DSD target rejects `format`. Run `--dry-run` to see the
-fully-resolved chain, output path and expected size for every target before processing
-anything.
+loads: `bwf` is WAV-only, FLAC requires an integer format (s16/s24) and a rate of at most
+**96 kHz**, `dsf` requires `dsd`, `dsd` requires `dsf`, and a DSD target rejects `format`.
+Run `--dry-run` to see the fully-resolved chain, output path and expected size for every
+target before processing anything.
+
+Two of those depend on the input file and so cannot be settled when the config loads — a
+target that omits `rate` delivers at whatever the master runs at, and nothing in the TOML
+mentions channels. Both are checked from the input's header before anything is decoded, and
+`--dry-run` prints them as a `!` line against the target that will fail:
+
+- **FLAC above 96 kHz.** mint's FLAC encoder tops out there. It is not a format limit —
+  FLAC itself codes 176.4 and 192 kHz — so a 24/192 deliverable means `codec = "wav"` for
+  now. Set `rate = 96000` on the FLAC target to keep a hi-res master shippable.
+- **DSD above 5.1.** The DSF channel-type table stops at six channels.
 
 ## Build
 
@@ -295,6 +310,11 @@ library + `pkg-config` — mint links libsoxr for reference-grade sample-rate co
     # <vcpkg>\installed\x64-windows\lib\pkgconfig) and add the bin dir to PATH
 
     cargo build
+
+The repository is a Cargo workspace whose root *is* the `mint` package, so `cargo build`
+and `cargo test` here still mean the CLI and nothing else. The second member, `gui/`
+(`mint-gui`), is built explicitly with `cargo build -p mint-gui` and depends on `mint`
+one-way — nothing it pulls in reaches the CLI binary.
 
 The `quality = lq|mq|hq|vhq` setting maps onto libsoxr's recipes. See
 [Audio quality](#audio-quality) for what libsoxr buys you.
@@ -324,12 +344,18 @@ Dry run (show derived chain + planned paths + expected sizes, process nothing):
       [cd] -> ./out/cd/master.wav  (52.9 MB)
           - loudness -> -12.0 LUFS (ceiling -0.1 dBTP, limit; balanced release; linked; soft_clip=false)
           - resample 96000 -> 44100 Hz (vhq)
+          - re-check true peak against the ceiling and re-verify loudness (corrected within the headroom)
           - quantize -> s16 + tpdf + noise-shaping (gentle) (normal)
           - write WAV
       [flac] -> ./out/flac/master.flac  (<= 173.3 MB)
           ...
       [sacd] -> ./out/sacd/master.dsf  (211.7 MB)
           ...
+
+A path that already has a file at it is marked — `(replaces existing)` when the target sets
+`overwrite = true`, `(exists — will fail without --force)` otherwise — and a target that
+cannot deliver this particular input at all (FLAC above 96 kHz, DSD above 5.1) gets a `!`
+line saying so.
 
 The size is what the file will actually weigh: exact for WAV and DSF (every stage in
 between has a deterministic length contract), `~` for MP3 (a nominal bitrate), and `<=` for
@@ -339,6 +365,11 @@ the input header does not declare a length.
 Process all targets for all inputs:
 
     cargo run -- --config examples/mint.toml "masters/*.wav" track.aif
+
+Running that a second time into the same output directory refuses every target: nothing at
+an output path is replaced unless you say so. Add `--force` (or set `overwrite = true` under
+`[defaults]`) to re-render over the previous deliverables — the dry-run marks which paths
+that would replace.
 
 Render only specific targets (repeat `--target`):
 
@@ -354,6 +385,12 @@ human-readable report and banners are suppressed so stdout is pure JSON for QC p
 
 Non-finite meter values (silence, or clips shorter than a meter's window) serialize as
 `null`. A non-zero exit still signals failures, which also appear in the `failures` array.
+
+One case produces **no document at all**: a batch rejected before it starts — an unreadable
+config, an unknown `--target`, an input that cannot be probed, or two inputs that would
+render to one path. Those are setup errors rather than task failures, so they go to stderr
+with a non-zero exit and stdout stays empty. Automation should treat "exit non-zero and
+stdout empty" as "nothing ran".
 
 Two encodings in that document are worth knowing about. `format` carries the delivered
 sample format for PCM (`"s16"`, `"s24"`, …) but `"<N> kbps"` for MP3 and `"1-bit"` for DSD.
@@ -377,6 +414,28 @@ when quantizing to an integer format, i.e. s16/s24), and for a 1-bit deliverable
 rate**. All are per-target config; `--dry-run` and the per-file report show exactly what
 each target will do.
 
+### Loudness measurement
+
+`lufs` is an EBU R128 / ITU-R BS.1770 integrated measurement (via `ebur128`), and BS.1770
+weights channels rather than just summing them. What mint uses:
+
+| channels | weighting |
+|---|---|
+| 1 (mono) | counted **twice**, as dual mono |
+| 2 | L, R at +0 dB |
+| 5.1 (SMPTE order) | L, R, C at +0 dB; Ls, Rs at +1.5 dB; LFE excluded |
+| 7 and above | channels 7+ are currently **excluded** from the measurement |
+
+The mono row is the one that surprises people, and it is deliberate: a 1-channel deliverable
+is played through both speakers, so the loudness that matters is the dual-mono one, 3.01 LU
+(10·log₁₀2) above a single-channel reading. Metering it as one channel would put every mono
+master 3.01 dB over its target on any normal playback system.
+
+> **Compatibility note.** mint metered mono as a single channel before this was fixed, so a
+> mono deliverable re-rendered now comes out **3.01 dB quieter** than the same target
+> produced previously. Stereo and surround are unaffected, and true peak is unaffected at
+> every channel count.
+
 ### Resampling
 
 Sample-rate conversion goes through **libsoxr** (needs the system library; see
@@ -388,8 +447,27 @@ onto libsoxr's internal recipes. `vhq` is the right choice for masters; the lowe
 settings trade stopband and transition-band performance for speed.
 
 The resampler runs **only when a target's rate differs from the source** — same-rate PCM
-targets skip it entirely. Whenever it does run, the true-peak ceiling is re-checked and
-re-limited afterwards, since sample-rate conversion can create new inter-sample peaks.
+targets skip it entirely. Whenever it does run, two things are re-verified afterwards,
+because a conversion changes both of the numbers the target is judged on:
+
+- **The true-peak ceiling**, re-checked and re-limited, since sample-rate conversion creates
+  new inter-sample peaks.
+- **The integrated loudness**, re-measured and pulled back onto the `lufs` target with a
+  static gain. The normalization gain was computed at the *source* rate, and BS.1770's
+  K-weighting keeps counting energy above 20 kHz — so band-limiting a 96 kHz master to
+  44.1 kHz removes loudness the meter had already credited. Ordinary programme drifts about
+  0.03 LU and nothing happens; an ultrasonic-heavy master can drift several LU.
+
+  An upward correction is capped at the headroom under `ceiling_dbtp`. That cap is the point:
+  within it no limiter runs, so the delivered dynamics are untouched and the correction cannot
+  eat back the loudness it just added. The cost is that a target with no headroom left cannot
+  be fully corrected — that residual is reported rather than bought with gain reduction.
+
+Both passes apply under every `on_clip` policy, `warn` included: `on_clip` is a decision
+about clipping, and neither pass can put a sample above the ceiling.
+
+The "loudness target not met within ±0.1 LU" warning is measured on the **delivered** audio,
+after both of those, so it describes the file that ships rather than an intermediate one.
 
 DSD targets are the exception on both counts: they resample to a *derived* intermediate
 rate (which is usually not the source rate), and the ×2ⁿ interpolation into the modulator
@@ -411,11 +489,11 @@ resampling only; dither, quantization, and noise shaping always stay in this too
 | `reduce_gain` | Never limit: cap the normalization gain (and, if needed, attenuate) so the peak fits. Dynamics are preserved exactly; the loudness target may be missed, and a warning says so. |
 | `warn` | Do neither. Report the overshoot and deliver it as-is. Diagnostic use — this is the one policy that can hand you a file above its own ceiling. |
 
-One caveat on the last two: the ceiling re-check that runs **after a resample** does not
-consult `on_clip`. Sample-rate conversion creates new inter-sample peaks, so a target that
-resamples always gets those trimmed by the limiter, and a `warn` target can therefore come
-out at its ceiling after all. `warn` only truly delivers an overshoot when no resample
-happens.
+One caveat on the last two: neither post-resample pass (see
+[Resampling](#resampling)) consults `on_clip`. Sample-rate conversion creates new
+inter-sample peaks, so a target that resamples always gets those trimmed by the limiter and
+its loudness re-verified, and a `warn` target can therefore come out at its ceiling after
+all. `warn` only truly delivers an overshoot when no resample happens.
 
 ### Limiter behavior
 
@@ -602,8 +680,23 @@ Worth knowing:
 
 ## Notes
 
-- Input files are never overwritten by default (use `--force` or `overwrite = true`).
-- Output naming requires `{stem}`; targets that would collide on disk are rejected at load.
+- **Nothing at an output path is replaced by default.** `overwrite = false` (the default)
+  refuses both a previous render and an input master, with a different message for each;
+  `--force` or `overwrite = true` allows it. So re-rendering into a directory you have
+  already rendered into needs `--force` — that is the trade for the previous run's
+  deliverables being safe.
+- "The input file" is a question about *identity*, not spelling. A leading `./`, a `..` in
+  the path, a symlink and a hard link all name the same bytes and are all caught; the
+  comparison is by inode on Unix and by canonical path elsewhere.
+- Writes are atomic: every codec renders to a sibling temp file and is renamed into place, so
+  a failed or interrupted encode cannot destroy the deliverable that was already there. What
+  this does *not* promise is durability across a power cut (there is no `fsync`), and a
+  replaced file takes the new file's permissions rather than keeping its own.
+- Output naming requires `{stem}`; targets that would collide on disk are rejected at load,
+  and two *inputs* that would render to one path (same stem, different directories) are
+  rejected before anything is decoded — as is a target whose output would land on another
+  input of the same run. No naming placeholder carries an input's directory, so the fix for
+  a same-stem collision is separate runs with different `dir`s, or a rename.
   `{cext}` (codec extension) and `{dsd}` (`"dsd64"`…, empty for PCM) are available as
   tie-breakers; on a DSD target `{rate}` renders the 1-bit rate and `{format}` renders
   `1bit`.

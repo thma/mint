@@ -95,6 +95,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::audio::atomic_write::{self, Staged};
 use crate::ops::dsd::DsdRate;
 use crate::ops::dsd::pack::{BitOrder, BitPacker, DSD_SILENCE};
 
@@ -145,9 +146,17 @@ pub struct DsfSummary {
 
 /// A DSF file being written. Feed it planar bit blocks with [`write`](Self::write), then
 /// call [`finish`](Self::finish) exactly once.
+///
+/// The bytes go to a staging sibling of `path` and are renamed into place by `finish`. This
+/// writer is the one that most needs it: a DSD render is the longest job mint has, and it
+/// has to seek back into its own file to patch the header — so the window in which the
+/// output is on disk but not yet valid is the whole encode.
 pub struct DsfWriter {
     file: BufWriter<File>,
+    /// The final path. Held for error messages; the bytes go to `staged.path()`.
     path: PathBuf,
+    /// `Some` until `finish` renames it into place. Dropping it deletes the partial file.
+    staged: Option<Staged>,
     channels: usize,
     rate: DsdRate,
     /// One packer per channel: the payload is planar, so the channels never share a byte.
@@ -175,12 +184,13 @@ impl DsfWriter {
         if channels == 0 || channels > MAX_CHANNELS {
             bail!("DSF supports 1 to {MAX_CHANNELS} channels, got {channels}");
         }
-        let file = File::create(path)
+        let (file, staged) = atomic_write::create(path)
             .with_context(|| format!("failed to create output dsf: {}", path.display()))?;
 
         let mut writer = Self {
             file: BufWriter::new(file),
             path: path.to_path_buf(),
+            staged: Some(staged),
             channels,
             rate,
             // LSB first is not a choice here: it is what `bitsPerSample = 1` means.
@@ -289,6 +299,20 @@ impl DsfWriter {
         self.file
             .flush()
             .with_context(|| format!("failed to flush dsf: {}", self.path.display()))?;
+
+        // Only now, with all three header fields patched, is the file a valid DSF. Anything
+        // that went wrong before this point took the `Staged` down with it on unwind and
+        // left whatever was at `path` untouched.
+        let staged = self
+            .staged
+            .take()
+            .expect("finish consumes the writer, so the staging file is still held");
+        // Close the handle before renaming. Neither platform strictly requires it (std opens
+        // with FILE_SHARE_DELETE on Windows), but it keeps the rename from depending on that
+        // detail, and it means the last thing to touch the bytes is the explicit `flush`
+        // above rather than a `Drop` whose errors nobody can see.
+        drop(self);
+        staged.commit()?;
 
         Ok(summary)
     }

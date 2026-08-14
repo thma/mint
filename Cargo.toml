@@ -2,6 +2,13 @@
 name = "mint"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+
+# The root stays a real package rather than becoming a virtual manifest: release.yml
+# reads the version with `grep -m1 '^version' Cargo.toml`, and `cargo build` here must
+# keep meaning "build the CLI" so the GUI's eframe/wgpu tree never enters its graph.
+[workspace]
+members = ["gui"]
 
 [dependencies]
 anyhow = "1.0"

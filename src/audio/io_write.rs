@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
 
+use crate::audio::atomic_write;
 use crate::audio::buffer::{AudioBuffer, OutputSampleFormat};
 
 /// Write the buffer as a WAV file. When `bext` is `Some`, a Broadcast WAV extension
@@ -14,6 +15,9 @@ use crate::audio::buffer::{AudioBuffer, OutputSampleFormat};
 /// before handing the bytes to disk, so sample encoding is never reimplemented.
 /// The one exception is f64: hound's Float support is 32-bit only, so that stream
 /// is serialized by `encode_wav_f64` (f64 has no packing subtleties to delegate).
+///
+/// Every route lands on disk through [`atomic_write`], so a failure partway through
+/// leaves the previous deliverable intact.
 pub fn write_wav(path: &Path, buffer: &AudioBuffer, bext: Option<&BextMetadata>) -> Result<()> {
     if buffer.out_format == OutputSampleFormat::F64 {
         let wav = encode_wav_f64(buffer)?;
@@ -22,19 +26,20 @@ pub fn write_wav(path: &Path, buffer: &AudioBuffer, bext: Option<&BextMetadata>)
             Some(meta) => splice_chunk_after_wave(&wav, b"bext", &meta.to_bytes())
                 .context("failed to splice bext chunk")?,
         };
-        return std::fs::write(path, bytes)
-            .with_context(|| format!("failed to write output wav: {}", path.display()));
+        return atomic_write::write(path, &bytes);
     }
 
     let spec = wav_spec(buffer);
 
     match bext {
-        // Fast path: stream straight to the file.
+        // Fast path: stream straight to the (staging) file.
         None => {
-            let mut writer = WavWriter::create(path, spec)
+            let staged = atomic_write::Staged::new(path)?;
+            let mut writer = WavWriter::create(staged.path(), spec)
                 .with_context(|| format!("failed to create output wav: {}", path.display()))?;
             write_samples(&mut writer, buffer)?;
             writer.finalize().context("failed to finalize wav writer")?;
+            staged.commit()?;
         }
         // Splice path: render to memory, insert the bext chunk, then write.
         Some(meta) => {
@@ -48,8 +53,7 @@ pub fn write_wav(path: &Path, buffer: &AudioBuffer, bext: Option<&BextMetadata>)
             let wav = cursor.into_inner();
             let spliced = splice_chunk_after_wave(&wav, b"bext", &meta.to_bytes())
                 .context("failed to splice bext chunk")?;
-            std::fs::write(path, spliced)
-                .with_context(|| format!("failed to write output wav: {}", path.display()))?;
+            atomic_write::write(path, &spliced)?;
         }
     }
     Ok(())
@@ -257,13 +261,38 @@ fn splice_chunk_after_wave(wav: &[u8], id: &[u8; 4], data: &[u8]) -> Result<Vec<
 // FLAC (pure-Rust flacenc) — lossless, integer (s16/s24) only.
 // ---------------------------------------------------------------------------
 
+/// Highest sample rate [`write_flac`] can encode.
+///
+/// Not a limitation of the format: RFC 9639 codes sample rates up to 655 350 Hz, and
+/// 24/192 FLAC is a real deliverable (Tidal HiRes, Amazon Ultra HD). It is a limitation of
+/// this *backend* — flacenc 0.5's `Stream::new` runs `verify_range!("sample_rate", ..,
+/// ..=96_000)` (`component/verify.rs:144`) and refuses to construct the stream at all above
+/// it, so there is nothing to work around from mint's side short of changing encoders.
+///
+/// Exported because the value is needed long before the encoder is: `config::validate_fields`
+/// rejects an explicit `rate` above it at load time and `ResolvedTarget::delivery_blocker`
+/// rejects a derived one before any DSP runs. Getting the error here, from the writer, means
+/// the whole chain already ran for nothing.
+pub const FLAC_MAX_SAMPLE_RATE: u32 = 96_000;
+
 /// Encode the (already quantized) buffer as FLAC at `bits_per_sample` (16 or 24).
 pub fn write_flac(path: &Path, buffer: &AudioBuffer, bits_per_sample: usize) -> Result<()> {
-    use anyhow::anyhow;
+    use anyhow::{anyhow, bail};
     use flacenc::bitsink::ByteSink;
     use flacenc::component::BitRepr;
     use flacenc::error::Verify;
     use flacenc::source::MemSource;
+
+    // The backstop, mirroring `DsfWriter::create`'s channel check: the config and the
+    // pipeline both refuse this long before here, so reaching it means a caller found a
+    // route around them — and the alternative is flacenc's `VerifyError` debug struct after
+    // an interleaved `Vec<i32>` the size of the buffer has already been allocated.
+    if buffer.sample_rate > FLAC_MAX_SAMPLE_RATE {
+        bail!(
+            "FLAC supports up to {FLAC_MAX_SAMPLE_RATE} Hz, got {} Hz",
+            buffer.sample_rate
+        );
+    }
 
     let channels = buffer.channels_count();
     let frames = buffer.frame_len();
@@ -290,9 +319,7 @@ pub fn write_flac(path: &Path, buffer: &AudioBuffer, bits_per_sample: usize) -> 
     stream
         .write(&mut sink)
         .map_err(|_| anyhow!("flac bitstream serialization failed"))?;
-    std::fs::write(path, sink.as_slice())
-        .with_context(|| format!("failed to write flac: {}", path.display()))?;
-    Ok(())
+    atomic_write::write(path, sink.as_slice())
 }
 
 /// Make STREAMINFO declare the fixed-blocksize stream that `encode_with_fixed_block_size`
@@ -379,8 +406,7 @@ pub fn write_mp3(path: &Path, buffer: &AudioBuffer, bitrate_kbps: u32) -> Result
         .flush_to_vec::<FlushNoGap>(&mut out)
         .map_err(|e| anyhow!("mp3 flush: {e}"))?;
 
-    std::fs::write(path, out).with_context(|| format!("failed to write mp3: {}", path.display()))?;
-    Ok(())
+    atomic_write::write(path, &out)
 }
 
 /// Map a kbps value onto libmp3lame's bitrate enum (validated upstream in config).

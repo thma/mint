@@ -73,6 +73,123 @@ fn carrier_with_clicks(rate: u32, seconds: f64, carrier_amp: f64, click: f64) ->
     buffer
 }
 
+/// The same signal as one channel and as two identical channels.
+fn dual_mono_of(buffer: &AudioBuffer) -> AudioBuffer {
+    let mut dual = buffer.clone();
+    dual.channels.push(buffer.channels[0].clone());
+    dual.src_info.channels = 2;
+    dual
+}
+
+// ══════════════════════════ mono is metered as dual mono ═════════════════════════════
+//
+// A 1-channel deliverable is played through both speakers. BS.1770 counts that channel
+// twice; ebur128's default map counts it once, as a lone `Left`. The gap is exactly
+// 10*log10(2) = 3.010 LU, and it went straight into the normalization gain, so every mono
+// master shipped 3.01 dB hot.
+
+#[test]
+fn mono_meters_the_same_as_the_dual_mono_it_will_be_played_as() {
+    let mono = sine_buffer(48_000, 3.0, 997.0, 0.5);
+    let dual = dual_mono_of(&mono);
+
+    let m = loudness::analyze(&mono).expect("analyze mono").integrated_lufs;
+    let d = loudness::analyze(&dual).expect("analyze dual").integrated_lufs;
+    assert!(
+        (m - d).abs() < 0.01,
+        "mono {m:.4} and dual mono {d:.4} LUFS must agree (they differed by 3.01 before the \
+         channel map was set)"
+    );
+}
+
+/// The user-visible defect, stated end to end: normalize a mono file, then play it the way
+/// a mono file is played. Before the fix this landed at -14.99 LUFS against a -18 target.
+#[test]
+fn a_normalized_mono_deliverable_hits_its_target_through_two_speakers() {
+    let mut buffer = sine_buffer(48_000, 4.0, 997.0, 0.5);
+    loudness::apply(
+        &mut buffer,
+        -18.0,
+        Some(-1.0),
+        Some(OnClipPolicy::Limit),
+        limiter_opts(),
+        8.0,
+    )
+    .expect("loudness apply should succeed");
+
+    let played = loudness::analyze(&dual_mono_of(&buffer)).expect("analyze playback");
+    assert!(
+        (played.integrated_lufs + 18.0).abs() <= 0.1,
+        "mono delivered at {:.2} LUFS when played as dual mono; target was -18.00",
+        played.integrated_lufs
+    );
+}
+
+/// Numeric pin on the 3.01 figure. It is exact rather than approximate because K-weighting
+/// at 997 Hz is +0.691 dB, which cancels BS.1770's -0.691 offset — so a dual-mono 997 Hz
+/// sine meters at its own peak level in dBFS.
+#[test]
+fn a_mono_997_hz_sine_meters_at_its_own_peak_level() {
+    let a = loudness::analyze(&sine_buffer(48_000, 3.0, 997.0, 0.5)).expect("analyze");
+    assert!(
+        (a.integrated_lufs - (-6.0206)).abs() < 0.02,
+        "expected ~-6.02 LUFS for a -6.02 dBFS sine, got {:.4}",
+        a.integrated_lufs
+    );
+}
+
+/// Guards the half-fix that would be worst: `measure_lufs` (which sets the gain) and
+/// `analyze` (which fills the report and the BWF bext chunk) must agree, or the delivered
+/// file and the numbers printed about it differ by 3.01 LU with both looking plausible.
+#[test]
+fn the_gain_is_computed_from_the_loudness_the_report_prints() {
+    let pristine = sine_buffer(48_000, 3.0, 997.0, 0.4);
+    let reported = loudness::analyze(&pristine).expect("analyze").integrated_lufs;
+
+    let mut buffer = pristine.clone();
+    let result = loudness::apply(
+        &mut buffer,
+        -20.0,
+        Some(-1.0),
+        Some(OnClipPolicy::Limit),
+        limiter_opts(),
+        8.0,
+    )
+    .expect("apply");
+
+    assert!(
+        (result.in_lufs - reported).abs() < 1e-9,
+        "the meter that sets the gain ({:.6}) and the meter that reports ({reported:.6}) \
+         must be the same meter",
+        result.in_lufs
+    );
+}
+
+/// Regression pin: only `channels == 1` may be remapped. ebur128's defaults for 4/5/5.1 are
+/// non-obvious (quad; L R C Ls Rs; L R C Unused Ls Rs), and a hand-written full channel map
+/// would change surround metering silently.
+#[test]
+fn stereo_metering_is_untouched_by_the_mono_map() {
+    let stereo = dual_mono_of(&sine_buffer(48_000, 3.0, 997.0, 0.5));
+    let a = loudness::analyze(&stereo).expect("analyze");
+    assert!(
+        (a.integrated_lufs - (-6.0206)).abs() < 0.02,
+        "two identical -6.02 dBFS channels must still meter ~-6.02 LUFS, got {:.4}",
+        a.integrated_lufs
+    );
+}
+
+/// The channel map weights the K-filtered energy sum; the true-peak scan runs outside that
+/// loop. Encoding it here means a future map change cannot quietly move a ceiling.
+#[test]
+fn the_channel_map_never_reaches_the_true_peak_meter() {
+    let mono = sine_buffer(48_000, 1.0, 997.0, 0.5);
+    let dual = dual_mono_of(&mono);
+    let m = loudness::measure_true_peak_dbtp(&mono).expect("mono tp");
+    let d = loudness::measure_true_peak_dbtp(&dual).expect("dual tp");
+    assert!((m - d).abs() < 1e-9, "true peak must not depend on the channel map: {m} vs {d}");
+}
+
 #[test]
 fn maximize_converges_to_target_where_limit_undershoots() {
     let ceiling = -1.0;
@@ -199,11 +316,18 @@ fn maximize_without_ceiling_breach_hits_target_in_one_pass() {
 fn limit_reports_avg_gain_reduction_and_duty_cycle() {
     // A steady sine pushed above the ceiling is limited essentially everywhere:
     // duty cycle near 1, mean depth positive but never above the peak depth.
+    //
+    // The overshoot has to come from the *ceiling*, not from the target: a sine's integrated
+    // loudness sits within a decibel of its peak, so normalizing one to -1 LUFS lands its
+    // peak on -1 dBTP and asks the limiter for nothing. (This test used to get its overshoot
+    // from mono being metered 3.01 LU too quiet — i.e. from the bug the dual-mono channel map
+    // fixes — so it needed a real premise once that was gone.) A -6 dBTP ceiling against a
+    // -1 LUFS target asks for ~5 dB, everywhere.
     let mut buffer = sine_buffer(48_000, 3.0, 997.0, 0.9);
     let result = loudness::apply(
         &mut buffer,
         -1.0,
-        Some(-1.0),
+        Some(-6.0),
         Some(OnClipPolicy::Limit),
         limiter_opts(),
         8.0,
@@ -292,9 +416,11 @@ fn analyze_loudness_range_grows_with_dynamics() {
 #[test]
 fn limit_policy_reports_gain_reduction_when_squashing_to_target() {
     // A loud source pushed louder must be limited; the reported gain reduction is
-    // the headline "how hard was it squashed" number.
+    // the headline "how hard was it squashed" number. Same premise as
+    // `limit_reports_avg_gain_reduction_and_duty_cycle`: the overshoot comes from a ceiling
+    // below the target, because a sine normalized to its own crest asks for no limiting.
     let mut buffer = sine_buffer(48_000, 3.0, 997.0, 0.9);
-    let ceiling = -1.0;
+    let ceiling = -6.0;
 
     let result = loudness::apply(
         &mut buffer,
@@ -417,7 +543,7 @@ fn recheck_applies_limiter_when_ceiling_exceeded() {
     let warn = loudness::recheck_and_limit_if_needed(&mut buffer, ceiling_dbtp, limiter_opts())
         .expect("recheck should succeed");
 
-    assert!(!warn.is_empty(), "limiter was applied; must produce a warning");
+    assert!(!warn.warnings.is_empty(), "limiter was applied; must produce a warning");
     let max_sample = buffer.channels[0].iter().map(|s| s.abs()).fold(0.0_f64, f64::max);
     assert!(
         max_sample <= ceiling_lin + 1e-6,
@@ -477,7 +603,10 @@ fn recheck_leaves_buffer_unchanged_when_within_ceiling() {
     let warn = loudness::recheck_and_limit_if_needed(&mut buffer, -1.0, limiter_opts())
         .expect("recheck should succeed");
 
-    assert!(warn.is_empty(), "no warning expected when signal is within ceiling");
+    assert!(
+        warn.warnings.is_empty(),
+        "no warning expected when signal is within ceiling"
+    );
     let sum_after: f64 = buffer.channels[0].iter().sum();
     assert!(
         (sum_before - sum_after).abs() < 1e-10,

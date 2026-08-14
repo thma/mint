@@ -13,6 +13,9 @@ name = "mint-masters"
 [defaults]
 dir     = "./out"
 quality = "vhq"            # lq | mq | hq | vhq
+# overwrite = false        # the default: refuse to replace anything already at an
+#                          # output path, previous renders included. Set it (or pass
+#                          # --force) when you want to re-render over them.
 # naming defaults to "{target}/{stem}.{cext}"
 # placeholders: {stem} {ext} {target} {rate} {format} {cext} {dsd}
 #   {cext} is the codec's extension (wav/flac/mp3/dsf); {dsd} is "dsd64"... and
@@ -60,7 +63,9 @@ preset = "hires"
 
 # FLAC (lossless @ 96k / s24  / -16 LUFS / -0.1 dBTP)
 [target.flac]
-preset = "hires"             # s24 / 96k
+preset = "hires"             # s24 / 96k — also the highest rate FLAC can take here:
+                             # mint's encoder stops at 96 kHz, so a 176.4/192 kHz
+                             # deliverable has to be codec = "wav".
 codec  = "flac"              # -> song.flac (FLAC keeps the s24 depth)
 
 # MP3 (lossy) — codec is independent of bit depth.
