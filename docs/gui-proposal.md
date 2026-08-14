@@ -274,6 +274,16 @@ Cancellation semantics come out right for free: `ctl.check()?` propagates as an 
 
 ### Tier 2 — the two that make it a desktop app rather than a wrapper
 
+> **Status 2026-08-14: done.** Both, plus `tests/explain.rs` and `tests/job_control.rs`.
+> Three deltas. (1) `Fate` is **not** four alternatives — `WouldError` turned out to be
+> orthogonal to the other three, exactly as this document's own mockup shows with `~!` on
+> `format`, so the model is `Fate::{Applies, Inert(why)}` plus a separate `dropped` and
+> `illegal_here`. A field can be all three. (2) Provenance is not computed inside `overlay`
+> but from the ordered `Layers` array that `overlay` is folded over, which is the same
+> single-source property with far less machinery. (3) `Stage` is as specified, but the
+> loudness *meters* and the WAV/FLAC/MP3 writers report indeterminate rather than fake a
+> bar — they are single blocking calls with nothing to count. `--explain` ships with it.
+
 | # | Change | Effort | Note |
 |---|---|---|---|
 | **T2-1** | `pub fn Config::resolve_target_explained(&self, name) -> Result<(ResolvedTarget, FieldOrigins)>`, where `FieldOrigins` records `(Layer, Fate)` per field. `Layer` = Builtin \| Defaults \| Preset(&str) \| Explicit. `Fate` = Applies \| Inert \| Dropped \| WouldError. Computed **inside** `overlay`/`resolve_target`, never re-derived. | ~1 day | **The highest-value screen in the whole design and it is impossible in every stack today** — the design panel's levelling correction. `overlay()`, `builtin_fallback()`, `preset()` are private and `resolve_target` discards provenance. The `Fate` axis is the one nobody expects and it is invisible in `--dry-run`, `--json` and every error message: `[defaults] rate = 48000` is *dropped* on a DSD target (config.rs:698) while an explicit `format` on the same target is a hard *error*. Belongs in the library regardless — it also gives the CLI `mint --explain <target>`. |
@@ -307,6 +317,28 @@ Carried verbatim from the UX analysis because these are the failure modes a well
 ## 8. Phased delivery
 
 ### Phase 0 — de-risking spike (1 week, throwaway code, `gui/` branch)
+
+> **Status 2026-08-14: all seven answered, six of them green and one green-with-an-asterisk.**
+> Measured on this machine (M-series macOS, rustc 1.97.1, eframe/egui 0.36.1, egui_table
+> 0.10):
+>
+> | # | Answer | Evidence |
+> |---|---|---|
+> | S1 | **green** | Workspace with root-as-package builds; `grep -m1 '^version' Cargo.toml` → `0.1.0`. `cargo build` at the root still compiles `mint` alone — release CLI is **5.3 MB**, unchanged. |
+> | S2 | **green** | Five-field live-validating form. Parse + validate of the 11-target `examples/mint.toml`: **80 µs warm median, 135 µs worst** (release) — 0.5 % of a 60 Hz frame, so per-frame validation is not merely affordable, it is free. **No rule was reimplemented in the GUI.** |
+> | S3 | **green** | `TextEdit::layouter` + a line-based highlighter + an underline at `toml_edit::TomlError::span()`. No second TOML implementation entered the build; no text engine was written. |
+> | S4 | **green** | `egui_table` 20×8 = 160 live cells: **696 µs/frame in a debug build** (4 % of the budget), every cell doing real `delivery_blocker` / `render_output_path` / `estimated_output_bytes` work. fps itself is not measurable headlessly; frame cost is the question underneath it. |
+> | S5 | **green, and better than planned** | The Tier-A `stat()` trick was not needed: Tier B (`JobControl`) landed first, so the percentage comes from inside `encode_dsf`'s block loop. A real DSD64 render runs on a worker while the harness keeps building frames; the fraction is monotonic and the `.dsf` lands. |
+> | S6 | **green** | Byte-diffed against the real `examples/mint.toml`: one line changes per edit, trailing comments and `=` alignment survive, target order is preserved, and a preset is never expanded. |
+> | S7 | **green\*** | Both `wgpu` and `glow` are compiled in and selectable via `--renderer` / `MINT_RENDERER`; both launch and stay up. The asterisk: the *interesting* half — wgpu over RDP or on a no-GPU VM — was not tested, and is moot for a private macOS tool (§11 Q1). The fallback is in the binary, which is what makes it a fallback. |
+>
+> GUI binary with both renderers: **17 MB**. Two deviations from the plan worth naming.
+> The code is **not throwaway and not on a branch** — Tiers 0–2 had already made the
+> library ready, so the spike was written as the beginning of Phase 1 (a `lib` + `bin`
+> crate, seven modules, four headless test files) rather than as code to delete. And one
+> real bug fell out of S5: the run view drained its worker's events from inside the Run
+> tab's `ui`, so a job stalled the moment the user looked at another tab. `MintApp::frame`
+> drains unconditionally now.
 
 Not a prototype of the app. A list of yes/no answers. **Do not proceed to Phase 1 until all seven are green.**
 

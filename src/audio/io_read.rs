@@ -14,6 +14,7 @@ use symphonia::core::probe::Hint;
 use symphonia::default::{get_codecs, get_probe};
 
 use crate::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
+use crate::progress::{JobControl, Stage};
 
 /// What the container header says, without decoding a single sample.
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +121,17 @@ pub fn probe_source(path: &Path) -> Result<SourceProbe> {
 }
 
 pub fn read_audio(path: &Path) -> Result<AudioBuffer> {
+    read_audio_with(path, JobControl::default())
+}
+
+/// [`read_audio`], cancellable and reporting progress.
+///
+/// Worth hooking despite not being DSP: decoding a 461 MB master is seconds of work that
+/// used to be entirely uninterruptible, and it is the *first* thing a job does — the stage
+/// a user is most likely to change their mind during. Progress is against the frame count
+/// the container declares; when it declares none the fraction stays 0 and only the
+/// cancellation half works, which is the honest outcome rather than a guessed bar.
+pub fn read_audio_with(path: &Path, ctl: JobControl<'_>) -> Result<AudioBuffer> {
     let file = File::open(path)
         .with_context(|| format!("failed to open input file: {}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -161,8 +173,10 @@ pub fn read_audio(path: &Path) -> Result<AudioBuffer> {
 
     let mut channels_data: Vec<Vec<f64>> = Vec::new();
     let mut channels_count = 0usize;
+    let mut progress = ctl.stage(Stage::Decode, frame_capacity as u64);
 
     loop {
+        progress.tick(channels_data.first().map_or(0, |c: &Vec<f64>| c.len() as u64))?;
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(symphonia::core::errors::Error::IoError(err))
@@ -192,6 +206,8 @@ pub fn read_audio(path: &Path) -> Result<AudioBuffer> {
             }
         }
     }
+
+    progress.finish();
 
     if channels_data.is_empty() {
         bail!("decoded stream has no audio samples");

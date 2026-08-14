@@ -20,8 +20,16 @@ pub struct Args {
     config: Option<PathBuf>,
 
     /// Input files and/or glob patterns.
-    #[arg(required = true)]
+    ///
+    /// Not required with `--explain`, which answers a question about the config alone and
+    /// never touches audio.
+    #[arg(required_unless_present = "explain")]
     inputs: Vec<String>,
+
+    /// Explain one target: every field's effective value, which of the four config layers
+    /// it came from, and what became of it. Prints and exits without reading any audio.
+    #[arg(long, value_name = "TARGET")]
+    explain: Option<String>,
 
     /// Render only the named target(s); repeat the flag for several. Default: all targets.
     #[arg(long)]
@@ -74,6 +82,13 @@ pub fn run() -> Result<()> {
 
     let config_path = resolve_config_path(args.config.as_deref())?;
     let config = Config::from_path(&config_path)?;
+
+    // Ahead of target selection and input globbing: this is a question about the config,
+    // and answering it must not depend on there being a master to point at.
+    if let Some(name) = &args.explain {
+        return print_explanation(&config, name);
+    }
+
     let targets = resolve_selected_targets(&config, &args.target, args.force)?;
 
     let inputs = resolve_inputs(&args.inputs)?;
@@ -356,6 +371,99 @@ fn print_dry_run(probed: &[ProbedInput<'_>], targets: &[ResolvedTarget]) -> Resu
         }
     }
     Ok(())
+}
+
+/// `--explain`: the four-layer merge, per field, for one target.
+///
+/// This is the one thing `--dry-run` structurally cannot show. The dry-run prints the
+/// *chain* — what will happen to the audio — and by then every value has been flattened to
+/// a single answer. Here the answer is still attached to where it came from, which is what
+/// makes a dropped `[defaults] rate` or a would-be-fatal `format` visible at all.
+fn print_explanation(config: &Config, name: &str) -> Result<()> {
+    if !config.target_names().iter().any(|t| t == name) {
+        bail!(
+            "no such target: '{name}' (this config defines: {})",
+            config.target_names().join(", ")
+        );
+    }
+    let (_, explanation) = config.resolve_target_explained(name)?;
+
+    match &explanation.preset {
+        Some(preset) => println!("target '{}'  (preset: {preset})", explanation.target),
+        None => println!("target '{}'", explanation.target),
+    }
+    println!();
+    println!("  origin  B builtin   D [defaults]   P preset   E this target   — nothing set it");
+    println!("  fate    · applies   ~ inert   / inherited value dropped   ! error if stated here");
+
+    let mut group = None;
+    for field in &explanation.fields {
+        if group != Some(field.group) {
+            println!();
+            println!("  {}", field.group);
+            group = Some(field.group);
+        }
+        let origin = field.origin.layer.as_ref().map_or('—', |layer| layer.glyph());
+        let mut marks = String::from(field.origin.fate.glyph());
+        if field.origin.dropped.is_some() {
+            marks.push('/');
+        }
+        if field.origin.illegal_here {
+            marks.push('!');
+        }
+        println!("    {:<22} {:<34} {origin}  {marks}", field.field, field.value);
+    }
+
+    // The prose the columns cannot carry. Only fields with something surprising about them
+    // appear — on a plain PCM target this section is usually empty, which is itself useful.
+    let mut printed_header = false;
+    for field in &explanation.fields {
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(reason) = field.origin.fate.reason() {
+            notes.push(format!("~ inert — {reason}"));
+        }
+        if let Some(dropped) = &field.origin.dropped {
+            notes.push(format!(
+                "/ {} says {} = {}, and it is not read here — {}",
+                dropped.layer, field.field, dropped.value, dropped.why
+            ));
+        }
+        if field.origin.illegal_here {
+            notes.push(
+                "! legal to inherit, a load-time error if stated on this target".to_string(),
+            );
+        }
+        if notes.is_empty() {
+            continue;
+        }
+        if !printed_header {
+            println!();
+            println!("  why");
+            printed_header = true;
+        }
+        for note in notes {
+            print_wrapped(&format!("    {}: ", field.field), &note);
+        }
+    }
+    Ok(())
+}
+
+/// Wrap `text` under a hanging indent so a long explanation stays readable in a terminal.
+fn print_wrapped(prefix: &str, text: &str) {
+    const WIDTH: usize = 96;
+    let hang = " ".repeat(prefix.len());
+    let mut line = prefix.to_string();
+    for word in text.split_whitespace() {
+        if line.len() + 1 + word.len() > WIDTH && line.trim_end() != prefix.trim_end() {
+            println!("{line}");
+            line = hang.clone();
+        }
+        if !line.ends_with(' ') && !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    println!("{line}");
 }
 
 fn print_reports(reports: &[ProcessingReport]) {

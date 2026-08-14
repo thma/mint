@@ -4,6 +4,7 @@ use libsoxr::{Datatype, IOSpec, QualityFlags, QualityRecipe, QualitySpec, Soxr};
 use crate::audio::buffer::AudioBuffer;
 use crate::config::ResampleQuality;
 use crate::ops::dsd::interpolate::SoxrStream;
+use crate::progress::{JobControl, Stage};
 
 /// Input frames per pass of the conversion loop. Large enough that the per-call FFI
 /// crossing disappears into the filtering, small enough that the interleaved scratch
@@ -15,6 +16,16 @@ const BLOCK_FRAMES: usize = 16_384;
 /// SRC is libsoxr throughout (reference-grade, multi-stage, FFI to the system C lib).
 /// Contract: planar f64 in, planar f64 out, output length == round(in_frames * ratio).
 pub fn apply(buffer: &mut AudioBuffer, target_rate: u32, quality: Option<ResampleQuality>) -> Result<()> {
+    apply_with(buffer, target_rate, quality, JobControl::default())
+}
+
+/// [`apply`], reporting progress and honouring cancellation between blocks.
+pub fn apply_with(
+    buffer: &mut AudioBuffer,
+    target_rate: u32,
+    quality: Option<ResampleQuality>,
+    ctl: JobControl<'_>,
+) -> Result<()> {
     if target_rate == buffer.sample_rate {
         return Ok(());
     }
@@ -26,7 +37,7 @@ pub fn apply(buffer: &mut AudioBuffer, target_rate: u32, quality: Option<Resampl
         return Ok(());
     }
 
-    apply_soxr(buffer, target_rate, quality, channels, in_frames)
+    apply_soxr(buffer, target_rate, quality, channels, in_frames, ctl)
 }
 
 /// libsoxr as a *pure* resampler: f64 in, f64 out. Because the I/O datatype is
@@ -53,6 +64,7 @@ fn apply_soxr(
     quality: Option<ResampleQuality>,
     channels: usize,
     in_frames: usize,
+    ctl: JobControl<'_>,
 ) -> Result<()> {
     let ratio = target_rate as f64 / buffer.sample_rate as f64;
     let expected = (in_frames as f64 * ratio).round() as usize;
@@ -63,6 +75,7 @@ fn apply_soxr(
         .collect();
     let mut chunk: Vec<Vec<f64>> = vec![Vec::with_capacity(BLOCK_FRAMES); channels];
 
+    let mut progress = ctl.stage(Stage::Resample, in_frames as u64);
     let mut pos = 0;
     while pos < in_frames {
         let n = BLOCK_FRAMES.min(in_frames - pos);
@@ -74,7 +87,9 @@ fn apply_soxr(
             channel.extend_from_slice(ready);
         }
         pos += n;
+        progress.tick(pos as u64)?;
     }
+    progress.finish();
     for (channel, tail) in out.iter_mut().zip(stream.finish()?) {
         channel.extend_from_slice(tail);
     }

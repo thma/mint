@@ -5,6 +5,7 @@ pub mod dither;
 pub mod json_report;
 pub mod ops;
 pub mod pipeline;
+pub mod progress;
 pub mod util;
 
 /// Whether this build can actually encode MP3. Without it an `codec = "mp3"` target

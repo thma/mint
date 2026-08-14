@@ -5,6 +5,7 @@ use crate::config::{DitherMode, DitherStrength, DitherCorrelation};
 use crate::dither::{NoiseShaper, ShapingCurve, TpdfDither};
 use crate::dither::psychoacoustic::PsychoacousticAnalysis;
 use crate::dither::adaptive::{AdaptiveShaper, quantize_adaptive};
+use crate::progress::{JobControl, Stage};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BitDepthApplyResult {
@@ -24,6 +25,32 @@ pub fn apply(
     dither_strength: Option<DitherStrength>,
     dither_correlation: Option<DitherCorrelation>,
     seed: Option<u64>,
+) -> Result<BitDepthApplyResult> {
+    apply_with(
+        buffer,
+        current,
+        target,
+        dither_mode,
+        dither_strength,
+        dither_correlation,
+        seed,
+        JobControl::default(),
+    )
+}
+
+/// [`apply`], cancellable. Coarse by design — the quantizer walks the buffer once per
+/// channel, so a channel is the smallest unit that can be interrupted without threading
+/// the control into the innermost sample loop, where it would cost more than it is worth.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_with(
+    buffer: &mut AudioBuffer,
+    current: &mut OutputSampleFormat,
+    target: OutputSampleFormat,
+    dither_mode: Option<DitherMode>,
+    dither_strength: Option<DitherStrength>,
+    dither_correlation: Option<DitherCorrelation>,
+    seed: Option<u64>,
+    ctl: JobControl<'_>,
 ) -> Result<BitDepthApplyResult> {
     let mode = dither_mode.unwrap_or(DitherMode::Tpdf);
     let reduced = is_reduction(*current, target);
@@ -46,7 +73,9 @@ pub fn apply(
 
     if reduced {
         let correlation = dither_correlation.unwrap_or_default();
-        quantize_in_place(buffer, target, mode, dither_strength, dithered, curve, correlation, seed);
+        quantize_in_place(
+            buffer, target, mode, dither_strength, dithered, curve, correlation, seed, ctl,
+        )?;
     }
 
     *current = target;
@@ -94,6 +123,7 @@ fn bit_depth_rank(format: OutputSampleFormat) -> u8 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn quantize_in_place(
     buffer: &mut AudioBuffer,
     target: OutputSampleFormat,
@@ -103,12 +133,15 @@ fn quantize_in_place(
     curve: Option<ShapingCurve>,
     correlation: DitherCorrelation,
     seed: Option<u64>,
-) {
+    ctl: JobControl<'_>,
+) -> Result<()> {
     // Only ever called on a reduction, so the target is always an integer format
     // (grid is Some). Resolve the grid once — it's loop-invariant.
     let Some((max, min_i, max_i)) = target.int_grid() else {
-        return;
+        return Ok(());
     };
+    let channel_count = buffer.channels_count() as u64;
+    let mut progress = ctl.stage(Stage::Quantize, channel_count);
 
     if is_adaptive(mode, target) {
         // Strength → FIR order: more taps track the perceptual target more sharply.
@@ -124,28 +157,35 @@ fn quantize_in_place(
         let mix = mono_mix(&buffer.channels);
         let analysis = PsychoacousticAnalysis::analyze(&mix, buffer.sample_rate);
         let shaper = AdaptiveShaper::from_analysis(&analysis, order);
+        progress.tick(0)?;
         quantize_adaptive(buffer, max, min_i, max_i, &shaper, correlation, seed);
-        return;
+        progress.finish();
+        return Ok(());
     }
 
     if let Some(curve) = curve {
         // One shaper per channel: the error-feedback history must stay per-channel,
         // unlike the flat path which can share a single dither stream.
         for (ch, channel) in buffer.channels.iter_mut().enumerate() {
+            progress.tick(ch as u64)?;
             let mut shaper = NoiseShaper::new(curve, per_channel_seed(seed, ch));
             for sample in channel {
                 *sample = shaper.quantize(*sample, max, min_i, max_i);
             }
         }
-        return;
+        progress.finish();
+        return Ok(());
     }
 
     let mut dither = use_dither.then(|| TpdfDither::new(seed));
-    for channel in &mut buffer.channels {
+    for (ch, channel) in buffer.channels.iter_mut().enumerate() {
+        progress.tick(ch as u64)?;
         for sample in channel {
             *sample = quantize_to_grid(*sample, max, min_i, max_i, dither.as_mut());
         }
     }
+    progress.finish();
+    Ok(())
 }
 
 /// Deterministic distinct sub-seed per channel, so each channel's shaper gets its

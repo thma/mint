@@ -705,31 +705,53 @@ impl Config {
 
     /// Resolve a single target by name, layering builtin < defaults < preset < explicit.
     pub fn resolve_target(&self, name: &str) -> Result<ResolvedTarget> {
+        self.resolve_layered(name).map(|(target, _)| target)
+    }
+
+    /// Resolve a target *and* say where every value came from — which layer won, what the
+    /// lower layers said, what was dropped or is inert, and which fields would be a hard
+    /// error if stated here.
+    ///
+    /// The provenance is not recomputed from a second copy of the precedence rule: both it
+    /// and the merge read the same [`Layers`] array. That matters because the rule has a
+    /// documented exception (`format`, `rate` and `bwf` are judged against the target's own
+    /// layer, not the merged one), and an explanation that re-derived precedence would
+    /// eventually describe a merge that no longer happens.
+    ///
+    /// Also what backs `mint --explain <target>`; it is not a GUI-only facility.
+    pub fn resolve_target_explained(&self, name: &str) -> Result<(ResolvedTarget, TargetExplanation)> {
+        let (target, layers) = self.resolve_layered(name)?;
+        let explanation = explain(&target, &layers);
+        Ok((target, explanation))
+    }
+
+    fn resolve_layered(&self, name: &str) -> Result<(ResolvedTarget, Layers)> {
         let raw = self
             .targets
             .get(name)
             .with_context(|| format!("no such target: '{name}'"))?
             .clone();
 
+        // A preset is a layer between `[defaults]` and the explicit fields — but for the
+        // three own-layer checks below it counts as part of what *this target* says, which
+        // is what makes the one-line `preset = "sacd"` work: a preset may legally supply
+        // `codec` and `dsd` there. Anyone narrowing `own` to mean "explicit fields only"
+        // breaks that preset.
+        let preset_layer = match raw.preset.as_deref() {
+            Some(preset_name) => Some((preset_name.to_string(), preset(preset_name)?)),
+            None => None,
+        };
+        let layers = Layers::new(self.defaults.clone(), preset_layer, raw);
+
         // What the target says about *itself*: preset < explicit, without the [defaults]
         // baseline underneath. Kept separate because the checks below have to tell
         // "the user described this deliverable" apart from "the user set a baseline for a
         // whole set of mostly-PCM targets" — a `format` in [defaults] must not make every
         // DSD target in the file a hard error. `overlay` is field-wise `Option::or` and
-        // therefore associative, so folding this in below reproduces the documented
+        // therefore associative, so folding the layers below reproduces the documented
         // builtin < defaults < preset < explicit precedence exactly.
-        //
-        // Note a preset counts as part of this layer, and may legally supply `codec` and
-        // `dsd` there — that is exactly what makes the one-line `preset = "sacd"` work.
-        // Anyone narrowing `own` to mean "explicit fields only" breaks that preset.
-        let own = match raw.preset.as_deref() {
-            Some(preset_name) => {
-                let layer = preset(preset_name)?;
-                overlay(layer, raw)
-            }
-            None => raw,
-        };
-        let merged = overlay(overlay(builtin_fallback(), self.defaults.clone()), own.clone());
+        let own = layers.own();
+        let merged = layers.merged();
 
         let codec = merged.codec.unwrap();
         let dsd = resolve_dsd(name, codec, &own, &merged)?;
@@ -801,7 +823,7 @@ impl Config {
         };
 
         resolved.validate_fields()?;
-        Ok(resolved)
+        Ok((resolved, layers))
     }
 
     /// Resolve every target and reject configs that cannot produce valid output.
@@ -946,6 +968,534 @@ fn resolve_dsd(
         ),
         (false, _, None) => Ok(None),
     }
+}
+
+/// The four config layers of one target, **in precedence order, lowest first**.
+///
+/// This array is the single statement of the precedence rule. `merged` folds it and
+/// `stated`/`winner` read it, so "which layer won" cannot drift from "which layer was
+/// applied" — there is no second copy of `builtin < defaults < preset < explicit` to keep
+/// in sync. Nothing here is optional except the preset, which is simply absent from the
+/// array when the target names none.
+struct Layers {
+    ordered: Vec<(Layer, RawTarget)>,
+}
+
+impl Layers {
+    fn new(defaults: RawTarget, preset_layer: Option<(String, RawTarget)>, explicit: RawTarget) -> Self {
+        let mut ordered = vec![
+            (Layer::Builtin, builtin_fallback()),
+            (Layer::Defaults, defaults),
+        ];
+        if let Some((name, raw)) = preset_layer {
+            ordered.push((Layer::Preset(name), raw));
+        }
+        ordered.push((Layer::Explicit, explicit));
+        Self { ordered }
+    }
+
+    /// All four layers folded — the effective `RawTarget`.
+    fn merged(&self) -> RawTarget {
+        self.ordered
+            .iter()
+            .fold(RawTarget::default(), |acc, (_, layer)| overlay(acc, layer.clone()))
+    }
+
+    /// What the target says about *itself*: preset < explicit, with the `[defaults]`
+    /// baseline left out. See the long comment in `resolve_target` for why three fields are
+    /// judged against this narrower stack rather than the merged one.
+    fn own(&self) -> RawTarget {
+        self.ordered
+            .iter()
+            .filter(|(layer, _)| matches!(layer, Layer::Preset(_) | Layer::Explicit))
+            .fold(RawTarget::default(), |acc, (_, layer)| overlay(acc, layer.clone()))
+    }
+
+    /// Every layer that states this field, lowest precedence first. `render` picks the
+    /// field out of a layer and spells it the way the TOML would.
+    fn stated(&self, render: impl Fn(&RawTarget) -> Option<String>) -> Vec<(Layer, String)> {
+        self.ordered
+            .iter()
+            .filter_map(|(layer, raw)| render(raw).map(|value| (layer.clone(), value)))
+            .collect()
+    }
+}
+
+/// Where a value came from. `Preset` carries the name because "a preset set this" is not
+/// actionable — *which* preset is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Layer {
+    Builtin,
+    Defaults,
+    Preset(String),
+    Explicit,
+}
+
+impl Layer {
+    /// Single-character badge for a dense table: `B` `D` `P` `E`.
+    pub fn glyph(&self) -> char {
+        match self {
+            Layer::Builtin => 'B',
+            Layer::Defaults => 'D',
+            Layer::Preset(_) => 'P',
+            Layer::Explicit => 'E',
+        }
+    }
+}
+
+impl fmt::Display for Layer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Layer::Builtin => f.write_str("builtin"),
+            Layer::Defaults => f.write_str("[defaults]"),
+            Layer::Preset(name) => write!(f, "preset '{name}'"),
+            Layer::Explicit => f.write_str("this target"),
+        }
+    }
+}
+
+/// What becomes of a value that *is* there.
+///
+/// Deliberately not four states. The proposal's fourth, "would error", turned out to be
+/// orthogonal rather than alternative — `format` on a DSD target is inherited-and-inert
+/// *and* illegal if stated here, which is why that lives on [`FieldOrigin::illegal_here`]
+/// and dropping lives on [`FieldOrigin::dropped`]. A field can be all three at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fate {
+    /// The value reaches the deliverable.
+    Applies,
+    /// Materialized into `ResolvedTarget`, but no code path on this target reads it.
+    Inert(&'static str),
+}
+
+impl Fate {
+    pub fn glyph(self) -> char {
+        match self {
+            Fate::Applies => '·',
+            Fate::Inert(_) => '~',
+        }
+    }
+
+    /// Why it is inert, for the row's trailing note.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Fate::Applies => None,
+            Fate::Inert(why) => Some(why),
+        }
+    }
+}
+
+/// A value that a lower layer stated and the narrow own-layer stack refused to read.
+/// Distinct from inert: an inert value *is* the effective one and simply goes unread; a
+/// dropped one never became the effective value at all.
+#[derive(Debug, Clone)]
+pub struct Dropped {
+    pub layer: Layer,
+    pub value: String,
+    pub why: &'static str,
+}
+
+/// Provenance of one resolved field: which layer won, what became of it, what was thrown
+/// away on the way, and whether stating it here at all would be a load-time error.
+#[derive(Debug, Clone)]
+pub struct FieldOrigin {
+    /// Layer whose value survived the merge. `None` when no layer stated the field — it is
+    /// either derived at run time (`rate` on DSD) or simply absent (`lufs`).
+    pub layer: Option<Layer>,
+    pub fate: Fate,
+    pub dropped: Option<Dropped>,
+    /// Stating this field in *this* target's own layer is a hard error, even though
+    /// inheriting it is fine. The asymmetry that makes `[defaults] format = "s24"` legal
+    /// alongside a DSD target and `format = "s24"` on that target fatal.
+    pub illegal_here: bool,
+    /// Every layer that stated the field, lowest precedence first — the "why" panel.
+    pub stated: Vec<(Layer, String)>,
+}
+
+/// Which part of the inspector a field belongs under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    Deliverable,
+    Policy,
+    Quality,
+    Destination,
+}
+
+impl fmt::Display for Group {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Group::Deliverable => "DELIVERABLE",
+            Group::Policy => "POLICY",
+            Group::Quality => "QUALITY",
+            Group::Destination => "DESTINATION",
+        })
+    }
+}
+
+/// One row of the inspector: the field, what it resolved to, and where that came from.
+#[derive(Debug, Clone)]
+pub struct FieldExplanation {
+    /// TOML key, exactly as it is spelled in a config file.
+    pub field: &'static str,
+    pub group: Group,
+    /// Effective value, rendered. Not always a TOML value — a field with no meaning on
+    /// this target says so in prose rather than reporting the placeholder it carries.
+    pub value: String,
+    pub origin: FieldOrigin,
+}
+
+/// Everything `--dry-run` cannot say: the per-field provenance behind one resolved target.
+#[derive(Debug, Clone)]
+pub struct TargetExplanation {
+    pub target: String,
+    /// The preset this target named, if any.
+    pub preset: Option<String>,
+    /// Rows in inspector order, grouped.
+    pub fields: Vec<FieldExplanation>,
+}
+
+impl TargetExplanation {
+    pub fn field(&self, name: &str) -> Option<&FieldExplanation> {
+        self.fields.iter().find(|f| f.field == name)
+    }
+}
+
+impl FieldExplanation {
+    fn new(field: &'static str, group: Group, value: String, stated: Vec<(Layer, String)>) -> Self {
+        // The winner is the last layer that stated it, because `stated` is in the same
+        // precedence order the merge folds in. The own-layer exceptions correct this with
+        // `own_layer_only` rather than by asking a different question.
+        let layer = stated.last().map(|(l, _)| l.clone());
+        Self {
+            field,
+            group,
+            value,
+            origin: FieldOrigin { layer, fate: Fate::Applies, dropped: None, illegal_here: false, stated },
+        }
+    }
+
+    fn inert_if(mut self, condition: bool, why: &'static str) -> Self {
+        if condition {
+            self.origin.fate = Fate::Inert(why);
+        }
+        self
+    }
+
+    fn illegal_here(mut self, condition: bool) -> Self {
+        self.origin.illegal_here = condition;
+        self
+    }
+
+    /// This field is read from the target's own layer only, so an inherited statement never
+    /// wins it — even though `stated` still lists the inherited value, which is exactly what
+    /// makes the "why" panel able to show what was passed over.
+    fn own_layer_only(mut self, condition: bool) -> Self {
+        if condition {
+            self.origin.layer = self
+                .origin
+                .stated
+                .iter()
+                .rev()
+                .find(|(l, _)| matches!(l, Layer::Preset(_) | Layer::Explicit))
+                .map(|(l, _)| l.clone());
+        }
+        self
+    }
+
+    /// Record the highest-precedence inherited layer that stated this field as dropped.
+    /// Only meaningful alongside `own_layer_only`, which is what did the dropping.
+    fn dropping_inherited(mut self, condition: bool, why: &'static str) -> Self {
+        if !condition {
+            return self;
+        }
+        if let Some((layer, value)) = self
+            .origin
+            .stated
+            .iter()
+            .rev()
+            .find(|(l, _)| matches!(l, Layer::Builtin | Layer::Defaults))
+        {
+            self.origin.dropped = Some(Dropped { layer: layer.clone(), value: value.clone(), why });
+        }
+        self
+    }
+}
+
+/// Build the per-field provenance for an already-resolved target.
+///
+/// Every "inert" verdict here is a claim about a code path, not a guess: each one names the
+/// reason a reader can go and check. The one field that cannot be judged is `quality` — an
+/// SRC runs or not depending on the *source* rate, which no amount of config inspection
+/// knows, so it is reported as applying rather than guessed at.
+fn explain(t: &ResolvedTarget, layers: &Layers) -> TargetExplanation {
+    // Tripwire, not logic: this destructure is exhaustive, so adding a field to `RawTarget`
+    // stops this function compiling and the author is standing in the one place that has to
+    // decide what the new field's fate is. Nothing else enforces that — a missing row here
+    // is silently invisible in the inspector rather than wrong.
+    let RawTarget {
+        preset: _,
+        rate: _,
+        format: _,
+        lufs: _,
+        ceiling_dbtp: _,
+        on_clip: _,
+        limiter_character: _,
+        limiter_soft_clip: _,
+        limiter_link_channels: _,
+        warn_limiting_db: _,
+        max_limiting_db: _,
+        quality: _,
+        dither: _,
+        dither_strength: _,
+        dither_correlation: _,
+        codec: _,
+        dsd: _,
+        bwf: _,
+        mp3_bitrate: _,
+        dir: _,
+        naming: _,
+        overwrite: _,
+    } = RawTarget::default();
+
+    let is_dsd = t.codec.is_dsd();
+    let is_mp3 = t.codec == OutputCodec::Mp3;
+    let is_float = matches!(t.format, OutputSampleFormat::F32 | OutputSampleFormat::F64);
+    // Whether `ops::bitdepth` maps this target onto an integer grid at all.
+    let quantizes = !is_dsd && !is_mp3 && !is_float;
+    // `bitdepth::quantize_in_place` reads strength and correlation in the adaptive branch
+    // only; the fixed-curve and flat-TPDF paths ignore both (report.md §9).
+    let adaptive = quantizes && t.dither == DitherMode::Adaptive && t.format == OutputSampleFormat::S16;
+    let limits = matches!(t.on_clip, OnClipPolicy::Limit | OnClipPolicy::Maximize);
+    let normalizes = t.lufs.is_some();
+
+    let no_quantizer = if is_dsd {
+        "the sigma-delta modulator is the quantizer"
+    } else if is_mp3 {
+        "libmp3lame quantizes internally"
+    } else {
+        "a float target is written without quantization"
+    };
+
+    let preset_name = layers.ordered.iter().find_map(|(l, _)| match l {
+        Layer::Preset(name) => Some(name.clone()),
+        _ => None,
+    });
+
+    let fields = vec![
+        // ── DELIVERABLE ────────────────────────────────────────────────────────────────
+        FieldExplanation::new(
+            "preset",
+            Group::Deliverable,
+            preset_name.clone().unwrap_or_else(|| "—".to_string()),
+            layers.stated(|r| r.preset.clone()),
+        )
+        .own_layer_only(true)
+        .dropping_inherited(
+            true,
+            "`[defaults] preset` parses but is never applied — resolve_target reads the \
+             target's own preset, not the merged one (report.md defect #14)",
+        ),
+        FieldExplanation::new(
+            "codec",
+            Group::Deliverable,
+            t.codec.to_string(),
+            layers.stated(|r| r.codec.map(|c| c.to_string())),
+        ),
+        FieldExplanation::new(
+            "dsd",
+            Group::Deliverable,
+            t.dsd.map_or_else(|| "—".to_string(), |d| d.tag().to_string()),
+            layers.stated(|r| r.dsd.map(|d| d.tag().to_string())),
+        )
+        .illegal_here(!is_dsd)
+        // Dropped rather than inert: on a PCM target the value never reaches
+        // `ResolvedTarget` at all, so there is nothing sitting there unread. The quiet one
+        // of the three own-layer exceptions — an inherited `dsd` is neither applied nor
+        // rejected, it is simply never looked at.
+        .own_layer_only(!is_dsd)
+        .dropping_inherited(
+            !is_dsd,
+            "an inherited `dsd` is ignored on a PCM target; only one stated on this target \
+             is an error",
+        ),
+        FieldExplanation::new(
+            "rate",
+            Group::Deliverable,
+            match (t.rate, is_dsd) {
+                (Some(rate), _) => format!("{rate} Hz"),
+                (None, true) => "derived from the source".to_string(),
+                (None, false) => "follows the source".to_string(),
+            },
+            layers.stated(|r| r.rate.map(|v| v.to_string())),
+        )
+        .own_layer_only(is_dsd)
+        .dropping_inherited(
+            is_dsd,
+            "on a DSD target `rate` is the intermediate PCM rate and is read from preset + \
+             explicit only. An inherited rate would silently re-pick what the modulator is fed \
+             from — and a rate that cannot reach the DSD rate by a power of two would turn every \
+             DSD target in the file into a load-time error",
+        ),
+        FieldExplanation::new(
+            "format",
+            Group::Deliverable,
+            if is_dsd {
+                "— (1-bit, no bit depth)".to_string()
+            } else if is_mp3 {
+                "— (lossy, no bit depth)".to_string()
+            } else {
+                format_tag(t.format).to_string()
+            },
+            layers.stated(|r| r.format.map(|f| f.to_string())),
+        )
+        .inert_if(is_dsd || is_mp3, no_quantizer)
+        // The asymmetry this whole facility exists to make visible: inheriting a format is
+        // fine on a DSD target, stating one here is a load-time error.
+        .illegal_here(is_dsd),
+        FieldExplanation::new(
+            "lufs",
+            Group::Deliverable,
+            t.lufs.map_or_else(|| "— (no normalization)".to_string(), |v| format!("{v:.1} LUFS")),
+            layers.stated(|r| r.lufs.map(|v| format!("{v:.1}"))),
+        ),
+        FieldExplanation::new(
+            "ceiling_dbtp",
+            Group::Deliverable,
+            format!("{:.1} dBTP", t.ceiling_dbtp),
+            layers.stated(|r| r.ceiling_dbtp.map(|v| format!("{v:.1}"))),
+        ),
+        FieldExplanation::new(
+            "bwf",
+            Group::Deliverable,
+            t.bwf.to_string(),
+            layers.stated(|r| r.bwf.map(|v| v.to_string())),
+        )
+        .own_layer_only(t.codec != OutputCodec::Wav)
+        .dropping_inherited(
+            t.codec != OutputCodec::Wav,
+            "a bext chunk is a WAV (RIFF) extension, so an inherited bwf = true is dropped \
+             rather than rejected — stating it on this target is an error instead",
+        )
+        .illegal_here(t.codec != OutputCodec::Wav),
+        FieldExplanation::new(
+            "mp3_bitrate",
+            Group::Deliverable,
+            format!("{} kbps", t.mp3_bitrate),
+            layers.stated(|r| r.mp3_bitrate.map(|v| v.to_string())),
+        )
+        .inert_if(!is_mp3, "the codec is not mp3"),
+        // ── POLICY ─────────────────────────────────────────────────────────────────────
+        FieldExplanation::new(
+            "on_clip",
+            Group::Policy,
+            t.on_clip.to_string(),
+            layers.stated(|r| r.on_clip.map(|v| v.to_string())),
+        ),
+        FieldExplanation::new(
+            "limiter_character",
+            Group::Policy,
+            t.limiter_character.to_string(),
+            layers.stated(|r| r.limiter_character.map(|v| v.to_string())),
+        )
+        .inert_if(!limits, "this on_clip policy never engages the limiter"),
+        FieldExplanation::new(
+            "limiter_soft_clip",
+            Group::Policy,
+            t.limiter_soft_clip.to_string(),
+            layers.stated(|r| r.limiter_soft_clip.map(|v| v.to_string())),
+        )
+        .inert_if(!limits, "this on_clip policy never engages the limiter"),
+        FieldExplanation::new(
+            "limiter_link_channels",
+            Group::Policy,
+            t.limiter_link_channels.to_string(),
+            layers.stated(|r| r.limiter_link_channels.map(|v| v.to_string())),
+        )
+        .inert_if(!limits, "this on_clip policy never engages the limiter"),
+        FieldExplanation::new(
+            "warn_limiting_db",
+            Group::Policy,
+            format!("{:.1} dB", t.warn_limiting_db),
+            layers.stated(|r| r.warn_limiting_db.map(|v| format!("{v:.1}"))),
+        )
+        .inert_if(
+            !normalizes,
+            "the heavy-limiting warning only fires inside the loudness step, and no lufs is set",
+        )
+        .inert_if(
+            normalizes && !matches!(t.on_clip, OnClipPolicy::Limit),
+            "only on_clip = limit can raise the heavy-limiting warning (maximize suppresses it \
+             by design — max_limiting_db is its guard instead)",
+        ),
+        FieldExplanation::new(
+            "max_limiting_db",
+            Group::Policy,
+            format!("{:.1} dB", t.max_limiting_db),
+            layers.stated(|r| r.max_limiting_db.map(|v| format!("{v:.1}"))),
+        )
+        .inert_if(
+            !matches!(t.on_clip, OnClipPolicy::Maximize) || !normalizes,
+            "only on_clip = maximize with a lufs target reads it",
+        ),
+        // ── QUALITY ────────────────────────────────────────────────────────────────────
+        FieldExplanation::new(
+            "quality",
+            Group::Quality,
+            t.quality.to_string(),
+            layers.stated(|r| r.quality.map(|v| v.to_string())),
+        ),
+        FieldExplanation::new(
+            "dither",
+            Group::Quality,
+            t.dither.to_string(),
+            layers.stated(|r| r.dither.map(|v| v.to_string())),
+        )
+        .inert_if(!quantizes, no_quantizer),
+        FieldExplanation::new(
+            "dither_strength",
+            Group::Quality,
+            t.dither_strength.to_string(),
+            layers.stated(|r| r.dither_strength.map(|v| v.to_string())),
+        )
+        .inert_if(!quantizes, no_quantizer)
+        .inert_if(
+            quantizes && !adaptive,
+            "only the adaptive mode reads strength (it picks the FIR order); the fixed curves \
+             and flat TPDF ignore it",
+        ),
+        FieldExplanation::new(
+            "dither_correlation",
+            Group::Quality,
+            t.dither_correlation.to_string(),
+            layers.stated(|r| r.dither_correlation.map(|v| v.to_string())),
+        )
+        .inert_if(!quantizes, no_quantizer)
+        .inert_if(
+            quantizes && !adaptive,
+            "only the adaptive mode reads correlation; the fixed curves and flat TPDF ignore it",
+        ),
+        // ── DESTINATION ────────────────────────────────────────────────────────────────
+        FieldExplanation::new(
+            "dir",
+            Group::Destination,
+            t.dir.display().to_string(),
+            layers.stated(|r| r.dir.as_ref().map(|d| d.display().to_string())),
+        ),
+        FieldExplanation::new(
+            "naming",
+            Group::Destination,
+            t.naming.clone(),
+            layers.stated(|r| r.naming.clone()),
+        ),
+        FieldExplanation::new(
+            "overwrite",
+            Group::Destination,
+            t.overwrite.to_string(),
+            layers.stated(|r| r.overwrite.map(|v| v.to_string())),
+        ),
+    ];
+
+    TargetExplanation { target: t.name.clone(), preset: preset_name, fields }
 }
 
 /// Overlay `top` onto `base`: any field set in `top` wins.

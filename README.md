@@ -375,6 +375,25 @@ Render only specific targets (repeat `--target`):
 
     cargo run -- --config examples/mint.toml --target cd --target streaming "masters/*.wav"
 
+### Explaining a target (`--explain`)
+
+`--dry-run` prints the *chain* — what will happen to the audio. By then every config value
+has been flattened into one answer. `--explain` asks the other question: where did each
+value come from, and what became of the ones that lost?
+
+    mint --config mint.toml --explain sacd
+
+It needs no input files and reads no audio. Each row carries an **origin** badge (`B`
+builtin, `D` `[defaults]`, `P` preset, `E` this target, `—` nothing set it) and a **fate**
+(`·` applies, `~` inert, `/` an inherited value was dropped, `!` a load-time error if
+stated on this target), followed by a `why` section spelling out every flagged row.
+
+This is the surface for the merge's one documented exception: `format`, `rate` and `bwf`
+are judged against the target's *own* layer (preset + explicit), not the merged one. So a
+`[defaults] rate = 48000` is silently dropped on a DSD target while `format = "s24"` stated
+on that same target is fatal — same inheritance, three different outcomes, and until now
+none of it was visible anywhere.
+
 ### Machine-readable report (`--json`)
 
 `--json` emits the full per-task metering (source + delivered loudness/dynamics, true

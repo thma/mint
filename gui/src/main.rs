@@ -1,83 +1,105 @@
-//! `mint-gui` — placeholder for the egui workbench described in `docs/gui-proposal.md`.
+//! `mint-gui` — window boot, renderer selection, and a headless self-test.
 //!
-//! Today it is a boundary smoke test, not an application: it calls exactly the library
-//! surface Phase 1 is built on and prints what comes back. That is the point — the whole
-//! design rests on the GUI *never re-deriving* anything (§5.2 rule 1), so if a screen can
-//! be described entirely as "call these functions and render the result", the boundary
-//! holds. Anything this file has to compute for itself is a finding.
-//!
-//! Run: `cargo run -p mint-gui -- [path/to/mint.toml]`
+//! Usage:
+//! ```text
+//! mint-gui [path/to/mint.toml]      # open the workbench
+//! mint-gui --renderer glow [path]   # force the OpenGL backend (also MINT_RENDERER=glow)
+//! mint-gui --selftest [path]        # run one frame headless and exit; no window
+//! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
-use mint::config::{
-    BitDepthFormat, Config, DitherCorrelation, DitherMode, DitherStrength, LimiterCharacter,
-    OnClipPolicy, OutputCodec, PRESET_NAMES, ResampleQuality,
-};
-
-/// Stand-in for a probed source until the Sources pane exists. 96 kHz stereo is the
-/// case that makes the derivation interesting: it forces a resample on every 44.1 kHz
-/// target and sits above FLAC's ceiling.
-const NOMINAL_SOURCE_RATE: u32 = 96_000;
+use mint_gui::app::MintApp;
+use mint_gui::state::AppState;
 
 fn main() -> Result<()> {
-    let path: PathBuf = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("examples/mint.toml"));
+    let mut args = std::env::args().skip(1);
+    let mut path: Option<PathBuf> = None;
+    let mut renderer: Option<String> = std::env::var("MINT_RENDERER").ok();
+    let mut selftest = false;
 
-    println!("mint-gui boundary check — mp3 support in this build: {}", mint::MP3_AVAILABLE);
-    println!();
-
-    dump_enum_domains();
-    println!();
-
-    // Read the bytes ourselves and parse via `from_toml_str` rather than `from_path`:
-    // that is the call the editor pane will make against an unsaved buffer, so it is
-    // the one worth exercising.
-    let text = std::fs::read_to_string(&path)?;
-    let config = Config::from_toml_str(&text)?;
-    dump_targets(&config, &path)?;
-
-    Ok(())
-}
-
-/// Every dropdown the target form will need, from the library's own `ALL` arrays and
-/// `Display` impls. A hardcoded list here would be the exact staleness `PRESET_NAMES`
-/// was introduced to fix.
-fn dump_enum_domains() {
-    println!("enum domains (T0-1/T0-2/T0-3):");
-    println!("  codec           {}", join(&OutputCodec::ALL));
-    println!("  format          {}", join(&BitDepthFormat::ALL));
-    println!("  quality         {}", join(&ResampleQuality::ALL));
-    println!("  on_clip         {}", join(&OnClipPolicy::ALL));
-    println!("  limiter         {}", join(&LimiterCharacter::ALL));
-    println!("  dither          {}", join(&DitherMode::ALL));
-    println!("  dither_strength {}", join(&DitherStrength::ALL));
-    println!("  correlation     {}", join(&DitherCorrelation::ALL));
-    println!("  preset          {}", PRESET_NAMES.join(", "));
-}
-
-fn dump_targets(config: &Config, path: &Path) -> Result<()> {
-    println!("targets in {} (source assumed {NOMINAL_SOURCE_RATE} Hz):", path.display());
-    for name in config.target_names() {
-        let target = config.resolve_target(&name)?;
-        let out = target.render_output_path(Path::new("master.wav"), NOMINAL_SOURCE_RATE)?;
-        println!("\n  [{name}] -> {}", out.display());
-
-        // `delivery_blocker` needs the *input* to answer, which is why the plan matrix
-        // cannot be filled in from the config alone. Channel count is unknown here.
-        if let Some(blocker) = target.delivery_blocker(NOMINAL_SOURCE_RATE, None) {
-            println!("    ! {blocker}");
-        }
-        for step in target.describe(NOMINAL_SOURCE_RATE) {
-            println!("    - {step}");
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--renderer" => renderer = args.next(),
+            "--selftest" => selftest = true,
+            other => path = Some(PathBuf::from(other)),
         }
     }
-    Ok(())
+    let path = path.unwrap_or_else(|| PathBuf::from("mint.toml"));
+    let state = AppState::load(&path);
+
+    if selftest {
+        return selftest_report(&state);
+    }
+
+    let options = eframe::NativeOptions {
+        // Both backends are compiled in and the choice is made here (spike gate S7).
+        // wgpu is the default because it is the one that gets the attention upstream;
+        // glow is the escape hatch for a machine where wgpu comes up as a black window,
+        // and an escape hatch that needs a rebuild is not one.
+        renderer: match renderer.as_deref() {
+            Some("glow") => eframe::Renderer::Glow,
+            _ => eframe::Renderer::Wgpu,
+        },
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([820.0, 520.0])
+            .with_title("mint"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "mint",
+        options,
+        Box::new(|_cc| Ok(Box::new(MintApp::new(state)))),
+    )
+    .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
-fn join<T: std::fmt::Display>(values: &[T]) -> String {
-    values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+/// No window, no GPU, no display: load the config, print what the library says about it,
+/// and exit non-zero if it does not resolve.
+///
+/// This is what a smoke job runs on a clean CI image to prove the shipped binary actually
+/// links and starts (proposal §9: "bundle verification happens on CI artefacts in clean
+/// VMs, never on a dev box"). It also makes the app runnable over SSH, which is how most
+/// of this spike was exercised.
+fn selftest_report(state: &AppState) -> Result<()> {
+    println!("config: {}", state.path.display());
+
+    // S2's real question is whether validation can run *per frame*, so measure it as a
+    // frame would experience it: warm, repeated, and reported as a median rather than as
+    // the one cold sample that includes first-touch costs.
+    let mut warm = AppState::load(&state.path);
+    let mut samples: Vec<u128> = Vec::new();
+    for _ in 0..200 {
+        warm.revalidate();
+        samples.push(warm.validate_micros);
+    }
+    samples.sort_unstable();
+    println!(
+        "validate: cold {} µs, warm median {} µs, worst {} µs  (16 600 µs is one frame at 60 Hz)",
+        state.validate_micros,
+        samples[samples.len() / 2],
+        samples[samples.len() - 1],
+    );
+    match state.error() {
+        Some(error) => {
+            println!("status: REJECTED");
+            println!("{error}");
+            std::process::exit(1);
+        }
+        None => println!("status: ok, {} targets", state.target_names().len()),
+    }
+    for name in state.target_names() {
+        let config = state.config().expect("checked above");
+        let (_, explained) = config.resolve_target_explained(&name)?;
+        let flagged = explained
+            .fields
+            .iter()
+            .filter(|f| f.origin.dropped.is_some() || f.origin.illegal_here)
+            .count();
+        println!("  {name}: {} fields, {flagged} flagged", explained.fields.len());
+    }
+    Ok(())
 }

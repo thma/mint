@@ -13,6 +13,26 @@ license = "Apache-2.0"
 mint = { path = ".." }
 anyhow = "1.0"
 
-# eframe/egui land here in spike S2 (see docs/gui-proposal.md §8 Phase 0). Held back
-# deliberately: everything in Tier 0 is stack-independent and should not be entangled
-# with a toolkit choice that has not been de-risked yet.
+# `wgpu` is on by default; `glow` is added so *both* backends are compiled in and the
+# renderer can be chosen at startup (spike gate S7). A black window on a machine without
+# working GPU acceleration is not an acceptable failure mode, and the fallback has to be
+# already in the binary to be a fallback at all.
+eframe = { version = "0.36.1", features = ["glow"] }
+# Direct dependency as well as an eframe re-export, so the modules can `use egui::…`.
+# Must stay pinned to eframe's own version or two incompatible egui types meet at the
+# `App` trait — which is a genuinely baffling error message when it happens.
+egui = "0.36.1"
+egui_extras = "0.36.1"
+# Virtualized table for the plan matrix (S4). Separate crate from egui_extras' Table:
+# this one is the one that scrolls a few thousand rows.
+egui_table = "0.10"
+# Surgical TOML editing (S6). Pinned to 0.22 on purpose: it is already in Cargo.lock
+# transitively via toml 0.8, so this costs zero new crates and dedupes. 0.25 would
+# duplicate the tree unless mint bumps to toml 1.x, which is a real bump (integer
+# handling changed in 0.9), not a patch.
+toml_edit = "0.22"
+
+[dev-dependencies]
+# Headless egui harness: runs frames without a window, so the form's behaviour is testable
+# in CI and on a machine with no display.
+egui_kittest = "0.36.1"

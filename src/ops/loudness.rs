@@ -4,6 +4,7 @@ use ebur128::{Channel, EbuR128, Mode};
 use crate::audio::buffer::AudioBuffer;
 use crate::config::OnClipPolicy;
 use crate::ops::limiter;
+use crate::progress::{JobControl, Stage};
 
 /// True-peak slack (dB) we tolerate above the ceiling before re-limiting. Absorbs the
 /// tiny disagreement between the limiter's own oversampled detector and the BS.1770
@@ -52,6 +53,29 @@ pub fn apply(
     limiter_options: limiter::LimiterOptions,
     max_limiting_db: f64,
 ) -> Result<LoudnessApplyResult> {
+    apply_with(
+        buffer,
+        target_lufs,
+        true_peak_ceiling_dbtp,
+        on_clip,
+        limiter_options,
+        max_limiting_db,
+        JobControl::default(),
+    )
+}
+
+/// [`apply`], cancellable and reporting progress.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_with(
+    buffer: &mut AudioBuffer,
+    target_lufs: f64,
+    true_peak_ceiling_dbtp: Option<f64>,
+    on_clip: Option<OnClipPolicy>,
+    limiter_options: limiter::LimiterOptions,
+    max_limiting_db: f64,
+    ctl: JobControl<'_>,
+) -> Result<LoudnessApplyResult> {
+    ctl.report(Stage::Loudness, 0.0);
     let in_lufs = measure_lufs(buffer)?;
     let tp_in = measure_true_peak_dbtp(buffer)?;
 
@@ -64,7 +88,7 @@ pub fn apply(
     // Maximize is normalization *with* makeup-gain convergence — its own control flow.
     if matches!(policy, OnClipPolicy::Maximize) {
         return apply_maximize(
-            buffer, target_lufs, ceiling, limiter_options, max_limiting_db, in_lufs, tp_in,
+            buffer, target_lufs, ceiling, limiter_options, max_limiting_db, in_lufs, tp_in, ctl,
         );
     }
 
@@ -113,7 +137,7 @@ pub fn apply(
         let mut tally =
             limiter::GainReductionTally::new(buffer.channels_count(), buffer.frame_len());
         let (final_tp, passes) =
-            limit_and_verify(buffer, ceiling, limiter_options, Some(&mut tally))?;
+            limit_and_verify(buffer, ceiling, limiter_options, Some(&mut tally), ctl)?;
         // The loudest peak sat at `predicted_tp`; the limiter pulls it down to the
         // ceiling, so this is the maximum gain reduction applied anywhere in the file.
         limiter_gain_reduction_db = predicted_tp - ceiling;
@@ -161,6 +185,7 @@ fn apply_maximize(
     max_limiting_db: f64,
     in_lufs: f64,
     tp_in: f64,
+    ctl: JobControl<'_>,
 ) -> Result<LoudnessApplyResult> {
     let pristine = buffer.channels.clone();
     let mut warnings = Vec::new();
@@ -192,7 +217,7 @@ fn apply_maximize(
         if limited {
             tally.reset();
             let (final_tp, passes) =
-                limit_and_verify(buffer, ceiling, limiter_options, Some(&mut tally))?;
+                limit_and_verify(buffer, ceiling, limiter_options, Some(&mut tally), ctl)?;
             // Only the last pass's audio survives, so earlier residuals are irrelevant.
             residual_tp_warning = (final_tp - ceiling > TP_TOLERANCE_DB).then(|| {
                 format!(
@@ -345,6 +370,17 @@ const METER_HOP_MS: f64 = 100.0;
 /// true peak). Audio is fed in 100 ms hops so the sliding momentary/short-term meters can
 /// be polled for their maxima; integrated, LRA and true peak are read once at the end.
 pub fn analyze(buffer: &AudioBuffer) -> Result<LoudnessAnalysis> {
+    analyze_with(buffer, Stage::AnalyzeSource, JobControl::default())
+}
+
+/// [`analyze`], reporting progress and honouring cancellation. `stage` distinguishes the
+/// two calls the pipeline makes — the same measurement, once on the source and once on
+/// what will ship, and a progress bar that could not tell them apart would run twice.
+pub fn analyze_with(
+    buffer: &AudioBuffer,
+    stage: Stage,
+    ctl: JobControl<'_>,
+) -> Result<LoudnessAnalysis> {
     let channels = buffer.channels_count() as u32;
     let rate = buffer.sample_rate;
     // LRA ⊇ S ⊇ M, and TRUE_PEAK adds the peak meter — one meter covers every figure.
@@ -359,8 +395,10 @@ pub fn analyze(buffer: &AudioBuffer) -> Result<LoudnessAnalysis> {
     let mut max_momentary = f64::NEG_INFINITY;
     let mut max_short_term = f64::NEG_INFINITY;
 
+    let mut progress = ctl.stage(stage, frames as u64);
     let mut pos = 0;
     while pos < frames {
+        progress.tick(pos as u64)?;
         let end = (pos + hop).min(frames);
         let slabs: Vec<&[f64]> = buffer.channels.iter().map(|c| &c[pos..end]).collect();
         meter
@@ -381,6 +419,7 @@ pub fn analyze(buffer: &AudioBuffer) -> Result<LoudnessAnalysis> {
         }
         pos = end;
     }
+    progress.finish();
 
     Ok(LoudnessAnalysis {
         integrated_lufs: meter.loudness_global().context("integrated loudness")?,
@@ -411,24 +450,25 @@ fn limit_and_verify(
     ceiling_dbtp: f64,
     limiter_options: limiter::LimiterOptions,
     mut tally: Option<&mut limiter::GainReductionTally>,
+    ctl: JobControl<'_>,
 ) -> Result<(f64, usize)> {
     let mut internal_ceiling = ceiling_dbtp;
     let mut tp = f64::INFINITY;
 
     for pass in 1..=MAX_LIMIT_PASSES {
+        // The control reaches *through* this loop rather than only around it: up to six
+        // whole-file limiter passes happen here, and a cancel that waited them out would
+        // feel broken.
         match tally.as_deref_mut() {
-            Some(t) => limiter::apply_true_peak_limit_tallied(
+            Some(t) => limiter::apply_true_peak_limit_tallied_with(
                 buffer,
                 internal_ceiling,
                 limiter_options,
                 t,
+                ctl,
             )?,
             None => {
-                limiter::apply_true_peak_limit_with_options(
-                    buffer,
-                    internal_ceiling,
-                    limiter_options,
-                )?
+                limiter::apply_true_peak_limit_with(buffer, internal_ceiling, limiter_options, ctl)?
             }
         }
         tp = measure_true_peak_dbtp(buffer)?;
@@ -459,6 +499,17 @@ pub fn enforce_ceiling(
     on_clip: OnClipPolicy,
     limiter_options: limiter::LimiterOptions,
 ) -> Result<Vec<String>> {
+    enforce_ceiling_with(buffer, ceiling_dbtp, on_clip, limiter_options, JobControl::default())
+}
+
+/// [`enforce_ceiling`], cancellable.
+pub fn enforce_ceiling_with(
+    buffer: &mut AudioBuffer,
+    ceiling_dbtp: f64,
+    on_clip: OnClipPolicy,
+    limiter_options: limiter::LimiterOptions,
+    ctl: JobControl<'_>,
+) -> Result<Vec<String>> {
     let tp = measure_true_peak_dbtp(buffer)?;
     if tp <= ceiling_dbtp {
         return Ok(Vec::new());
@@ -468,7 +519,8 @@ pub fn enforce_ceiling(
         // Maximize without a loudness step has nothing to maximize toward — it degrades
         // to plain ceiling enforcement (the pipeline warns about the no-op intent).
         OnClipPolicy::Limit | OnClipPolicy::Maximize => {
-            let (final_tp, passes) = limit_and_verify(buffer, ceiling_dbtp, limiter_options, None)?;
+            let (final_tp, passes) =
+                limit_and_verify(buffer, ceiling_dbtp, limiter_options, None, ctl)?;
             let mut warnings = vec![format!(
                 "true peak {tp:.2} dBTP exceeded ceiling {ceiling_dbtp:.2} dBTP; limiter applied"
             )];
@@ -529,11 +581,21 @@ pub fn recheck_and_limit_if_needed(
     ceiling_dbtp: f64,
     limiter_options: limiter::LimiterOptions,
 ) -> Result<RecheckResult> {
+    recheck_and_limit_if_needed_with(buffer, ceiling_dbtp, limiter_options, JobControl::default())
+}
+
+/// [`recheck_and_limit_if_needed`], cancellable.
+pub fn recheck_and_limit_if_needed_with(
+    buffer: &mut AudioBuffer,
+    ceiling_dbtp: f64,
+    limiter_options: limiter::LimiterOptions,
+    ctl: JobControl<'_>,
+) -> Result<RecheckResult> {
     let tp = measure_true_peak_dbtp(buffer)?;
     if tp <= ceiling_dbtp {
         return Ok(RecheckResult { warnings: Vec::new(), true_peak_dbtp: tp });
     }
-    let (final_tp, passes) = limit_and_verify(buffer, ceiling_dbtp, limiter_options, None)?;
+    let (final_tp, passes) = limit_and_verify(buffer, ceiling_dbtp, limiter_options, None, ctl)?;
     let mut warnings = vec![format!(
         "true peak {tp:.2} dBTP exceeded ceiling {ceiling_dbtp:.2} dBTP after SRC; limiter re-applied"
     )];

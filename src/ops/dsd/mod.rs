@@ -18,6 +18,7 @@ use crate::audio::io_write_dsd::{BLOCK_SAMPLES, DsfSummary, DsfWriter};
 use crate::config::ResampleQuality;
 use crate::ops::dsd::interpolate::SoxrStream;
 use crate::ops::dsd::modulator::{Modulator, ModulatorStats};
+use crate::progress::{JobControl, Stage};
 
 pub mod decimate;
 pub mod interpolate;
@@ -149,6 +150,24 @@ pub fn encode_dsf(
     quality: Option<ResampleQuality>,
     seed: Option<u64>,
 ) -> Result<DsdEncoding> {
+    encode_dsf_with(path, pcm, pcm_rate, rate, quality, seed, JobControl::default())
+}
+
+/// [`encode_dsf`], reporting progress and honouring cancellation.
+///
+/// This is *the* stage worth hooking: five minutes at DSD256 is minutes of work, and the
+/// block loop below already iterates once per container block, so the check costs an
+/// `Option` test against work measured in thousands of samples. A cancel here unwinds past
+/// `DsfWriter`'s staging file, so the previous render survives.
+pub fn encode_dsf_with(
+    path: &Path,
+    pcm: &[Vec<f64>],
+    pcm_rate: u32,
+    rate: DsdRate,
+    quality: Option<ResampleQuality>,
+    seed: Option<u64>,
+    ctl: JobControl<'_>,
+) -> Result<DsdEncoding> {
     let channels = pcm.len();
     if channels == 0 {
         bail!("DSD output needs at least one channel");
@@ -178,6 +197,7 @@ pub fn encode_dsf(
     let mut chunk: Vec<Vec<f64>> = vec![Vec::with_capacity(step); channels];
     let mut bits: Vec<Vec<bool>> = vec![Vec::new(); channels];
 
+    let mut progress = ctl.stage(Stage::Encode, frames as u64);
     let mut pos = 0;
     while pos < frames {
         let n = step.min(frames - pos);
@@ -189,6 +209,7 @@ pub fn encode_dsf(
         modulate_into(&mut mods, up, &mut bits);
         writer.write(&bits)?;
         pos += n;
+        progress.tick(pos as u64)?;
     }
 
     let tail = src.finish()?;
@@ -208,6 +229,7 @@ pub fn encode_dsf(
         writer.write(&bits)?;
     }
     let file = writer.finish()?;
+    progress.finish();
 
     Ok(DsdEncoding {
         rate,

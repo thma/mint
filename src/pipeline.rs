@@ -13,6 +13,7 @@ use crate::config::{
 use crate::ops::dsd::modulator::MAX_MODULATION;
 use crate::ops::loudness::{LUFS_TOLERANCE, LoudnessAnalysis};
 use crate::ops::{bitdepth, dsd, limiter, loudness, resample};
+use crate::progress::{JobControl, Stage};
 
 #[derive(Debug, Clone)]
 pub struct ProcessingReport {
@@ -230,6 +231,25 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// Ahead of all of it: everything that can make the job impossible is settled from the input
 /// header, so a doomed target costs a header read rather than the whole chain.
 pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Result<ProcessingReport> {
+    process_with(input, target, seed, JobControl::default())
+}
+
+/// [`process`], with cancellation and progress.
+///
+/// `ctl` is two borrowed pointers and nothing else — see `crate::progress`. With
+/// `JobControl::default()` every hook below is two `Option` checks per block, which is why
+/// `process` can stay the signature the CLI and every test already call.
+///
+/// Cancellation semantics, stated because a mastering engineer will assume them: a
+/// cancelled job propagates `Cancelled` through the same `?` path as a failure, unwinding
+/// past `audio::atomic_write::Staged`'s `Drop`. **The previous render survives and no
+/// partial file is left behind.**
+pub fn process_with(
+    input: &Path,
+    target: &ResolvedTarget,
+    seed: Option<u64>,
+    ctl: JobControl<'_>,
+) -> Result<ProcessingReport> {
     let started = std::time::Instant::now();
     // Everything that can be known to be impossible is decided from the *header*, before the
     // file is even decoded. All of it used to surface from inside a writer instead — a
@@ -237,6 +257,8 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     // `overwrite = false` discovered the pre-existing output only once it had been replaced.
     // A doomed job now costs one header read, which matters in a batch: a hundred of them
     // used to cost a hundred decodes to say the same thing a hundred times.
+    ctl.report(Stage::Probe, 0.0);
+    ctl.check()?;
     let probe = io_read::probe_source(input)?;
     let source_rate = probe.sample_rate;
     let out_rate = target.delivery_rate(source_rate);
@@ -253,7 +275,7 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
             .with_context(|| format!("failed to create output directory: {}", parent.display()))?;
     }
 
-    let mut buffer = io_read::read_audio(input)?;
+    let mut buffer = io_read::read_audio_with(input, ctl)?;
     // The two read the same track parameters out of the same container, so this cannot
     // differ — but the output path was already rendered from the header's answer, and a
     // silent disagreement would put the wrong `{rate}` in the file name.
@@ -283,19 +305,20 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
 
     // Full source metering, measured once on the untouched input so the report shows
     // loudness/dynamics uniformly whether or not a loudness step runs.
-    let source = loudness::analyze(&buffer)?;
+    let source = loudness::analyze_with(&buffer, Stage::AnalyzeSource, ctl)?;
 
     // 1. Loudness normalization — only when the target specifies a LUFS goal.
     //    The loudness step applies a constant gain and (for on_clip=limit) runs
     //    the limiter, so it also enforces the ceiling on its own output.
     let loudness_ran = if let Some(lufs) = target.lufs {
-        let result = loudness::apply(
+        let result = loudness::apply_with(
             &mut buffer,
             lufs,
             Some(ceiling),
             Some(target.on_clip),
             limiter_options,
             target.max_limiting_db,
+            ctl,
         )?;
         warnings.extend(result.warnings);
         pre_src_lufs = Some(result.out_lufs);
@@ -334,9 +357,11 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     //    from, derived from the source unless the target set `rate` explicitly.
     let pcm_rate = target.pcm_stage_rate(source_rate);
     if pcm_rate != source_rate {
-        resample::apply(&mut buffer, pcm_rate, Some(target.quality))?;
+        resample::apply_with(&mut buffer, pcm_rate, Some(target.quality), ctl)?;
         // SRC can raise inter-sample peaks above the previously enforced ceiling.
-        let recheck = loudness::recheck_and_limit_if_needed(&mut buffer, ceiling, limiter_options)?;
+        ctl.report(Stage::PostSrcVerify, 0.0);
+        let recheck =
+            loudness::recheck_and_limit_if_needed_with(&mut buffer, ceiling, limiter_options, ctl)?;
         warnings.extend(recheck.warnings);
 
         // ...and it moves the integrated loudness too, which the gain computed at the source
@@ -368,16 +393,17 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
                 "on_clip=maximize has no effect without lufs; behaving as limit".to_string(),
             );
         }
-        warnings.extend(loudness::enforce_ceiling(
+        warnings.extend(loudness::enforce_ceiling_with(
             &mut buffer,
             ceiling,
             target.on_clip,
             limiter_options,
+            ctl,
         )?);
     }
 
     // Delivered metering for the report, measured before any quantization/encode.
-    let delivered = loudness::analyze(&buffer)?;
+    let delivered = loudness::analyze_with(&buffer, Stage::AnalyzeDelivered, ctl)?;
 
     // The loudness verdict is read off `delivered`, not off the loudness step's own output.
     // Those are the same number only when nothing followed it; a resample changes the
@@ -421,6 +447,9 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
 
     match target.codec {
         OutputCodec::Mp3 => {
+            // One blocking call into libmp3lame with nothing to count; reported as started
+            // rather than given a bar that would be invented.
+            ctl.report(Stage::Encode, 0.0);
             io_write::write_mp3(&output_path, &buffer, target.mp3_bitrate)?;
             format_tag_str = format!("{} kbps", target.mp3_bitrate);
         }
@@ -428,13 +457,14 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
             let dsd_rate = target
                 .dsd
                 .context("DSD codec resolved without a dsd rate (config resolution bug)")?;
-            let encoding = dsd::encode_dsf(
+            let encoding = dsd::encode_dsf_with(
                 &output_path,
                 &buffer.channels,
                 pcm_rate,
                 dsd_rate,
                 Some(target.quality),
                 seed,
+                ctl,
             )?;
             let stats = encoding.stats;
 
@@ -476,7 +506,7 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
             // WAV and FLAC quantize the full-precision buffer exactly once, with dither.
             let mut current = OutputSampleFormat::F32;
             let in_format = current;
-            let bd = bitdepth::apply(
+            let bd = bitdepth::apply_with(
                 &mut buffer,
                 &mut current,
                 target.format,
@@ -484,6 +514,7 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
                 Some(target.dither_strength),
                 Some(target.dither_correlation),
                 seed,
+                ctl,
             )?;
             dithered = bd.dithered;
             shaped = bd.shaped;

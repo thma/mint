@@ -45,6 +45,7 @@ use anyhow::Result;
 
 use crate::audio::buffer::AudioBuffer;
 use crate::config::LimiterCharacter;
+use crate::progress::{JobControl, Stage};
 
 /// 4× oversampling for inter-sample peak detection.
 const OVERSAMPLE: usize = 4;
@@ -311,7 +312,7 @@ pub fn apply_true_peak_limit_with_options(
     ceiling_dbtp: f64,
     options: LimiterOptions,
 ) -> Result<()> {
-    limit(buffer, ceiling_dbtp, options, None)
+    limit(buffer, ceiling_dbtp, options, None, JobControl::default())
 }
 
 /// As [`apply_true_peak_limit_with_options`], recording exactly what the gain curve did
@@ -323,7 +324,30 @@ pub fn apply_true_peak_limit_tallied(
     options: LimiterOptions,
     tally: &mut GainReductionTally,
 ) -> Result<()> {
-    limit(buffer, ceiling_dbtp, options, Some(tally))
+    limit(buffer, ceiling_dbtp, options, Some(tally), JobControl::default())
+}
+
+/// As [`apply_true_peak_limit_tallied`], cancellable. The convergence loops above this
+/// (`limit_and_verify`, `apply_maximize`) call it once per pass, so the control has to
+/// reach *through* them or a cancel would wait out however many passes remain.
+pub fn apply_true_peak_limit_tallied_with(
+    buffer: &mut AudioBuffer,
+    ceiling_dbtp: f64,
+    options: LimiterOptions,
+    tally: &mut GainReductionTally,
+    ctl: JobControl<'_>,
+) -> Result<()> {
+    limit(buffer, ceiling_dbtp, options, Some(tally), ctl)
+}
+
+/// As [`apply_true_peak_limit_with_options`], cancellable.
+pub fn apply_true_peak_limit_with(
+    buffer: &mut AudioBuffer,
+    ceiling_dbtp: f64,
+    options: LimiterOptions,
+    ctl: JobControl<'_>,
+) -> Result<()> {
+    limit(buffer, ceiling_dbtp, options, None, ctl)
 }
 
 fn limit(
@@ -331,6 +355,7 @@ fn limit(
     ceiling_dbtp: f64,
     options: LimiterOptions,
     mut tally: Option<&mut GainReductionTally>,
+    ctl: JobControl<'_>,
 ) -> Result<()> {
     if buffer.frame_len() == 0 {
         return Ok(());
@@ -356,7 +381,8 @@ fn limit(
             shape,
             BLOCK_FRAMES,
             tally.as_deref_mut(),
-        );
+            ctl,
+        )?;
     } else {
         // Independent envelopes can preserve more channel-specific transients at the
         // cost of possible stereo image movement under heavy limiting.
@@ -367,7 +393,8 @@ fn limit(
                 shape,
                 BLOCK_FRAMES,
                 tally.as_deref_mut(),
-            );
+                ctl,
+            )?;
         }
     }
 
@@ -404,10 +431,11 @@ fn limit_channels(
     shape: CurveShape,
     block: usize,
     mut tally: Option<&mut GainReductionTally>,
-) {
+    ctl: JobControl<'_>,
+) -> Result<()> {
     let frames = channels[0].len();
     if frames == 0 {
-        return;
+        return Ok(());
     }
     // Write-behind safety, part one. After detecting a block of `m` frames starting at
     // `start`, the detector sits at oversampled index `OVERSAMPLE*(start+m) + look_ahead`
@@ -434,9 +462,14 @@ fn limit_channels(
     let mut previous: Vec<f64> = Vec::with_capacity(block);
     let mut previous_start = 0usize;
 
+    // Cancelling mid-loop leaves the buffer half-limited, which is fine and deliberate:
+    // the job is unwinding, the staging file goes with it, and nothing half-limited is
+    // ever written or re-read.
+    let mut progress = ctl.stage(Stage::Ceiling, frames as u64);
     let mut fed = 0usize;
     let mut start = 0usize;
     while start < frames {
+        progress.tick(start as u64)?;
         let m = block.min(frames - start);
 
         // The sliding minimum cannot finalize the gain at oversampled index `e` until it
@@ -476,6 +509,8 @@ fn limit_channels(
     }
 
     apply_gains(channels, channel_offset, previous_start, &previous, tally);
+    progress.finish();
+    Ok(())
 }
 
 fn apply_gains(
@@ -1142,7 +1177,9 @@ mod tests {
         // below and far above the look-ahead (211 at this rate).
         for block in [1, 7, 13, 211, 512, 4096, frames, frames * 2] {
             let mut got = source.clone();
-            limit_channels(&mut got, 0, shape, block, None);
+            // `JobControl::default()` is the no-op control: this stays a test of the gain
+            // curve, not of the progress hook.
+            limit_channels(&mut got, 0, shape, block, None, JobControl::default()).unwrap();
             for (c, (a, b)) in got.iter().zip(&expected).enumerate() {
                 for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
                     assert_eq!(x.to_bits(), y.to_bits(), "block={block} ch{c}[{i}]: {x} != {y}");
@@ -1172,6 +1209,7 @@ mod tests {
                 link_channels: false,
             },
             None,
+            JobControl::default(),
         )
         .unwrap();
 
