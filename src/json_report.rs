@@ -10,8 +10,15 @@ use serde::Serialize;
 use crate::ops::loudness::LoudnessAnalysis;
 use crate::pipeline::{DsdReport, ProcessingReport, TaskFailure};
 
+/// Bumped when a consumer that reads this document could break: a field removed or
+/// renamed, or one whose meaning changes. Adding a field does **not** bump it — every
+/// reader already has to tolerate unknown keys. The GUI persists run history in exactly
+/// this schema, and history without a version is unreadable in two years.
+pub const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Serialize)]
 struct JsonReport<'a> {
+    schema_version: u32,
     config: Option<&'a str>,
     tasks: Vec<TaskJson<'a>>,
     failures: Vec<FailureJson<'a>>,
@@ -28,6 +35,22 @@ struct TaskJson<'a> {
     format: &'a str,
     /// True when a Broadcast WAV bext chunk was written.
     bwf: bool,
+    channels: usize,
+    /// Frames per channel as delivered; 1-bit `sampleCount` on a DSD task.
+    frames: u64,
+    /// Size of the file on disk, measured after writing rather than predicted.
+    file_bytes: u64,
+    elapsed_ms: u64,
+    /// RNG seed for this render, or `null` when it was left to entropy — `null` means the
+    /// render is not reproducible.
+    seed: Option<u64>,
+    /// Resampler quality tier, `null` when no sample-rate conversion ran.
+    src_quality: Option<&'a str>,
+    /// Static gain the normalization applied (dB); `null` when the target has no `lufs`.
+    loudness_gain_db: Option<f64>,
+    /// Further static gain from the post-resample correction (dB); `null` when that pass
+    /// did not run (no resample, or no `lufs`), `0.0` when it ran and found nothing to do.
+    post_resample_gain_db: Option<f64>,
     dither: DitherJson<'a>,
     /// DSD stage figures; `null` for every PCM and MP3 target.
     dsd: Option<DsdJson<'a>>,
@@ -53,6 +76,12 @@ struct RateJson {
 #[derive(Serialize)]
 struct DitherJson<'a> {
     applied: bool,
+    /// Mode as configured; `null` on MP3 and DSD, which have no bit-depth stage. Together
+    /// with `noise_shaping` this is what separates a target that asked for flat TPDF from
+    /// one that asked for `adaptive` and got TPDF because the format was not s16.
+    mode: Option<&'a str>,
+    /// Strength as configured; `null` on the same codecs as `mode`.
+    strength: Option<&'a str>,
     /// Noise-shaping curve name when shaping ran, else `null`.
     noise_shaping: Option<&'a str>,
 }
@@ -149,7 +178,20 @@ pub fn render(
             codec: &r.codec,
             format: &r.format,
             bwf: r.bwf,
-            dither: DitherJson { applied: r.dithered, noise_shaping: r.shaping_curve },
+            channels: r.channels,
+            frames: r.frames,
+            file_bytes: r.file_bytes,
+            elapsed_ms: r.elapsed_ms,
+            seed: r.seed,
+            src_quality: r.src_quality,
+            loudness_gain_db: r.loudness_gain_db.and_then(finite),
+            post_resample_gain_db: r.post_resample_gain_db.and_then(finite),
+            dither: DitherJson {
+                applied: r.dithered,
+                mode: r.dither_mode,
+                strength: r.dither_strength,
+                noise_shaping: r.shaping_curve,
+            },
             dsd: r.dsd.as_ref().map(Into::into),
             limiter_gain_reduction_db: r.limiter_gain_reduction_db,
             limiter_avg_gain_reduction_db: r.limiter_avg_gain_reduction_db,
@@ -165,7 +207,7 @@ pub fn render(
         .map(|f| FailureJson { target: &f.target, input: &f.input, error: &f.error })
         .collect();
 
-    let doc = JsonReport { config: config_name, tasks, failures };
+    let doc = JsonReport { schema_version: SCHEMA_VERSION, config: config_name, tasks, failures };
     serde_json::to_string_pretty(&doc).context("failed to serialize JSON report")
 }
 
@@ -191,11 +233,21 @@ mod tests {
             output: "out/spotify/in.wav".into(),
             in_rate: 48_000,
             out_rate: 44_100,
+            channels: 2,
+            frames: 44_100,
+            file_bytes: 176_444,
+            elapsed_ms: 1_234,
             source: analysis(f64::NEG_INFINITY), // silence -> null
             delivered: analysis(-14.0),
             limiter_gain_reduction_db: Some(2.5),
             limiter_avg_gain_reduction_db: Some(0.8),
             limiter_active_percent: Some(42.0),
+            loudness_gain_db: Some(-3.5),
+            post_resample_gain_db: Some(0.12),
+            src_quality: Some("vhq"),
+            dither_mode: Some("psychoacoustic"),
+            dither_strength: Some("normal"),
+            seed: Some(42),
             dithered: true,
             shaped: true,
             shaping_curve: Some("psychoacoustic"),
@@ -214,8 +266,19 @@ mod tests {
         let json = render(Some("album"), &[report], &[failure]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
+        assert_eq!(v["schema_version"].as_u64(), Some(SCHEMA_VERSION as u64));
         assert_eq!(v["config"].as_str(), Some("album"));
         assert_eq!(v["tasks"][0]["target"].as_str(), Some("spotify"));
+        assert_eq!(v["tasks"][0]["channels"].as_u64(), Some(2));
+        assert_eq!(v["tasks"][0]["frames"].as_u64(), Some(44_100));
+        assert_eq!(v["tasks"][0]["file_bytes"].as_u64(), Some(176_444));
+        assert_eq!(v["tasks"][0]["elapsed_ms"].as_u64(), Some(1_234));
+        assert_eq!(v["tasks"][0]["seed"].as_u64(), Some(42));
+        assert_eq!(v["tasks"][0]["src_quality"].as_str(), Some("vhq"));
+        assert_eq!(v["tasks"][0]["loudness_gain_db"].as_f64(), Some(-3.5));
+        assert_eq!(v["tasks"][0]["post_resample_gain_db"].as_f64(), Some(0.12));
+        assert_eq!(v["tasks"][0]["dither"]["mode"].as_str(), Some("psychoacoustic"));
+        assert_eq!(v["tasks"][0]["dither"]["strength"].as_str(), Some("normal"));
         assert_eq!(v["tasks"][0]["codec"].as_str(), Some("wav"));
         assert_eq!(v["tasks"][0]["bwf"].as_bool(), Some(true));
         assert_eq!(v["tasks"][0]["sample_rate"]["in"].as_u64(), Some(48_000));
@@ -243,11 +306,21 @@ mod tests {
             output: "out/sacd/in.dsf".into(),
             in_rate: 96_000,
             out_rate: 2_822_400,
+            channels: 2,
+            frames: 32_768,
+            file_bytes: 8_284,
+            elapsed_ms: 9_000,
             source: analysis(-18.0),
             delivered: analysis(-16.0),
             limiter_gain_reduction_db: None,
             limiter_avg_gain_reduction_db: None,
             limiter_active_percent: None,
+            loudness_gain_db: None,
+            post_resample_gain_db: None,
+            src_quality: Some("vhq"),
+            dither_mode: None,
+            dither_strength: None,
+            seed: None,
             dithered: false,
             shaped: false,
             shaping_curve: None,
@@ -282,5 +355,12 @@ mod tests {
         assert_eq!(v["tasks"][0]["format"].as_str(), Some("1-bit"));
         // The 1-bit rate, not the intermediate PCM one.
         assert_eq!(v["tasks"][0]["sample_rate"]["out"].as_u64(), Some(2_822_400));
+        // DSD has no bit-depth stage, so the dither settings must read as absent rather
+        // than as whatever the target happened to carry.
+        assert!(v["tasks"][0]["dither"]["mode"].is_null());
+        assert!(v["tasks"][0]["dither"]["strength"].is_null());
+        // ...but the seed still applies: it drives the modulator's comparator dither.
+        assert!(v["tasks"][0]["seed"].is_null());
+        assert_eq!(v["tasks"][0]["src_quality"].as_str(), Some("vhq"));
     }
 }

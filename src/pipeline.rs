@@ -6,7 +6,10 @@ use anyhow::{Context, Result, bail};
 use crate::audio::buffer::OutputSampleFormat;
 use crate::audio::io_read;
 use crate::audio::io_write;
-use crate::config::{DitherMode, OnClipPolicy, OutputCodec, ResolvedTarget, format_tag};
+use crate::config::{
+    DitherMode, OnClipPolicy, OutputCodec, ResolvedTarget, dither_strength_tag, dither_tag,
+    format_tag, quality_tag,
+};
 use crate::ops::dsd::modulator::MAX_MODULATION;
 use crate::ops::loudness::{LUFS_TOLERANCE, LoudnessAnalysis};
 use crate::ops::{bitdepth, dsd, limiter, loudness, resample};
@@ -19,6 +22,17 @@ pub struct ProcessingReport {
     pub output: String,
     pub in_rate: u32,
     pub out_rate: u32,
+    /// Channel count of the delivered file.
+    pub channels: usize,
+    /// Frames per channel as delivered, at `out_rate`. For DSD this is `sampleCount`
+    /// (1-bit samples, padding included); for MP3 it is what was handed to the encoder,
+    /// which adds its own padding on top.
+    pub frames: u64,
+    /// Size of the file that was written, read back from the filesystem rather than
+    /// predicted — this is the number `estimated_output_bytes` was guessing at.
+    pub file_bytes: u64,
+    /// Wall-clock time for this one (input × target) job.
+    pub elapsed_ms: u64,
     /// Full loudness/dynamics metering of the untouched source.
     pub source: LoudnessAnalysis,
     /// Full loudness/dynamics metering of the delivered signal (measured before
@@ -34,6 +48,30 @@ pub struct ProcessingReport {
     /// Percent (0–100) of the signal's samples the limiter attenuated (None when no
     /// limiting ran).
     pub limiter_active_percent: Option<f64>,
+    /// Static gain the normalization step applied (dB); `None` when the target set no
+    /// `lufs` and no loudness step ran. Computed on every normalized render and, until
+    /// now, thrown away — it is the single number that says how far the master moved.
+    pub loudness_gain_db: Option<f64>,
+    /// Further static gain applied by the post-resample correction (dB); `None` when that
+    /// pass did not run at all (no resample, or no `lufs` for it to correct towards), and
+    /// `0.0` when it ran and found nothing outside its tolerance.
+    /// Separate from `loudness_gain_db` because they are answers to different questions:
+    /// one is the normalization, the other is what band-limiting cost it.
+    pub post_resample_gain_db: Option<f64>,
+    /// Resampler quality tier actually used ("lq".."vhq"); `None` when no SRC ran at all.
+    /// A DSD target always resamples — the interpolation to the 1-bit rate is one.
+    pub src_quality: Option<&'static str>,
+    /// Dither mode as configured ("tpdf" | "none" | "shaped" | …); `None` for the codecs
+    /// with no bit-depth stage (MP3, DSD), where the setting is silently ignored.
+    /// `dithered`/`shaping_curve` say what *happened*; this says what was *asked for*,
+    /// and the pair is what distinguishes flat TPDF from adaptive-degraded-to-TPDF.
+    pub dither_mode: Option<&'static str>,
+    /// Dither strength as configured; `None` for the same codecs as `dither_mode`.
+    pub dither_strength: Option<&'static str>,
+    /// RNG seed pinned for this render, or `None` when it was left to entropy — in which
+    /// case the run is not reproducible. Feeds both the dither streams and the DSD
+    /// modulator's comparator dither, which is why it sits here rather than under dither.
+    pub seed: Option<u64>,
     /// True when TPDF dither was applied during quantization.
     pub dithered: bool,
     /// True when error-feedback noise shaping ran (implies `dithered`).
@@ -87,7 +125,38 @@ pub struct TaskFailure {
     pub error: String,
 }
 
-/// Refuse to write over something the user did not agree to lose.
+/// Why a render would destroy something the user did not agree to lose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Conflict {
+    /// The output path names the input master itself.
+    Input,
+    /// Something else is already sitting at the output path.
+    Existing,
+}
+
+impl Conflict {
+    /// The prose the CLI bails with. One producer, so a front end that renders this in a
+    /// dialog and the CLI that prints it cannot describe the same situation differently —
+    /// and so the two fixes the message names stay the only two on offer.
+    pub fn message(self, input: &Path, output: &Path) -> String {
+        match self {
+            Conflict::Input => format!(
+                "refusing to overwrite the input file without --force or overwrite=true: {}",
+                input.display()
+            ),
+            Conflict::Existing => format!(
+                "output file already exists: {} (pass --force, or set overwrite = true on the \
+                 target, to replace it)",
+                output.display()
+            ),
+        }
+    }
+}
+
+/// Would writing `output_path` destroy something? A *query* — it answers and returns,
+/// touching nothing. That is what lets a form ask it per keystroke, and it is why the
+/// overwrite policy can stay here instead of migrating into a writer where it would be
+/// asked too late and by code that does not know what the target consented to.
 ///
 /// The old check compared `output_path == input` as raw `PathBuf`s, which asked the wrong
 /// question twice: it missed `./master.wav` against `master.wav` (or a symlink, or a
@@ -99,26 +168,27 @@ pub struct TaskFailure {
 /// nothing needs comparing unless something is already at the output path, and if something
 /// is, [`same_file`] can compare the two as the files they actually name rather than as the
 /// strings they were spelled with.
-fn guard_output_path(input: &Path, output_path: &Path, overwrite: bool) -> Result<()> {
+pub fn output_conflict(input: &Path, output_path: &Path, overwrite: bool) -> Option<Conflict> {
     // `symlink_metadata` rather than `exists()`: a dangling symlink at the output path is
     // something the rename will replace, so it counts as occupied.
     if std::fs::symlink_metadata(output_path).is_err() {
-        return Ok(());
+        return None;
     }
     if overwrite {
-        return Ok(());
+        return None;
     }
     if same_file(output_path, input) {
-        bail!(
-            "refusing to overwrite the input file without --force or overwrite=true: {}",
-            input.display()
-        );
+        return Some(Conflict::Input);
     }
-    bail!(
-        "output file already exists: {} (pass --force, or set overwrite = true on the target, \
-         to replace it)",
-        output_path.display()
-    )
+    Some(Conflict::Existing)
+}
+
+/// Enforcement half of [`output_conflict`]: the same question, as a hard stop.
+fn guard_output_path(input: &Path, output_path: &Path, overwrite: bool) -> Result<()> {
+    match output_conflict(input, output_path, overwrite) {
+        None => Ok(()),
+        Some(conflict) => bail!("{}", conflict.message(input, output_path)),
+    }
 }
 
 /// Whether two existing paths name the same file on disk.
@@ -160,6 +230,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// Ahead of all of it: everything that can make the job impossible is settled from the input
 /// header, so a doomed target costs a header read rather than the whole chain.
 pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Result<ProcessingReport> {
+    let started = std::time::Instant::now();
     // Everything that can be known to be impossible is decided from the *header*, before the
     // file is even decoded. All of it used to surface from inside a writer instead — a
     // 192 kHz FLAC target or a 7.1 DSD one failed after the whole chain had run, and
@@ -203,6 +274,8 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     let mut limiter_gain_reduction = None;
     let mut limiter_avg_gain_reduction = None;
     let mut limiter_active_percent = None;
+    let mut loudness_gain_db = None;
+    let mut post_resample_gain_db = None;
     // Loudness as the normalization stage left it. Only the post-resample report reads it,
     // and only to separate the loudness the *resampler* removed from the loudness the
     // limiter had already eaten before it — two different stories about one shortfall.
@@ -226,6 +299,7 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
         )?;
         warnings.extend(result.warnings);
         pre_src_lufs = Some(result.out_lufs);
+        loudness_gain_db = Some(result.gain_db);
 
         // Heavy-limiting check: hitting the LUFS target required squashing peaks.
         // Both delivered loudness and true peak look clean afterwards, so this
@@ -272,13 +346,15 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
         // `on_clip`: the correction cannot exceed the headroom, so no policy's promise about
         // peaks is broken by it.
         if let Some(lufs) = target.lufs {
-            warnings.extend(loudness::correct_loudness_after_resample(
+            let correction = loudness::correct_loudness_after_resample(
                 &mut buffer,
                 lufs,
                 ceiling,
                 recheck.true_peak_dbtp,
                 pre_src_lufs.unwrap_or(f64::NAN),
-            )?);
+            )?;
+            warnings.extend(correction.warnings);
+            post_resample_gain_db = Some(correction.applied_db);
         }
     }
 
@@ -336,6 +412,11 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
     let mut shaped = false;
     let mut shaping_curve = None;
     let mut dsd_report = None;
+    // What was *asked for*, set only by the arm that actually has a bit-depth stage. On
+    // MP3 and DSD these settings are silently ignored (see CLAUDE.md), and a report that
+    // named a dither mode there would be describing something that never ran.
+    let mut dither_mode = None;
+    let mut dither_strength = None;
     let format_tag_str;
 
     match target.codec {
@@ -407,6 +488,8 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
             dithered = bd.dithered;
             shaped = bd.shaped;
             shaping_curve = bd.shaping_tag;
+            dither_mode = Some(dither_tag(target.dither));
+            dither_strength = Some(dither_strength_tag(target.dither_strength));
 
             if bd.reduced
                 && matches!(target.dither, DitherMode::None)
@@ -444,17 +527,44 @@ pub fn process(input: &Path, target: &ResolvedTarget, seed: Option<u64>) -> Resu
         }
     }
 
+    // Read back rather than predicted: this is the ground truth `estimated_output_bytes`
+    // is judged against, and a stat of a file we just closed is not worth guarding.
+    let file_bytes = fs::metadata(&output_path)
+        .with_context(|| format!("failed to stat the file just written: {}", output_path.display()))?
+        .len();
+    debug_assert!(
+        dsd_report.as_ref().is_none_or(|d: &DsdReport| d.file_bytes == file_bytes),
+        "the DSF writer's own byte count disagrees with the file on disk"
+    );
+
     Ok(ProcessingReport {
         target: target.name.clone(),
         input: input.display().to_string(),
         output: output_path.display().to_string(),
         in_rate: source_rate,
         out_rate,
+        channels: buffer.channels_count(),
+        // The DSD branch delivers 1-bit samples, so its own count is the delivered one;
+        // the PCM buffer it was interpolated from is an intermediate, not the deliverable.
+        frames: dsd_report
+            .as_ref()
+            .map_or(buffer.frame_len() as u64, |d| d.samples_per_channel),
+        file_bytes,
+        elapsed_ms: started.elapsed().as_millis() as u64,
         source,
         delivered,
         limiter_gain_reduction_db: limiter_gain_reduction,
         limiter_avg_gain_reduction_db: limiter_avg_gain_reduction,
         limiter_active_percent,
+        loudness_gain_db,
+        post_resample_gain_db,
+        // A DSD target always resamples even when the PCM stage rate matches the source:
+        // the interpolation up to the 1-bit rate is an SRC, on the same quality tier.
+        src_quality: (pcm_rate != source_rate || target.codec.is_dsd())
+            .then(|| quality_tag(target.quality)),
+        dither_mode,
+        dither_strength,
+        seed,
         dithered,
         shaped,
         shaping_curve,

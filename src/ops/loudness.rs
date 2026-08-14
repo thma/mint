@@ -589,23 +589,33 @@ const SRC_DRIFT_TOLERANCE_LU: f64 = LUFS_TOLERANCE / 2.0;
 /// the warning how much of the shortfall the resampler is actually responsible for — the
 /// rest is loudness the limiter ate on the way here, which is a different story about the
 /// same file.
+/// What the post-resample correction did. The gain is returned rather than only warned
+/// about because it is the second half of the static gain a render applied — reporting
+/// the normalization gain alone would attribute the whole move to the wrong stage.
+#[derive(Debug, Clone, Default)]
+pub struct SrcCorrection {
+    /// Static gain applied here (dB), 0.0 when the correction was a no-op.
+    pub applied_db: f64,
+    pub warnings: Vec<String>,
+}
+
 pub fn correct_loudness_after_resample(
     buffer: &mut AudioBuffer,
     target_lufs: f64,
     ceiling_dbtp: f64,
     true_peak_dbtp: f64,
     pre_src_lufs: f64,
-) -> Result<Vec<String>> {
+) -> Result<SrcCorrection> {
     let measured = measure_lufs(buffer)?;
     // Digital silence meters as -inf: there is no gain that makes it -14 LUFS, and the
     // delivered-loudness check reports the miss.
     if !measured.is_finite() {
-        return Ok(Vec::new());
+        return Ok(SrcCorrection::default());
     }
 
     let shortfall = target_lufs - measured;
     if shortfall.abs() <= SRC_DRIFT_TOLERANCE_LU {
-        return Ok(Vec::new());
+        return Ok(SrcCorrection::default());
     }
 
     // Attenuation is always available; gain is only what sits under the ceiling.
@@ -642,5 +652,5 @@ pub fn correct_loudness_after_resample(
             }
         ));
     }
-    Ok(warnings)
+    Ok(SrcCorrection { applied_db, warnings })
 }

@@ -33,6 +33,14 @@ pub fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
+/// Playing time of a delivered file from its own frame count and rate. Correct for DSD
+/// too: there `frames` is the 1-bit sample count and `rate` the 1-bit rate, so the
+/// quotient is still seconds. Guards `rate == 0` because a report is not the place to
+/// discover a division by zero.
+pub fn duration_seconds(frames: u64, rate: u32) -> f64 {
+    if rate == 0 { 0.0 } else { frames as f64 / rate as f64 }
+}
+
 /// Format a dB/LU/LUFS figure, or "n/a" when the meter returned a non-finite value
 /// (silence, or a clip shorter than the meter's integration time).
 pub fn fmt_db(v: f64) -> String {

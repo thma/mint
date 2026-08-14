@@ -256,6 +256,16 @@ Cancellation semantics come out right for free: `ctl.check()?` propagates as an 
 
 ### Tier 1 — small, additive, low risk
 
+> **Status 2026-08-14: done.** All three, plus `tests/report_fields.rs` pinning each new
+> figure against an independent measurement. Deltas: T1-2's `gain_db` ships as *two* fields
+> (`loudness_gain_db` and `post_resample_gain_db`) because one number cannot honestly carry
+> both the normalization and what band-limiting later cost it — which required
+> `correct_loudness_after_resample` to return a `SrcCorrection` rather than bare warnings.
+> `seed` sits at task level, not under `dither`, because the DSD modulator's comparator
+> dither uses it too. Sample peak and clipped-sample count from report.md §9 item 6 are
+> **not** included — those are not currently computed anywhere, so they are new measurement
+> rather than reporting, and belong with the Tier 3 work.
+
 | # | Change | Location | Note |
 |---|---|---|---|
 | T1-1 | `"schema_version"` in the JSON document | json_report.rs:13–18 | Highest value-per-line in the dossier. The GUI writes run history in this schema; unversioned history is unreadable in two years. |

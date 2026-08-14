@@ -215,8 +215,9 @@ fn the_post_resample_correction_stops_at_the_ceiling() {
 
     // Ask for far more gain than the headroom can pay for.
     let before = loudness::analyze(&buffer).expect("analyze").integrated_lufs;
-    let warnings = loudness::correct_loudness_after_resample(&mut buffer, 12.0, ceiling, tp, before)
-        .expect("correct");
+    let correction =
+        loudness::correct_loudness_after_resample(&mut buffer, 12.0, ceiling, tp, before)
+            .expect("correct");
 
     let after = loudness::measure_true_peak_dbtp(&buffer).expect("tp after");
     assert!(
@@ -224,8 +225,16 @@ fn the_post_resample_correction_stops_at_the_ceiling() {
         "the correction must stop at the ceiling: {after:.6} dBTP vs {ceiling:.6}"
     );
     assert!(
-        warnings.iter().any(|w| w.contains("capped by")),
-        "a clamped correction must say so: {warnings:?}"
+        correction.warnings.iter().any(|w| w.contains("capped by")),
+        "a clamped correction must say so: {:?}",
+        correction.warnings
+    );
+    // The reported gain is the capped one, not the shortfall it wanted — the report would
+    // otherwise claim a move the ceiling never allowed.
+    assert!(
+        (correction.applied_db - headroom).abs() < 1e-6,
+        "reported gain {:.6} dB should be the headroom {headroom:.6} dB",
+        correction.applied_db
     );
 }
 
@@ -248,7 +257,7 @@ fn the_post_resample_correction_is_a_no_op_inside_its_tolerance() {
     let before = buffer.channels[0].clone();
 
     // 0.02 LU away: inside the 0.05 LU tolerance.
-    let warnings = loudness::correct_loudness_after_resample(
+    let correction = loudness::correct_loudness_after_resample(
         &mut buffer,
         measured + 0.02,
         -1.0,
@@ -257,7 +266,12 @@ fn the_post_resample_correction_is_a_no_op_inside_its_tolerance() {
     )
     .expect("correct");
 
-    assert!(warnings.is_empty(), "no warning expected: {warnings:?}");
+    assert!(
+        correction.warnings.is_empty(),
+        "no warning expected: {:?}",
+        correction.warnings
+    );
+    assert_eq!(correction.applied_db, 0.0, "a no-op must report no gain");
     assert_eq!(before, buffer.channels[0], "the buffer must not be touched at all");
 }
 

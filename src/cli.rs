@@ -9,7 +9,7 @@ use crate::audio::io_read;
 use crate::config::{self, Config, PlannedOutput, ResolvedTarget};
 use crate::json_report;
 use crate::pipeline::{self, ProcessingReport, TaskFailure};
-use crate::util::{fmt_bytes, fmt_db, is_supported_input};
+use crate::util::{duration_seconds, fmt_bytes, fmt_db, is_supported_input};
 
 #[derive(Debug, Parser)]
 #[command(name = "mint")]
@@ -378,10 +378,16 @@ fn print_reports(reports: &[ProcessingReport]) {
             }
             _ => String::new(),
         };
-        let dither_tag = match (report.shaping_curve, report.dithered) {
-            (Some(curve), _) => format!(" +shaped({curve})"),
-            (None, true) => " +dither".to_string(),
-            (None, false) => String::new(),
+        // Naming the *requested* mode when flat TPDF ran is the whole point of reporting
+        // it: a target that asked for `adaptive` and got TPDF because the format is not
+        // s16 looked identical to one that asked for TPDF.
+        let dither_tag = match (report.shaping_curve, report.dithered, report.dither_mode) {
+            (Some(curve), _, _) => format!(" +shaped({curve})"),
+            (None, true, Some(mode)) if mode != "tpdf" => {
+                format!(" +dither(tpdf, {mode} skipped)")
+            }
+            (None, true, _) => " +dither".to_string(),
+            (None, false, _) => String::new(),
         };
 
         let bwf_tag = if report.bwf { " (bwf)" } else { "" };
@@ -390,6 +396,22 @@ fn print_reports(reports: &[ProcessingReport]) {
             "    {} -> {} Hz | {}/{}{}{}{}",
             report.in_rate, report.out_rate, report.codec, report.format, bwf_tag, dither_tag, limiting,
         );
+        // What shipped and what it cost: shape, real size on disk, and the two settings a
+        // re-render needs to reproduce it. `seed` absent means it cannot be reproduced.
+        let mut facts = format!(
+            "    {} ch | {:.1} s | {}",
+            report.channels,
+            duration_seconds(report.frames, report.out_rate),
+            fmt_bytes(report.file_bytes),
+        );
+        if let Some(quality) = report.src_quality {
+            facts.push_str(&format!(" | src {quality}"));
+        }
+        if let Some(seed) = report.seed {
+            facts.push_str(&format!(" | seed {seed}"));
+        }
+        facts.push_str(&format!(" | in {:.2} s", report.elapsed_ms as f64 / 1000.0));
+        println!("{facts}");
         // The DSD stage's own figures. Peak modulation is the level QC number for a 1-bit
         // deliverable — 50 % is the SACD 0 dB reference — and the overload count is the
         // only place a loop that was driven past what it can track becomes visible.
@@ -405,16 +427,28 @@ fn print_reports(reports: &[ProcessingReport]) {
                 fmt_bytes(d.file_bytes),
             );
         }
+        // The static gain the render applied, which the before/after LUFS pair does not
+        // show: the two figures can be identical on a file that was moved 6 dB and on one
+        // that was not touched at all. The post-SRC correction is called out separately
+        // because it measures something else — loudness the band limit removed.
+        let gain = match (report.loudness_gain_db, report.post_resample_gain_db) {
+            (Some(g), Some(p)) if p.abs() >= 0.005 => {
+                format!("  gain {g:+.2} dB ({p:+.2} post-SRC)")
+            }
+            (Some(g), _) => format!("  gain {g:+.2} dB"),
+            (None, _) => String::new(),
+        };
         // Loudness metering, source -> delivered (integrated + range), plus the loudest
         // delivered momentary/short-term windows.
         println!(
-            "    LUFS {} -> {} (I)  LRA {} -> {} LU  M {}  S {} LUFS",
+            "    LUFS {} -> {} (I)  LRA {} -> {} LU  M {}  S {} LUFS{}",
             fmt_db(s.integrated_lufs),
             fmt_db(d.integrated_lufs),
             fmt_db(s.loudness_range_lu),
             fmt_db(d.loudness_range_lu),
             fmt_db(d.max_momentary_lufs),
             fmt_db(d.max_short_term_lufs),
+            gain,
         );
         // Peak / crest metering of the delivered signal.
         println!(

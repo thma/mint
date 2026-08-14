@@ -392,6 +392,29 @@ render to one path. Those are setup errors rather than task failures, so they go
 with a non-zero exit and stdout stays empty. Automation should treat "exit non-zero and
 stdout empty" as "nothing ran".
 
+The document opens with a `"schema_version"` integer. It is bumped only when a reader
+could break — a field removed or renamed, or one whose meaning changes. **Adding** a field
+does not bump it, so a consumer must tolerate keys it does not know.
+
+Alongside the metering, each task reports what the render actually did, which is what makes
+a run reproducible and auditable after the fact:
+
+| field | meaning |
+|---|---|
+| `channels`, `frames` | shape of the delivered file; `frames` is 1-bit `sampleCount` on a DSD task |
+| `file_bytes` | size on disk, measured after writing (not the `--dry-run` estimate) |
+| `elapsed_ms` | wall-clock time for that one input × target job |
+| `seed` | the `--seed` used, or `null` — **`null` means the render is not reproducible** |
+| `src_quality` | resampler tier that ran, or `null` when no conversion was needed |
+| `loudness_gain_db` | static gain the normalization applied; `null` without a `lufs` target |
+| `post_resample_gain_db` | further gain from the post-resample correction; `null` if that pass never ran, `0.0` if it ran and found nothing |
+| `dither.mode`, `dither.strength` | what was **asked for**; `null` on MP3 and DSD, which have no bit-depth stage |
+| `dither.applied`, `dither.noise_shaping` | what actually **happened** |
+
+The last two rows are a pair on purpose: a target that asks for `adaptive` at s24 gets flat
+TPDF (shaping is s16-only), and `mode: "adaptive"` with `noise_shaping: null` is how that
+becomes visible instead of looking identical to a target that simply asked for `tpdf`.
+
 Two encodings in that document are worth knowing about. `format` carries the delivered
 sample format for PCM (`"s16"`, `"s24"`, …) but `"<N> kbps"` for MP3 and `"1-bit"` for DSD.
 And a DSD task gains a nested `dsd` object:
