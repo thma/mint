@@ -20,8 +20,9 @@
 
 use std::path::PathBuf;
 
+use mint::diagnostics::FailureKind;
 use mint::ops::loudness::LoudnessAnalysis;
-use mint::pipeline::{ProcessingReport, TaskFailure};
+use mint::pipeline::{Conflict, ProcessingReport, TaskFailure};
 use mint_gui::history::{self, Project};
 use mint_gui::state::RunOptions;
 
@@ -89,6 +90,7 @@ fn a_persisted_run_is_the_json_document_byte_for_byte() {
         target: "hires".into(),
         input: "/masters/take.wav".into(),
         error: "output file already exists".into(),
+        kind: FailureKind::OutputConflict(Conflict::Existing),
     }];
 
     let path = history::persist(&config, Some("demo"), &reports, &failures).expect("persist");

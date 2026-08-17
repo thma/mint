@@ -40,6 +40,7 @@ use std::cmp::Ordering;
 
 use egui::{Grid, RichText, ScrollArea, Ui};
 use mint::json_report;
+use mint::diagnostics::FailureKind;
 use mint::pipeline::{ProcessingReport, TaskFailure};
 use mint::util::{duration_seconds, fmt_bytes, fmt_db};
 
@@ -470,9 +471,24 @@ fn warnings(ui: &mut Ui, reports: &[ProcessingReport]) {
     ui.separator();
     ui.label(RichText::new("Warnings").strong());
     for report in reports {
+        // In the order the render emitted them, which is chain order — the loudness stage's
+        // warnings before the resample's before the encoder's. Grouping them by subject would
+        // read tidier and would throw that away.
         for warning in &report.warnings {
-            // mint's own text, whole. The target name is a prefix, not a rewording.
-            ui.colored_label(colors::WARN, format!("⚠ [{}] {warning}", report.target));
+            // `horizontal_wrapped`, not a `Grid`: these sentences run to 200 characters and a
+            // grid cell does not wrap, so the tidier layout silently clips the end of every
+            // long warning off the right edge. §7 rule 9 is that a warning may not be
+            // collapsed into a count — one you can only read half of is collapsed by another
+            // name.
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(colors::WARN, "⚠");
+                // `subject` is what a warning is *about*, from the library. It is here so the
+                // sigma-delta lines are findable among the loudness ones without reading all
+                // of them — never as a substitute for the sentence.
+                ui.weak(RichText::new(warning.subject().label()).small());
+                // mint's own text, whole. The target name is a prefix, not a rewording.
+                ui.colored_label(colors::WARN, format!("[{}] {warning}", report.target));
+            });
         }
     }
 }
@@ -491,6 +507,15 @@ fn failure_section(ui: &mut Ui, failures: &[TaskFailure]) {
             ui.label(file_name(&failure.input)).on_hover_text(&failure.input);
             // mint's own message, verbatim: this is the text the CLI would have bailed with.
             ui.colored_label(colors::BAD, &failure.error);
+            // ...and mint's own verdict on what kind of failure it was, which the message
+            // does not spell out and which decides whether `--force` is even relevant. Shown
+            // only when there is one worth naming, so an ordinary failure gains no noise.
+            if failure.kind != FailureKind::Other {
+                ui.weak(RichText::new(failure.kind.tag()).small());
+            }
+            if failure.kind.force_can_fix() {
+                ui.weak(RichText::new("· --force would allow it").small());
+            }
         });
     }
 }

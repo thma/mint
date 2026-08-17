@@ -68,7 +68,8 @@ use std::time::{Duration, Instant};
 use egui::{ProgressBar, RichText, ScrollArea, Ui};
 use mint::config::{ResolvedTarget, SizeEstimate};
 use mint::pipeline::{self, ProcessingReport, TaskFailure};
-use mint::progress::{Cancelled, JobControl, Stage};
+use mint::diagnostics::FailureKind;
+use mint::progress::{JobControl, Stage};
 use mint::util::fmt_bytes;
 
 use crate::colors;
@@ -87,7 +88,10 @@ pub enum JobEvent {
     Started { job: usize },
     Progress { job: usize, stage: Stage, fraction: f64 },
     Done { job: usize, report: Box<ProcessingReport> },
-    Failed { job: usize, error: String },
+    /// `kind` travels with the message because the live `anyhow::Error` does not survive
+    /// the channel: once it is a `String`, the only route back to "was that a refused
+    /// overwrite?" is reading the sentence.
+    Failed { job: usize, error: String, kind: FailureKind },
     /// Cancelled: either in flight when the flag went up, or never started because of it.
     Cancelled { job: usize },
     /// Never ran: `fail_fast` stopped the batch before this one came up.
@@ -529,6 +533,13 @@ impl RunView {
                         // A new stage has proved nothing yet; it earns its bar below.
                         *shown = None;
                     }
+                    // Taken as given, including when it is *lower* than the last one. A
+                    // stage is not one sweep (`progress::Stage`'s doc says so): `Ceiling`
+                    // covers up to six limiter verification passes and `Loudness` four to
+                    // nine whole-file meter passes, and each reports 0→1 of itself. Clamping
+                    // this to a running maximum would look tidier and would be the lying bar
+                    // §7 rule 8 forbids — it would sit at 100 % through every pass but the
+                    // first.
                     if fraction > 0.0 {
                         *shown = Some(fraction);
                     }
@@ -539,11 +550,12 @@ impl RunView {
                     JobState::Done { bytes: report.file_bytes, elapsed_ms: report.elapsed_ms };
                 self.reports.push(*report);
             }
-            JobEvent::Failed { error, .. } => {
+            JobEvent::Failed { error, kind, .. } => {
                 self.failures.push(TaskFailure {
                     target: row.target.clone(),
                     input: row.input.clone(),
                     error: error.clone(),
+                    kind,
                 });
                 row.state = JobState::Failed(error);
             }
@@ -570,6 +582,8 @@ impl RunView {
                 target: self.rows[index].target.clone(),
                 input: self.rows[index].input.clone(),
                 error: error.clone(),
+                // mint never ran, so mint has no verdict on this one either.
+                kind: FailureKind::Other,
             });
             self.rows[index].state = JobState::Failed(error);
         }
@@ -756,16 +770,23 @@ fn run_one(
         Ok(Ok(report)) => {
             (JobEvent::Done { job: index, report: Box::new(report) }, Terminal::Done)
         }
-        // A distinct type rather than a message match, so "the user stopped it" and "the
-        // render failed" cannot be confused for one another.
-        Ok(Err(err)) if err.downcast_ref::<Cancelled>().is_some() => {
-            (JobEvent::Cancelled { job: index }, Terminal::Cancelled)
-        }
-        Ok(Err(err)) => {
-            (JobEvent::Failed { job: index, error: format!("{err:#}") }, Terminal::Failed)
-        }
+        // mint's own classifier rather than a bare downcast of the outermost error, so
+        // "the user stopped it" and "the render failed" cannot be confused for one another
+        // — and so this keeps working if a cancel ever arrives wrapped in a `context`.
+        Ok(Err(err)) => match FailureKind::classify(&err) {
+            FailureKind::Cancelled => (JobEvent::Cancelled { job: index }, Terminal::Cancelled),
+            kind => (
+                JobEvent::Failed { job: index, error: format!("{err:#}"), kind },
+                Terminal::Failed,
+            ),
+        },
+        // A panic is mint-gui's own crash, not a mint verdict on the job.
         Err(payload) => (
-            JobEvent::Failed { job: index, error: panic_message(payload.as_ref()) },
+            JobEvent::Failed {
+                job: index,
+                error: panic_message(payload.as_ref()),
+                kind: FailureKind::Other,
+            },
             Terminal::Failed,
         ),
     };

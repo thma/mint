@@ -87,8 +87,9 @@
 use std::path::PathBuf;
 
 use egui::{RichText, Ui};
-use mint::config::{self, Config, PlannedOutput, ResolvedTarget};
-use mint::pipeline::{self, Conflict};
+use mint::config::{self, Config, DeliveryBlocker, PlannedOutput, ResolvedTarget};
+use mint::diagnostics::FailureKind;
+use mint::pipeline::{self};
 
 use crate::colors;
 use crate::state::{AppState, Source};
@@ -129,6 +130,15 @@ pub struct Problem {
     pub scope: Scope,
     /// mint's own text, verbatim. Never reworded, never truncated on the way in.
     pub message: String,
+    /// mint's own verdict on *what kind* of fault this is, when the row came from a real
+    /// `anyhow::Error` and [`FailureKind::classify`] could read its chain. `None` for the
+    /// rows this panel assembles from a *query* rather than a failure — `output_conflict`
+    /// hands back a `Conflict` directly, and there is no error to classify.
+    ///
+    /// It exists so a reader does not have to recover the kind by elimination over
+    /// `severity` and `scope`, which is what `plan.rs` used to do to find the batch
+    /// collisions: correct only for as long as no other step produces a cell-scoped error.
+    pub kind: Option<FailureKind>,
     pub fix: Option<Fix>,
 }
 
@@ -193,6 +203,7 @@ pub fn collect(query: Query<'_>) -> Vec<Problem> {
                 severity: Severity::Error,
                 scope: Scope::Target(name.clone()),
                 message: format!("{err:#}"),
+                kind: Some(FailureKind::classify(&err)),
                 fix: Some(Fix::SelectTarget(name.clone())),
             }),
         }
@@ -217,6 +228,7 @@ pub fn collect(query: Query<'_>) -> Vec<Problem> {
                     severity: Severity::Error,
                     scope: Scope::Target(second.name.clone()),
                     message: format!("{err:#}"),
+                    kind: Some(FailureKind::classify(&err)),
                     fix: Some(Fix::SelectTarget(second.name.clone())),
                 });
             }
@@ -243,6 +255,10 @@ pub fn collect(query: Query<'_>) -> Vec<Problem> {
                 severity: Severity::Error,
                 scope: Scope::Source(index),
                 message: err.clone(),
+                // The probe failure was flattened to a `String` when the source was cached,
+                // so there is no chain left to classify. Honest `None` rather than a guessed
+                // `Other`.
+                kind: None,
                 fix: None,
             });
         }
@@ -265,12 +281,12 @@ pub fn collect(query: Query<'_>) -> Vec<Problem> {
     // anyway is a consequence, not a second fault.
     for planned in &cells {
         match (&planned.blocked, &planned.output) {
-            (Some(reason), _) => {
+            (Some(blocker), _) => {
                 problems.push(cell(
                     Severity::Error,
                     planned.source,
                     &planned.target.name,
-                    reason.clone(),
+                    blocker.to_string(),
                 ));
             }
             (None, Err(err)) => {
@@ -326,11 +342,12 @@ pub fn collect(query: Query<'_>) -> Vec<Problem> {
         for (candidate, planned) in planned_batch.into_iter().zip(attributable) {
             accepted.push(candidate);
             if let Err(err) = config::check_planned_outputs(&accepted, &inputs) {
-                problems.push(cell(
+                problems.push(cell_of_kind(
                     Severity::Error,
                     planned.source,
                     &planned.target.name,
                     format!("{err:#}"),
+                    Some(FailureKind::classify(&err)),
                 ));
                 accepted.pop();
                 refused.push((planned.source, planned.target.name.as_str()));
@@ -354,6 +371,7 @@ pub fn collect(query: Query<'_>) -> Vec<Problem> {
         };
         let select =
             Fix::SelectCell { source: planned.source, target: planned.target.name.clone() };
+        let kind = FailureKind::OutputConflict(conflict);
         problems.push(Problem {
             severity: Severity::Warning,
             scope: Scope::Cell {
@@ -361,21 +379,24 @@ pub fn collect(query: Query<'_>) -> Vec<Problem> {
                 target: planned.target.name.clone(),
             },
             message: conflict.message(input, output),
-            fix: match conflict {
-                // The remedy mint's own message names, and the only non-navigating fix in
-                // the panel — except on a cell step 8 has *already* refused. There the file
-                // in the way belongs to this same batch (another job's output, or another
-                // input of the run), `check_planned_outputs` rejects that even under
-                // `--force`, and the button would sit one row under mint's refusal offering
-                // to overwrite a master it will not overwrite anyway.
-                Conflict::Existing
-                    if !refused.contains(&(planned.source, planned.target.name.as_str())) =>
-                {
-                    Some(Fix::EnableForce)
-                }
-                // Writing over the master is not a one-click button. The row navigates to
-                // the cell instead, where the chain preview says what would land on it.
-                Conflict::Existing | Conflict::Input => Some(select),
+            kind: Some(kind.clone()),
+            // The remedy mint's own message names, and the only non-navigating fix in the
+            // panel. Whether `--force` even *reaches* this conflict is `force_can_fix`'s
+            // answer, not this panel's: writing over the master is refused under `--force`
+            // too, and a button that promised otherwise would be offering a fix mint
+            // declines to perform.
+            //
+            // The second condition is this panel's own, and is about a *different* fact: on
+            // a cell step 8 has already refused, the file in the way belongs to this same
+            // batch, `check_planned_outputs` rejects that even under `--force`, and the
+            // button would sit one row under mint's refusal offering to overwrite a master
+            // it will not overwrite anyway.
+            fix: if kind.force_can_fix()
+                && !refused.contains(&(planned.source, planned.target.name.as_str()))
+            {
+                Some(Fix::EnableForce)
+            } else {
+                Some(select)
             },
         });
     }
@@ -393,8 +414,11 @@ pub struct PlannedCell<'a> {
     /// Index into the `sources` slice — the same index `Scope::Source`/`Scope::Cell` use.
     pub source: usize,
     pub target: &'a ResolvedTarget,
-    /// `delivery_blocker`'s reason, verbatim, when this pair cannot be delivered.
-    pub blocked: Option<String>,
+    /// Which rule refused this pair, when one did. The typed refusal rather than its
+    /// sentence: a caller that only prints gets the sentence from `Display`, and one that
+    /// has to count the two rules apart or offer the right fix no longer reads prose to do
+    /// it.
+    pub blocked: Option<DeliveryBlocker>,
     /// `render_output_path`'s answer, or mint's own message for why there is none.
     pub output: Result<PathBuf, String>,
 }
@@ -451,16 +475,28 @@ pub fn planned_outputs<'a>(
 }
 
 fn document(message: String) -> Problem {
-    Problem { severity: Severity::Error, scope: Scope::Document, message, fix: None }
+    Problem { severity: Severity::Error, scope: Scope::Document, message, kind: None, fix: None }
 }
 
 /// A cell-scoped problem, whose fix is always "show me". Steps 7 and 8 both produce these;
 /// step 9 builds its own because `Conflict::Existing` is the one row that offers more.
 fn cell(severity: Severity, source: usize, target: &str, message: String) -> Problem {
+    cell_of_kind(severity, source, target, message, None)
+}
+
+/// [`cell`], for a row that came from a live error mint could classify.
+fn cell_of_kind(
+    severity: Severity,
+    source: usize,
+    target: &str,
+    message: String,
+    kind: Option<FailureKind>,
+) -> Problem {
     Problem {
         severity,
         scope: Scope::Cell { source, target: target.to_string() },
         message,
+        kind,
         fix: Some(Fix::SelectCell { source, target: target.to_string() }),
     }
 }

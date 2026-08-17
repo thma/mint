@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
 use mint::audio::io_write;
-use mint::config::{Config, ResolvedTarget};
+use mint::config::{Config, DeliveryBlocker, ResolvedTarget};
+use mint::diagnostics::WarningKind;
 use mint::ops::loudness;
 use mint::pipeline;
 
@@ -129,7 +130,10 @@ fn an_ultrasonic_heavy_master_still_lands_on_target_after_the_resample() {
     // A correction this large is worth saying out loud even though it succeeded: the same
     // master at a different delivery rate will not measure the same.
     assert!(
-        report.warnings.iter().any(|w| w.contains("across the resample")),
+        report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, WarningKind::SrcLoudnessCorrected { src_drift_lu: Some(_), .. })),
         "expected the drift to be reported, got: {:?}",
         report.warnings
     );
@@ -153,7 +157,10 @@ fn a_band_limited_master_is_neither_corrected_nor_warned_about() {
         report.delivered.integrated_lufs
     );
     assert!(
-        !report.warnings.iter().any(|w| w.contains("across the resample")),
+        !report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, WarningKind::SrcLoudnessCorrected { .. })),
         "a 0.03 LU drift must not be reported: {:?}",
         report.warnings
     );
@@ -179,14 +186,24 @@ fn the_target_not_met_warning_quotes_the_delivered_loudness() {
     let warning = report
         .warnings
         .iter()
-        .find(|w| w.contains("loudness target not met"))
+        .find(|w| matches!(w, WarningKind::LoudnessTargetMissed { .. }))
         .unwrap_or_else(|| panic!("expected a target-not-met warning, got: {:?}", report.warnings));
 
     // The figure in the warning has to be the one in the report, or the two disagree about
-    // the same file.
+    // the same file. Asked of the payload rather than of the sentence — the warning carries
+    // the number now, and a substring search would also pass on a coincidence.
+    let WarningKind::LoudnessTargetMissed { delivered_lufs, .. } = warning else {
+        unreachable!("matched above")
+    };
+    assert_eq!(
+        delivered_lufs.to_bits(),
+        report.delivered.integrated_lufs.to_bits(),
+        "the warning and the report must quote one measurement"
+    );
+    // ...and the sentence must still show it, since that is what a reader sees.
     let delivered = format!("{:.2}", report.delivered.integrated_lufs);
     assert!(
-        warning.contains(&delivered),
+        warning.message().contains(&delivered),
         "the warning must quote the delivered loudness {delivered}: {warning}"
     );
 }
@@ -225,7 +242,9 @@ fn the_post_resample_correction_stops_at_the_ceiling() {
         "the correction must stop at the ceiling: {after:.6} dBTP vs {ceiling:.6}"
     );
     assert!(
-        correction.warnings.iter().any(|w| w.contains("capped by")),
+        correction.warnings.iter().any(
+            |w| matches!(w, WarningKind::SrcLoudnessCorrected { capped_by_ceiling: Some(_), .. })
+        ),
         "a clamped correction must say so: {:?}",
         correction.warnings
     );
@@ -316,7 +335,7 @@ fn a_derived_flac_rate_above_96k_fails_before_any_dsp_runs() {
     let blocker = t
         .delivery_blocker(192_000, Some(2))
         .expect("the dry-run must predict this failure");
-    assert!(blocker.contains("192000"), "{blocker}");
+    assert_eq!(blocker, DeliveryBlocker::FlacRate { rate: 192_000 }, "{blocker}");
 
     let message = match pipeline::process(&input, &t, Some(SEED)) {
         Ok(r) => panic!("expected a refusal, got {}", r.output),

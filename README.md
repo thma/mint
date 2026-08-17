@@ -413,7 +413,8 @@ stdout empty" as "nothing ran".
 
 The document opens with a `"schema_version"` integer. It is bumped only when a reader
 could break — a field removed or renamed, or one whose meaning changes. **Adding** a field
-does not bump it, so a consumer must tolerate keys it does not know.
+does not bump it, so a consumer must tolerate keys it does not know. It currently reads
+**2**; version 1 differed in one respect, described under warnings below.
 
 Alongside the metering, each task reports what the render actually did, which is what makes
 a run reproducible and auditable after the fact:
@@ -448,6 +449,40 @@ And a DSD task gains a nested `dsd` object:
 
 `max_modulation_percent` and `overload_samples` are the QC numbers for a 1-bit
 deliverable — see [DSD](#dsd-1-bit--sacd).
+
+#### Warnings and failures carry a kind
+
+A warning is an object, not a string — **this is the change from schema 1**, where
+`warnings` was an array of bare sentences:
+
+```json
+"warnings": [
+  { "kind": "heavy_limiting", "subject": "loudness",
+    "message": "heavy limiting: 4.2 dB of peak gain reduction to reach -14.0 LUFS under the -1.0 dBTP ceiling (source true peak -0.2 dBTP); consider a lower target or more source headroom" }
+]
+```
+
+`message` is the sentence mint prints on the console, unchanged and still the thing to show
+a person. `kind` is a stable snake_case discriminant to branch, group and count on, so QC
+automation never has to match on prose: `heavy_limiting`, `loudness_target_missed`,
+`src_loudness_corrected`, `residual_true_peak`, `ceiling_enforced_by_limiter`,
+`ceiling_enforced_by_gain`, `ceiling_not_enforced`, `reduce_gain_capped`,
+`predicted_peak_over_ceiling`, `maximization_capped`, `maximize_without_lufs`,
+`undithered_reduction`, `dsd_over_modulation`, `dsd_sigma_delta_overload`. `subject` is the
+coarser grouping: `loudness`, `peak`, `dither` or `dsd`.
+
+Each entry in `failures` gains a `kind` for the same reason. In this document it is one of
+`output_exists`, `output_is_the_input`, `delivery_blocked` or `other` — the four ways a
+single task can fail once the batch is under way. Of those, only `output_exists` is something
+`--force` would have allowed; mint refuses to write over an input master under `--force` too.
+
+The other kinds the type can express never reach this array, and that is worth stating rather
+than leaving a reader to wonder. A cancelled job is not a failure — nothing was written and
+nothing was refused, so it is neither a task nor a failure. And a batch collision
+(`batch_output_collision`, `batch_writes_over_an_input`) is caught in the pre-flight, before
+any audio is touched, which is one of the cases above that produces **no document at all**.
+
+    mint --config mint.toml --json "masters/*.wav" | jq '[.tasks[].warnings[].kind] | group_by(.) | map({kind: .[0], n: length})'
 
 ## Audio quality
 

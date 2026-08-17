@@ -254,7 +254,11 @@ fn a_blocker_that_needs_the_input_reaches_the_list_per_cell() {
         .expect("the target resolves")
         .delivery_blocker(probe.sample_rate, probe.channels)
         .expect("192 kHz into FLAC must be blocked");
-    assert_eq!(cell.message, expected, "mint's own FLAC ceiling message, unedited");
+    assert_eq!(
+        cell.message,
+        expected.to_string(),
+        "mint's own FLAC ceiling message, unedited"
+    );
 
     let message = cell.message.clone();
     assert_on_screen(&panel(state), &message);

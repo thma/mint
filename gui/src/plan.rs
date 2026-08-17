@@ -40,12 +40,13 @@ use std::path::{Path, PathBuf};
 use egui::{Color32, Response, RichText, Sense, Ui};
 use egui_table::{CellInfo, Column, HeaderCellInfo, HeaderRow, Table, TableDelegate};
 use mint::audio::io_read::SourceProbe;
+use mint::diagnostics::FailureKind;
 use mint::config::{ResolvedTarget, SizeEstimate};
 use mint::pipeline::{self, Conflict};
 use mint::util::fmt_bytes;
 
 use crate::colors;
-use crate::problems::{Problem, Scope, Severity};
+use crate::problems::{Problem, Scope};
 use crate::state::{AppState, Source};
 
 /// One cell's predicted output size, or `None` when the header did not declare enough to
@@ -227,7 +228,13 @@ fn verdict(
     // Asked first and asked with the input, because a job that cannot run has no filename
     // and no size worth showing.
     if let Some(reason) = target.delivery_blocker(probe.sample_rate, probe.channels) {
-        return Verdict { status: Status::Blocked, note: Some(reason), output: None, size: None };
+        return Verdict {
+            status: Status::Blocked,
+            // `Display` is `DeliveryBlocker`'s own sentence — mint's words, not a paraphrase.
+            note: Some(reason.to_string()),
+            output: None,
+            size: None,
+        };
     }
     let out_rate = target.delivery_rate(probe.sample_rate);
     let output = match target.render_output_path(input, out_rate) {
@@ -343,16 +350,19 @@ fn legend(ui: &mut Ui) {
     });
 }
 
-/// The collector's cell-scoped *errors*, keyed by cell and built once per frame instead of
+/// The collector's batch-collision rows, keyed by cell and built once per frame instead of
 /// scanned per cell.
 ///
-/// Errors only, and that filter is what makes the lookup mean "collision": step 7's
-/// delivery blocker is asked directly one line above the lookup and so never reaches it,
-/// and step 9's output conflict is a warning. Step 8's batch collision is what is left.
+/// Asked of mint's own classification of each row rather than recovered by elimination. It
+/// used to be "a cell-scoped row whose severity is Error", which is a *consequence* of how
+/// the collector happens to be arranged today — step 7's delivery blocker is asked directly
+/// one line above the lookup and step 9's conflict is a warning, so only step 8 was left —
+/// and it would have started quietly mislabelling rows the day any other step produced a
+/// cell-scoped error. `FailureKind::BatchCollision` is the fact itself.
 fn collision_index(problems: &[Problem]) -> HashMap<(usize, &str), &str> {
     let mut index: HashMap<(usize, &str), &str> = HashMap::new();
     for problem in problems {
-        if problem.severity != Severity::Error {
+        if !matches!(problem.kind, Some(FailureKind::BatchCollision { .. })) {
             continue;
         }
         if let Scope::Cell { source, target } = &problem.scope {

@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
 use mint::audio::io_write_dsd::{BLOCK_BYTES, BLOCK_SAMPLES, HEADER_BYTES};
 use mint::audio::{io_read, io_write};
+use mint::diagnostics::WarningKind;
 use mint::config::{Config, SizeEstimate};
 use mint::ops::dsd::DsdRate;
 use mint::ops::dsd::decimate::Decimator;
@@ -655,7 +656,7 @@ fn the_ceiling_stage_keeps_the_modulation_index_inside_the_format() {
     assert_eq!(dsd.overload_samples, 0, "the loop should never have clamped");
     assert_eq!(dsd.resets, 0);
     assert!(
-        !report.warnings.iter().any(|w| w.contains("modulation")),
+        !report.warnings.iter().any(|w| matches!(w, WarningKind::DsdOverModulation { .. })),
         "{:?}",
         report.warnings
     );

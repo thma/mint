@@ -136,10 +136,11 @@ pub fn run() -> Result<()> {
 
     let mut reports: Vec<ProcessingReport> = Vec::new();
     let mut failures: Vec<TaskFailure> = Vec::new();
-    let fail = |job: &Job, e: anyhow::Error| TaskFailure {
-        target: job.target.name.clone(),
-        input: job.input.display().to_string(),
-        error: format!("{e:#}"),
+    // Classified while the live `anyhow::Error` is still in hand: `TaskFailure::new` reads
+    // its chain, and flattening it to a string first would throw away the only non-textual
+    // answer to "what kind of failure was that".
+    let fail = |job: &Job, e: anyhow::Error| {
+        TaskFailure::new(job.target.name.clone(), job.input.display().to_string(), &e)
     };
 
     if args.fail_fast || worker_count <= 1 {

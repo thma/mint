@@ -1,6 +1,8 @@
 pub mod audio;
+pub mod chain;
 pub mod cli;
 pub mod config;
+pub mod diagnostics;
 pub mod dither;
 pub mod json_report;
 pub mod ops;

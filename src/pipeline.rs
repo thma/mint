@@ -1,17 +1,17 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
-use crate::audio::buffer::OutputSampleFormat;
+use crate::audio::buffer::{AudioBuffer, OutputSampleFormat};
 use crate::audio::io_read;
 use crate::audio::io_write;
+use crate::diagnostics::{FailureKind, WarningKind};
 use crate::config::{
-    DitherMode, OnClipPolicy, OutputCodec, ResolvedTarget, dither_strength_tag, dither_tag,
-    format_tag, quality_tag,
+    DeliveryBlocker, DitherMode, OnClipPolicy, OutputCodec, ResolvedTarget, dither_strength_tag,
+    dither_tag, format_tag, quality_tag,
 };
-use crate::ops::dsd::modulator::MAX_MODULATION;
-use crate::ops::loudness::{LUFS_TOLERANCE, LoudnessAnalysis};
+use crate::ops::loudness::LoudnessAnalysis;
 use crate::ops::{bitdepth, dsd, limiter, loudness, resample};
 use crate::progress::{JobControl, Stage};
 
@@ -97,7 +97,7 @@ pub struct ProcessingReport {
     pub format: String,
     /// DSD-specific figures; `None` for every PCM and MP3 target.
     pub dsd: Option<DsdReport>,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<WarningKind>,
 }
 
 impl ProcessingReport {
@@ -159,7 +159,27 @@ pub struct DsdReport {
 pub struct TaskFailure {
     pub target: String,
     pub input: String,
+    /// mint's own message, exactly as the CLI would have bailed with it. Still a `String`
+    /// and still the thing to *show*: `kind` is for branching, not for printing.
     pub error: String,
+    /// What kind of failure it was, from [`FailureKind::classify`] on the live error before
+    /// it was flattened. Recorded here because the flattening is lossy — once the job's
+    /// `anyhow::Error` is gone, the only way back to "was that a cancel, a refused overwrite
+    /// or a real failure?" is to read the sentence, which is what this exists to avoid.
+    pub kind: FailureKind,
+}
+
+impl TaskFailure {
+    /// Build one from a live error, classifying and flattening it in the same breath so the
+    /// two cannot be done from different errors.
+    pub fn new(target: impl Into<String>, input: impl Into<String>, error: &anyhow::Error) -> Self {
+        Self {
+            target: target.into(),
+            input: input.into(),
+            error: format!("{error:#}"),
+            kind: FailureKind::classify(error),
+        }
+    }
 }
 
 /// Why a render would destroy something the user did not agree to lose.
@@ -220,11 +240,43 @@ pub fn output_conflict(input: &Path, output_path: &Path, overwrite: bool) -> Opt
     Some(Conflict::Existing)
 }
 
+/// A refused write, as an error that still knows *why*.
+///
+/// The whole type exists so `diagnostics::FailureKind::classify` can recover the [`Conflict`]
+/// from a job's `anyhow::Error` — and specifically so a front end can tell the force-able
+/// half (`Existing`) from the half `--force` does not reach (`Input`) without matching on the
+/// sentence. `Display` delegates to [`Conflict::message`], which stays the single producer,
+/// and the error is one link long, so `{}` and `{:#}` both render exactly what `bail!`
+/// rendered before it existed.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", conflict.message(input, output))]
+pub struct ConflictError {
+    pub conflict: Conflict,
+    input: PathBuf,
+    output: PathBuf,
+}
+
+/// `delivery_blocker`'s refusal, as an error. Same bargain as [`ConflictError`]: `Display` is
+/// the `bail!` string it replaced, character for character, and the typed
+/// [`DeliveryBlocker`] survives into the chain for a caller that has to branch on which rule
+/// fired rather than print it.
+#[derive(Debug, thiserror::Error)]
+#[error("target '{target}': {blocker}")]
+pub struct DeliveryBlockedError {
+    pub target: String,
+    pub blocker: DeliveryBlocker,
+}
+
 /// Enforcement half of [`output_conflict`]: the same question, as a hard stop.
 fn guard_output_path(input: &Path, output_path: &Path, overwrite: bool) -> Result<()> {
     match output_conflict(input, output_path, overwrite) {
         None => Ok(()),
-        Some(conflict) => bail!("{}", conflict.message(input, output_path)),
+        Some(conflict) => Err(ConflictError {
+            conflict,
+            input: input.to_path_buf(),
+            output: output_path.to_path_buf(),
+        }
+        .into()),
     }
 }
 
@@ -295,32 +347,180 @@ pub fn process_with(
     // used to cost a hundred decodes to say the same thing a hundred times.
     ctl.report(Stage::Probe, 0.0);
     ctl.check()?;
+    let plan = plan_job(input, target)?;
+    // Before the decode as well as before the write: a `create_dir_all` that fails on
+    // permissions should not cost a five-minute master's worth of decoding first. It comes
+    // after the guard so a refused job leaves no empty directories behind, and `render`
+    // repeats it for the callers that arrive with a buffer already in hand.
+    create_output_dir(&plan.output_path)?;
+
+    let buffer = io_read::read_audio_with(input, ctl)?;
+    // The two read the same track parameters out of the same container, so this cannot
+    // differ — but the output path was already rendered from the header's answer, and a
+    // silent disagreement would put the wrong `{rate}` in the file name.
+    debug_assert_eq!(
+        buffer.sample_rate, plan.source_rate,
+        "probe and decode disagree on the rate"
+    );
+
+    render(input, buffer, target, seed, ctl, started)
+}
+
+/// Everything that can make a job impossible, settled from the input's **header**.
+///
+/// The prologue of [`process_with`] as a value, so the ordering guarantee CLAUDE.md states —
+/// *nothing costs a decode before it is known to be possible* — lives in a function rather
+/// than in the order of four statements someone could reasonably reorder. Touches no audio
+/// and creates no directory, so it is also safe to ask speculatively.
+///
+/// `delivery_blocker` is asked here with the header's channel count, which may be `None` for
+/// a container that does not declare one; [`process_buffer_with`] asks it again with the
+/// decoded count, which never is.
+pub fn plan_job(input: &Path, target: &ResolvedTarget) -> Result<JobPlan> {
     let probe = io_read::probe_source(input)?;
-    let source_rate = probe.sample_rate;
+    plan_output(input, target, probe.sample_rate, probe.channels)
+}
+
+/// What [`plan_job`] settled: the rates the chain will run at and where the file lands.
+#[derive(Debug, Clone)]
+pub struct JobPlan {
+    pub source_rate: u32,
+    /// The rate of the *delivered* file — for DSD the 1-bit rate, not the intermediate one.
+    pub out_rate: u32,
+    pub output_path: PathBuf,
+}
+
+/// The half of [`plan_job`] that does not need a header, shared with the buffer entry point
+/// so the two cannot answer the same question differently.
+fn plan_output(
+    input: &Path,
+    target: &ResolvedTarget,
+    source_rate: u32,
+    channels: Option<usize>,
+) -> Result<JobPlan> {
     let out_rate = target.delivery_rate(source_rate);
-    if let Some(reason) = target.delivery_blocker(source_rate, probe.channels) {
-        bail!("target '{}': {reason}", target.name);
+    if let Some(blocker) = target.delivery_blocker(source_rate, channels) {
+        return Err(DeliveryBlockedError { target: target.name.clone(), blocker }.into());
     }
     let output_path = target.render_output_path(input, out_rate)?;
-    // Before `create_dir_all`, so a refused job leaves no empty directories behind. The
+    // Before any `create_dir_all`, so a refused job leaves no empty directories behind. The
     // guard does not need the parent to exist: a path whose parent is missing has nothing
     // sitting at it, which is the only case it cares about.
     guard_output_path(input, &output_path, target.overwrite)?;
+    Ok(JobPlan { source_rate, out_rate, output_path })
+}
+
+fn create_output_dir(output_path: &Path) -> Result<()> {
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create output directory: {}", parent.display()))?;
     }
+    Ok(())
+}
 
-    let mut buffer = io_read::read_audio_with(input, ctl)?;
-    // The two read the same track parameters out of the same container, so this cannot
-    // differ — but the output path was already rendered from the header's answer, and a
-    // silent disagreement would put the wrong `{rate}` in the file name.
-    debug_assert_eq!(buffer.sample_rate, source_rate, "probe and decode disagree on the rate");
-    // Asked again with the decoded channel count: `probe.channels` is `None` for a container
-    // that does not declare one, and the check above cannot fire on what it cannot see.
-    if let Some(reason) = target.delivery_blocker(source_rate, Some(buffer.channels_count())) {
-        bail!("target '{}': {reason}", target.name);
+/// [`process`] for audio the caller already holds, so a decode mint did not perform can still
+/// be rendered through the one chain.
+///
+/// `input` is **not read here**. It is still required, and it is not decoration: it is the
+/// identity the overwrite policy compares against (`same_file`, hard links included) and the
+/// source of `{stem}`/`{ext}` in the output name. Hand over the path the audio came from; a
+/// stand-in produces a correctly-named file and a wrong answer to "would this destroy the
+/// master?".
+///
+/// `buffer` is taken by value because every op mutates it in place — a caller rendering one
+/// input into several targets must clone per target. That is also why mint's own batch does
+/// **not** decode once and share: measured on a five-minute 96 kHz master, the decode is
+/// 88 ms of a 3.9 s job while the pristine copy it would have to hold for the batch's life is
+/// +184 MB on a 763 MB four-worker peak. Trading 2 % of CPU for 24 % of RAM is the wrong way
+/// round for a tool whose budget *is* the buffer.
+///
+/// The buffer must be as `io_read::read_audio` produces it — un-quantized, with
+/// `out_format == OutputSampleFormat::F32`. A buffer that has already been through
+/// `bitdepth::apply` is refused rather than quantized a second time; see [`render`].
+pub fn process_buffer(
+    input: &Path,
+    buffer: AudioBuffer,
+    target: &ResolvedTarget,
+    seed: Option<u64>,
+) -> Result<ProcessingReport> {
+    process_buffer_with(input, buffer, target, seed, JobControl::default())
+}
+
+/// [`process_buffer`], with cancellation and progress.
+///
+/// Every guard [`process_with`] runs still runs here — `delivery_blocker` (with a channel
+/// count that is never `None`), `render_output_path`, `guard_output_path` including the
+/// `Conflict::Input` hard-link case, and `create_dir_all` after the guard. What the caller
+/// takes on is the *ordering* one: mint's own rule is that nothing costs a decode before it
+/// is known to be possible, and a caller that has already decoded has spent that cost. Ask
+/// [`plan_job`] first if the decode is still ahead of you.
+pub fn process_buffer_with(
+    input: &Path,
+    buffer: AudioBuffer,
+    target: &ResolvedTarget,
+    seed: Option<u64>,
+    ctl: JobControl<'_>,
+) -> Result<ProcessingReport> {
+    render(input, buffer, target, seed, ctl, std::time::Instant::now())
+}
+
+/// The chain itself, over a buffer that is already in memory. The one body both entry points
+/// run, so there is no second description of the pipeline.
+///
+/// `started` is threaded rather than taken here because `elapsed_ms` must cover the probe and
+/// the decode when there was one.
+fn render(
+    input: &Path,
+    mut buffer: AudioBuffer,
+    target: &ResolvedTarget,
+    seed: Option<u64>,
+    ctl: JobControl<'_>,
+    started: std::time::Instant,
+) -> Result<ProcessingReport> {
+    // The single most load-bearing invariant in CLAUDE.md is that the buffer meets a grid
+    // exactly once. `bitdepth::apply` below starts from `OutputSampleFormat::F32` — meaning
+    // "not yet on an integer grid" — and that was sound only because `read_audio` was the one
+    // producer of buffers. It is not any more, so the assumption is now a check: a buffer
+    // that has already been quantized would be quantized a second time, silently, and the
+    // result would be a real defect in shipped audio.
+    //
+    // The question is `int_grid()`, not equality with `F32`. f64 is mint's documented
+    // *lossless passthrough* — a buffer labelled `F64` has been through `bitdepth::apply` and
+    // is bit-for-bit what it was, so refusing it would be refusing audio nothing happened to,
+    // with a message saying it had been quantized.
+    if buffer.out_format.int_grid().is_some() {
+        anyhow::bail!(
+            "target '{}': refusing audio that has already been quantized to {} — the chain \
+             quantizes exactly once and must be handed the un-quantized buffer",
+            target.name,
+            format_tag(buffer.out_format)
+        );
     }
+    // Planar and ragged is representable and would panic several stages in, inside a slice
+    // index in the loudness meter, with nothing naming the caller's mistake. Cheap to ask
+    // here — it is one length comparison per channel, not per frame.
+    if buffer.channels.is_empty() {
+        anyhow::bail!("target '{}': refusing a buffer with no channels", target.name);
+    }
+    if let Some(bad) = buffer.channels.iter().position(|c| c.len() != buffer.frame_len()) {
+        anyhow::bail!(
+            "target '{}': channel {bad} has {} frames but channel 0 has {} — every channel of \
+             a planar buffer must be the same length",
+            target.name,
+            buffer.channels[bad].len(),
+            buffer.frame_len()
+        );
+    }
+
+    // The buffer's own rate, never a probe's: the audio in hand is the audio that ships, and
+    // the `{rate}` in the file name has to come from the same place as the samples.
+    let source_rate = buffer.sample_rate;
+    // Asked with the decoded channel count. `plan_job`'s ask can see `None` for a container
+    // that does not declare one, and cannot fire on what it cannot see.
+    let plan = plan_output(input, target, source_rate, Some(buffer.channels_count()))?;
+    let out_rate = plan.out_rate;
+    let output_path = plan.output_path;
+    create_output_dir(&output_path)?;
 
     let ceiling = target.ceiling_dbtp;
     let limiter_options = limiter::LimiterOptions {
@@ -372,12 +572,12 @@ pub fn process_with(
             if result.limiter_gain_reduction_db > target.warn_limiting_db
                 && !matches!(target.on_clip, OnClipPolicy::Maximize)
             {
-                warnings.push(format!(
-                    "heavy limiting: {:.1} dB of peak gain reduction to reach {lufs:.1} LUFS \
-                     under the {ceiling:.1} dBTP ceiling (source true peak {:.1} dBTP); \
-                     consider a lower target or more source headroom",
-                    result.limiter_gain_reduction_db, source.true_peak_dbtp
-                ));
+                warnings.push(WarningKind::HeavyLimiting {
+                    gain_reduction_db: result.limiter_gain_reduction_db,
+                    target_lufs: lufs,
+                    ceiling_dbtp: ceiling,
+                    source_true_peak_dbtp: source.true_peak_dbtp,
+                });
             }
         }
 
@@ -407,12 +607,13 @@ pub fn process_with(
         // `on_clip`: the correction cannot exceed the headroom, so no policy's promise about
         // peaks is broken by it.
         if let Some(lufs) = target.lufs {
-            let correction = loudness::correct_loudness_after_resample(
+            let correction = loudness::correct_loudness_after_resample_with(
                 &mut buffer,
                 lufs,
                 ceiling,
                 recheck.true_peak_dbtp,
                 pre_src_lufs.unwrap_or(f64::NAN),
+                ctl,
             )?;
             warnings.extend(correction.warnings);
             post_resample_gain_db = Some(correction.applied_db);
@@ -425,9 +626,7 @@ pub fn process_with(
     if !loudness_ran {
         // Makeup-gain convergence needs a LUFS goal; without one, maximize is just limit.
         if matches!(target.on_clip, OnClipPolicy::Maximize) {
-            warnings.push(
-                "on_clip=maximize has no effect without lufs; behaving as limit".to_string(),
-            );
+            warnings.push(WarningKind::MaximizeWithoutLufs);
         }
         warnings.extend(loudness::enforce_ceiling_with(
             &mut buffer,
@@ -458,11 +657,10 @@ pub fn process_with(
         && delivered.integrated_lufs.is_finite()
         && !loudness::meets_target(delivered.integrated_lufs, lufs)
     {
-        warnings.push(format!(
-            "loudness target not met within +/-{LUFS_TOLERANCE:.1} LU \
-             (target {lufs:.2}, delivered {:.2})",
-            delivered.integrated_lufs
-        ));
+        warnings.push(WarningKind::LoudnessTargetMissed {
+            target_lufs: lufs,
+            delivered_lufs: delivered.integrated_lufs,
+        });
     }
 
     // 4/5. Quantize (once, if the codec is PCM-based) and encode/write. Two codecs skip the
@@ -511,20 +709,16 @@ pub fn process_with(
             // exists to prevent — so if it fires, the ceiling stage was bypassed or the
             // ceiling itself is set above 0.
             if stats.exceeds_format_maximum() {
-                warnings.push(format!(
-                    "peak modulation {:.1} % exceeds the format maximum of {:.2} % \
-                     (the 20/28 rule); lower ceiling_dbtp",
-                    stats.max_modulation_percent(),
-                    MAX_MODULATION * 100.0
-                ));
+                warnings.push(WarningKind::DsdOverModulation {
+                    max_modulation_percent: stats.max_modulation_percent(),
+                });
             }
             if stats.overload_samples > 0 {
-                warnings.push(format!(
-                    "sigma-delta overload on {} of {} samples ({} loop reset(s)); the \
-                     modulator clipped rather than diverged, but the tail of the level \
-                     distribution is past what a 1-bit loop can track",
-                    stats.overload_samples, stats.samples, stats.resets
-                ));
+                warnings.push(WarningKind::DsdSigmaDeltaOverload {
+                    overload_samples: stats.overload_samples,
+                    samples: stats.samples,
+                    resets: stats.resets,
+                });
             }
 
             format_tag_str = "1-bit".to_string();
@@ -565,10 +759,7 @@ pub fn process_with(
                 && matches!(target.dither, DitherMode::None)
                 && matches!(target.format, OutputSampleFormat::S16)
             {
-                warnings.push(format!(
-                    "undithered bit-depth reduction {} -> s16 requested (dither=none); this can introduce correlated quantization distortion on low-level material",
-                    format_tag(in_format)
-                ));
+                warnings.push(WarningKind::UnditheredReduction { from: in_format });
             }
 
             format_tag_str = format_tag(target.format).to_string();

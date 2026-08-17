@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use mint::diagnostics::WarningKind;
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
 use mint::audio::io_write;
 use mint::config::{Config, ResolvedTarget, SizeEstimate};
@@ -246,7 +247,7 @@ fn a_report_carries_what_it_was_judged_against_and_agrees_with_its_own_warning()
     assert_eq!(report.lufs_verdict(), Some(true));
     assert!(report.ceiling_verdict(), "delivered {:.2} dBTP", report.delivered.true_peak_dbtp);
     assert!(
-        !report.warnings.iter().any(|w| w.contains("loudness target not met")),
+        !report.warnings.iter().any(|w| matches!(w, WarningKind::LoudnessTargetMissed { .. })),
         "a passing verdict must not sit next to the warning that says otherwise: {:?}",
         report.warnings
     );
@@ -264,7 +265,7 @@ fn a_report_carries_what_it_was_judged_against_and_agrees_with_its_own_warning()
         report.delivered.integrated_lufs
     );
     assert!(
-        report.warnings.iter().any(|w| w.contains("loudness target not met")),
+        report.warnings.iter().any(|w| matches!(w, WarningKind::LoudnessTargetMissed { .. })),
         "the verdict and the warning are the same judgement: {:?}",
         report.warnings
     );
@@ -322,7 +323,7 @@ fn the_loudness_warning_fires_exactly_when_the_verdict_fails() {
     ] {
         let target = target_in(&dir, name, body);
         let report = pipeline::process(&input, &target, Some(1)).expect("process");
-        let warned = report.warnings.iter().any(|w| w.contains("loudness target not met"));
+        let warned = report.warnings.iter().any(|w| matches!(w, WarningKind::LoudnessTargetMissed { .. }));
 
         let expected = match report.declared_lufs {
             Some(declared) => !loudness::meets_target(report.delivered.integrated_lufs, declared),
@@ -352,14 +353,19 @@ fn the_loudness_warning_fires_exactly_when_the_verdict_fails() {
     assert!(warnings_fired.contains(&false), "every target warned — the pass side is untested");
 }
 
-/// The declared figures survive the trip through `--json`, and the schema version does not
-/// move for having gained them.
+/// The declared figures survive the trip through `--json`, at the schema version this build
+/// promises.
 ///
-/// Adding a key is the one change that must *not* bump `SCHEMA_VERSION`: every reader has to
-/// tolerate unknown keys, and a bump would strand the run history the GUI persists in this
-/// exact schema. The version is therefore asserted as a literal rather than read from the
-/// constant — comparing the constant against itself would agree with any future value of it,
-/// and this line is where a removal or a rename has to be thought about on purpose.
+/// The version is asserted as a **literal** rather than read from the constant: comparing the
+/// constant against itself would agree with any future value of it, and this line is where a
+/// removal, a rename or a change of meaning has to be thought about on purpose. Adding a key
+/// must *not* move it — every reader has to tolerate unknown keys, and a bump strands the run
+/// history the GUI persists in this exact schema.
+///
+/// It has moved once, to **2**, and this is the record of why: Tier 3 turned `warnings` from
+/// an array of strings into an array of `{kind, subject, message}` objects and added
+/// `failures[].kind`. The prose did not change and is still in `message` — the *element type*
+/// did, which is the "meaning changes" case the constant's own doc names.
 #[test]
 fn the_json_task_carries_the_declared_figures_at_an_unchanged_schema_version() {
     let dir = tmp("json-declared");
@@ -377,8 +383,9 @@ fn the_json_task_carries_the_declared_figures_at_an_unchanged_schema_version() {
 
     assert_eq!(
         doc["schema_version"].as_u64(),
-        Some(1),
-        "two added keys are not a breaking change; anything that removes or renames one is"
+        Some(2),
+        "schema 2 is `warnings` as objects; anything further that removes, renames or \
+         re-means a key bumps it again"
     );
 
     // Tasks are emitted in the order they were rendered, so these indices are the two

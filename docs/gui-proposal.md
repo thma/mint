@@ -291,6 +291,110 @@ Cancellation semantics come out right for free: `ctl.check()?` propagates as an 
 
 ### Tier 3 — defer past v1, listed so they are not forgotten
 
+> **Status 2026-08-17: all four done.** No DSP was touched and no output bit moved. That is
+> not an assurance, it is a measurement: the `#[cfg(test)] mod reference` suites and all three
+> verification harnesses were run before the work started (Phase 3's block) and again after it
+> finished, and the two `--nocapture` transcripts differ **only in cargo's own `Compiling`
+> line**. Every dB figure, every ULP-level deviation, identical. Worth having, because item 4
+> changes how audio is fed to the loudness meters and the gain those meters set is in the
+> shipped file. Two new library modules,
+> `src/chain.rs` and `src/diagnostics.rs`, three new test files, and the one schema bump this
+> project has made. Seven deltas from the paragraph below, in descending order of how much
+> they matter.
+>
+> 1. **`ChainStep` is a refactor of `describe()`, and the proof is a golden captured from the
+>    code it replaced.** `ResolvedTarget::chain(source_rate) -> Vec<ChainStep>` holds the
+>    branch structure; `ChainStep::line()` is the one producer of the prose; `describe()` is
+>    `chain().iter().map(line).collect()` and nothing else. The paragraph warns about ~15
+>    byte-for-byte assertions, and it undercounts what is at risk: they are all `contains`,
+>    so none of them would notice a line that changed somewhere they do not look, and
+>    `README.md` quotes a five-line dry-run sample. So `tests/fixtures/chain_golden.txt` is
+>    **791 lines over 141 cases** — every `ALL` array walked, every branch of the derivation
+>    — captured by running the matrix against the *pre-refactor* build (stash, bless, unstash)
+>    and then diffed. It matched on the first run and has not moved since.
+> 2. **`WarningKind` is fourteen variants over eighteen sites, and the sentences were moved,
+>    not rewritten.** `ProcessingReport.warnings` is `Vec<WarningKind>`, as are the three
+>    sub-result structs and `enforce_ceiling`'s return. Each variant carries *the figures its
+>    sentence quotes, never the sentence*; `Display` renders `message()`, so `cli.rs`'s console
+>    line did not change at all. Verified two ways: `tests/diagnostics.rs` pins all fourteen
+>    messages as literals behind an exhaustive-match tripwire, and a script diffed every
+>    diagnostic string literal in the tree against `HEAD`'s, format specifiers included —
+>    **26 sentences, 26 matches, nothing lost and nothing new.**
+> 3. **`FailureKind` is a classifier, not an error type.** Rewriting ~50 `bail!`s was the
+>    obvious reading and the wrong one: `FailureKind::classify(&anyhow::Error)` walks the chain
+>    with `downcast_ref` and answers what a front end actually branches on. It needed three
+>    enabling changes, each a typed error whose `Display` **is** the string `bail!` used to
+>    build, so `{}` and `{:#}` render exactly what they rendered before: `pipeline::
+>    ConflictError` (carrying `Conflict`), `config::DeliveryBlocker` (`delivery_blocker` now
+>    returns it instead of a `String`, absorbing the old `flac_rate_error`), and
+>    `diagnostics::BatchCollision`. The first attempt at the third used `.context()` with a
+>    marker underneath and silently appended ": batch plan refused" to mint's own refusal —
+>    caught, and now the reason that pattern is banned in the module doc.
+> 4. **The GUI stopped guessing in three places.** `plan.rs::collision_index` matched on
+>    `FailureKind::BatchCollision` instead of recovering "this is a batch collision" by
+>    elimination over severity and scope (correct only while no other step produced a
+>    cell-scoped error); `problems.rs` asks `kind.force_can_fix()` instead of hard-coding that
+>    `Conflict::Existing` is the force-able one; and `run.rs` classifies rather than
+>    downcasting the outermost error, so a cancel wrapped in a `context` still reads as a
+>    cancel. `Problem` gained an honest `Option<FailureKind>` — `None` where the row came from
+>    a *query* rather than a failure, because there is no error there to classify.
+> 5. **`json_report::SCHEMA_VERSION` is 2**, the first bump in the project's life, and it is
+>    the case the constant's own doc describes: `warnings` went from `[String]` to
+>    `[{kind, subject, message}]`, which changes an existing field's *meaning*. The additive
+>    alternative — a parallel `warning_kinds` array — was rejected for putting two
+>    representations of one warning on the wire. `gui/history.rs` already reports a version
+>    mismatch on an old run file rather than failing to list it, which is what makes the bump
+>    affordable.
+> 6. **Chunking the meters bought cancellation, not speed.** `measure_lufs` and
+>    `measure_true_peak_dbtp` fed ebur128 the whole planar buffer in one call: 673 ms and
+>    1.15 s respectively on the 461 MB reference master, up to nine times in a `maximize`
+>    render, none of it interruptible and none of it visible. They now share `analyze_with`'s
+>    100 ms hop through one `feed_hopped` — the hop expression itself unchanged, because moving
+>    it would move `analyze_with`'s poll instants and with them two reported figures. It
+>    equals ebur128's own `samples_in_100ms` for every rate divisible by ten, which makes
+>    bit-identity structural there; it does not hold for any rate whose last digit is five or
+>    more, which of the rates anyone ships means **11 025 Hz** (1102 vs 1103) — and the first
+>    draft of this note claimed the equality held everywhere. It is now asserted the
+>    honest way: `to_bits()` equality against a whole-buffer reference at six lengths
+>    (aligned, ±1 frame, shorter than a hop) × **five** rates *including 11 025* × mono and
+>    stereo — it holds there too — plus a test pinning 11 025 as the exception so the
+>    structural claim cannot quietly go stale. One consequence is now written
+>    down in `progress::Stage`'s doc: **a stage is not one sweep.** `Loudness` and `Ceiling`
+>    report 0→1 several times per job because they genuinely are several whole-file passes, so
+>    a fraction means *this pass*. Clamping that to a running maximum in the GUI would look
+>    tidier and would be §7 rule 8's lying bar.
+> 7. **`process_buffer` has one real caller and it is `process_with`.** The split is
+>    `plan_job` (probe → `delivery_blocker` → `render_output_path` → `guard_output_path`,
+>    touching no audio and creating no directory) + a private `render` that both public entry
+>    points run, so there is no second description of the chain;
+>    `tests/process_buffer.rs` pins that either door produces the same file byte for byte. On
+>    the honesty question the paragraph's premise does not survive contact: **the GUI has no
+>    decoded audio to hand over** (`gui/` decodes nothing — §7 item 10 forbids the waveform
+>    that would), and mint's own batch should not use it either. Measured, a decode is 88 ms
+>    of a 3.9 s job while the pristine copy a shared decode must hold is +184 MB on a 763 MB
+>    four-worker peak: 2 % of CPU for 24 % of RAM, the wrong way round for a tool whose budget
+>    is the buffer. So it ships as the split a future in-process consumer needs, with that
+>    measurement recorded in its own doc comment — plus one thing that turned out to be a
+>    live latent bug rather than a new risk: `render` hardcoded "the buffer is full precision"
+>    (`OutputSampleFormat::F32`), sound only while `read_audio` was the sole producer of
+>    buffers. It is a hard error now, because the alternative is quantizing twice.
+> 8. **A review pass afterwards found three things a green suite could not.** Worth recording
+>    because all three are the same species — a *claim* the code makes that no test checks.
+>    `ChainStep::stage()` promised `Stage::Quantize` for `WriteFloat` and `Stage::Encode` for
+>    `WriteContainer`; neither ever fires (`bitdepth::apply` returns before reporting when
+>    there is no reduction, and the WAV/FLAC writers report nothing at all — only the MP3 arm
+>    does). A front end highlighting the running step would have waited forever on those rows.
+>    The Report view's new warnings grid did not wrap, so a 200-character warning was clipped
+>    at the right edge — §7 rule 9 by another name, and now a `horizontal_wrapped` again. And
+>    the hop doc claimed the ebur128 equality held "for every rate mint handles" when it fails
+>    for every rate whose last digit is ≥ 5. All three are now pinned rather than reasoned
+>    about: the `stage()` set that returns `None` is *enumerated* in a test, so a writer that
+>    gains progress reporting is told to come back here; and the wrapping has a test that
+>    measures the rendered row against one text line's height, which was checked the only way
+>    such a test is worth anything — by putting the `Grid` back and watching it fail. The
+>    assertion that was there before, a lookup of the sentence by its accessibility label,
+>    passed throughout the bug: a clipped label still has its label.
+
 `ChainStep` + `chain()` with `describe()` reimplemented as its renderer (~100–140 lines, no DSP touched — but ~15 assertions in `tests/config_parse.rs` and `tests/dsd_pipeline.rs` read the strings byte-for-byte, and it must be **one** producer plus a formatter, never a parallel third representation); structured `WarningKind`/`FailureKind` alongside the prose; `process_buffer` so the GUI can hand over already-decoded audio; chunking the `measure_lufs` feed. **Not needed at all in-process:** `--dry-run --json` and NDJSON task events. Those exist only to serve a sidecar, and choosing egui deletes them from the roadmap.
 
 ---
@@ -477,6 +581,45 @@ Sources pane (`probe_source` per file, cached by path+mtime), Targets pane, Plan
 T2-1 (`resolve_target_explained`) plus the Target Inspector with origin badges (`B`/`D`/`P`/`E`) and fate glyphs (`·` applies / `~` inert / `/` dropped / `!` would error), the expandable "why is `rate = 88200 Hz`?" panel, the preset picker as a resolved-value diff, and `toml_edit` write-back with the round-trip property test. Add file-watch + hot-reload. **This is the phase that makes the GUI something a TOML-fluent engineer opens daily.**
 
 ### Phase 3 — real progress and cancellation (1.5 weeks)
+
+> **Status 2026-08-17: closed. Nothing was built for it, and that is the finding.** T2-2 landed
+> in Tier 2 and T1-1/T1-2 in Tier 1, so by the time this phase came up its entire feature list
+> was already shipped — Phase 1's note 1 said as much when it happened. What was still owing is
+> the other half of the paragraph below, the part that is a *gate* rather than a feature: the
+> `#[cfg(test)] mod reference` bit-equality suites and the three verification harnesses had
+> never been run against their documented figures **as one pass, after** the `JobControl`
+> threading. "Before and after" is worthless if only the before was measured.
+>
+> Run 2026-08-17, debug profile, Apple Silicon (arm64, macOS 26.6.1), rustc 1.97.1, system
+> libsoxr 0.1.3. All green: 44 lib tests (the two `mod reference` suites among them), 6 dither,
+> 1 limiter, 10 DSD modulator, 17 DSF container, 40 noise-shaping. **Every printed figure is
+> identical to the number documented in its harness's header** — not within a tolerance,
+> identical to the last digit printed, so no header moved:
+>
+> | harness | figure | header | measured |
+> |---|---|---|---|
+> | `dsd_verification` | DSD64 sup\|NTF\| / in-band / SNR / THD+N | 1.300 / −94.6 / 121.0 / 120.0 dB | 1.3000 / −94.6 / 121.0 / 120.0 dB |
+> | | DSD128 | 1.300 / −135.1 / 163.8 / 162.1 dB | identical |
+> | | DSD256 | 1.300 / −151.1 / 173.7 / 171.1 dB | identical |
+> | | DSD512 | 1.300 / −151.8 / 175.1 / 171.3 dB | identical |
+> | | in-band vs a 2nd-order modulator | 48.2 dB better | 48.2 dB |
+> | | loop-filter fit | k = 2.42, 0.32 dB rms | k = 2.42, 0.32 dB |
+> | | passband 19 Hz – 19.8 kHz, whole chain | 0.0001 dB | 0.0001 dB |
+> | | idle tone, 1e-3 DC offset | 16.1 dB dithered (34.5 undithered) | 16.1 / 34.5 dB |
+> | | SNR after a 90 % overdrive | 120.7 dB | 120.7 dB |
+> | | decimator's own error (the instrument) | −185.7 dB | −185.7 dB |
+> | `limiter_verification` | raised-cosine attack, max gain slew | ≈ 1.9e-2 /sample | 1.919e-2 /sample |
+> | | HF (> 2 kHz) fraction of the gain signal | ≈ 5.8e-8 | 5.789e-8 |
+>
+> `dither_verification` is the one harness with **no** numeric baseline in its header to diff
+> against, and deliberately so: its gate is a *ratio* recomputed at run time (adaptive's
+> perceptual-noise improvement against the best fixed shaper), which is what makes it immune to
+> the absolute threshold calibration inside `psychoacoustic.rs`. It printed adaptive NMR
+> **+4.05 dB** vs best fixed **+0.14 dB** → PASS, with the quiet-passage safeguard holding at
+> adaptive-idle **+10.35 dB** vs Lipshitz **+9.88 dB**.
+>
+> So the audio T2-2 threads a borrowed pointer through is bit-for-bit the audio it produced
+> before, which is the claim §10's "T2-2 changes DSP output" row exists to make someone prove.
 
 T2-2. Run the `#[cfg(test)] mod reference` bit-equality suites before and after; run the DSD, dither and limiter verification harnesses with `--nocapture` and compare the printed dB figures against the numbers in the file headers. T1-1 and T1-2 land here too (the report gains `gain_db`, elapsed, `file_bytes`, dither mode/seed).
 

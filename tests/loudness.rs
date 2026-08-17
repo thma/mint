@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
+use mint::diagnostics::WarningKind;
 use mint::config::LimiterCharacter;
 use mint::config::OnClipPolicy;
 use mint::ops::{limiter, loudness};
@@ -281,7 +282,7 @@ fn maximize_respects_max_limiting_db_cap_and_warns() {
         "capped maximization must fall short of the target"
     );
     assert!(
-        result.warnings.iter().any(|w| w.contains("maximization capped")),
+        result.warnings.iter().any(|w| matches!(w, WarningKind::MaximizationCapped { .. })),
         "cap warning expected, got: {:?}",
         result.warnings
     );
@@ -498,7 +499,7 @@ fn reduce_gain_policy_caps_predicted_peak() {
         result
             .warnings
             .iter()
-            .any(|w| w.contains("reduce_gain applied")),
+            .any(|w| matches!(w, WarningKind::ReduceGainCapped { .. })),
         "reduce_gain warning should be emitted"
     );
 }
@@ -591,7 +592,7 @@ fn enforce_ceiling_warn_policy_leaves_samples_untouched() {
     )
     .expect("enforce should succeed");
 
-    assert!(warnings.iter().any(|w| w.contains("on_clip=warn")));
+    assert!(warnings.iter().any(|w| matches!(w, WarningKind::CeilingNotEnforced { .. })));
     assert_eq!(buffer.channels[0][100], before, "warn must not alter samples");
 }
 

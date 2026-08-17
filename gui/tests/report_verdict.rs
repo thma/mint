@@ -20,8 +20,9 @@ use std::path::PathBuf;
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
+use mint::diagnostics::{FailureKind, WarningKind};
 use mint::ops::loudness::{LUFS_TOLERANCE, LoudnessAnalysis};
-use mint::pipeline::{ProcessingReport, TaskFailure};
+use mint::pipeline::{Conflict, ProcessingReport, TaskFailure};
 use mint_gui::report::ReportView;
 use mint_gui::state::AppState;
 
@@ -76,9 +77,10 @@ fn report(target: &str, delivered_lufs: f64, declared: Option<f64>) -> Processin
         bwf: false,
         format: "s24".into(),
         dsd: None,
-        warnings: vec![format!(
-            "loudness target not met: delivered {delivered_lufs:.2} LUFS, target -14.00 LUFS"
-        )],
+        warnings: vec![WarningKind::LoudnessTargetMissed {
+            target_lufs: -14.0,
+            delivered_lufs,
+        }],
     }
 }
 
@@ -119,6 +121,7 @@ fn a_miss_renders_a_cross_and_a_hit_renders_a_tick() {
             target: "sacd".into(),
             input: "/masters/take.wav".into(),
             error: "refusing to overwrite the input file without --force".into(),
+            kind: FailureKind::OutputConflict(Conflict::Input),
         }],
     );
     harness.run();
@@ -206,4 +209,59 @@ fn sorting_a_column_does_not_lose_the_verdicts() {
     harness.run();
     assert!(harness.query_all_by_label_contains("✗ -14.4").next().is_some());
     assert!(harness.query_all_by_label_contains("✓ -14.0").next().is_some());
+}
+
+/// §7 item 9 has a geometric half that a label query cannot see.
+///
+/// "Every warning is on screen in full" was asserted by looking the sentence up by its
+/// accessibility label — and a label survives being clipped. A `Grid` briefly replaced the
+/// warnings list here and, because an egui grid cell lays out with `TextWrapMode::Extend`
+/// rather than `Wrap`, every long warning was drawn as one line running past the right edge
+/// of a vertical-only `ScrollArea`: measured 986 px of text in 784 px of panel, with the
+/// remedy — the part that says *what to do about it* — off screen. The old assertion passed
+/// throughout.
+///
+/// So this one measures. `HeavyLimiting` is the longest sentence mint produces and the one
+/// whose tail carries the advice, which makes it the right fixture.
+#[test]
+fn a_long_warning_wraps_instead_of_running_off_the_right_edge() {
+    let warning = WarningKind::HeavyLimiting {
+        gain_reduction_db: 4.2,
+        target_lufs: -14.0,
+        ceiling_dbtp: -1.0,
+        source_true_peak_dbtp: -0.2,
+    };
+    let text = warning.message();
+    // ~171 characters, which at this font is roughly 1 200 px against a 784 px panel.
+    assert!(text.len() > 150, "the fixture must be long enough to overflow: {} chars", text.len());
+    let tail = "consider a lower target";
+    assert!(text.contains(tail), "the advice is the part that gets clipped first");
+
+    let mut report = report("cd", -14.4, Some(-14.0));
+    report.warnings = vec![warning];
+    let mut harness = harness(vec![report], Vec::new());
+    harness.run();
+
+    // Asked as "did it wrap?" rather than "does it fit?": the harness reports no screen rect,
+    // so the reference is one text line — taken from the `⚠` glyph beside the sentence, which
+    // is a single line by construction and laid out by the same code in the same row.
+    let line = harness
+        .query_all_by_label_contains("⚠")
+        .map(|node| node.rect().height())
+        .fold(f32::INFINITY, f32::min);
+    assert!(line.is_finite(), "the warning rows must render their glyph");
+    let node = harness
+        .query_all_by_label_contains(tail)
+        .next()
+        .expect("the whole sentence, advice included, must be rendered");
+    let drawn = node.rect();
+    assert!(
+        drawn.height() > line * 1.5,
+        "the warning was laid out {} px tall against a {line} px line, i.e. on one line, so a \
+         {} px sentence is running off the right edge of a vertical-only ScrollArea — a \
+         warning you can only read half of is collapsed by another name (§7 item 9). An \
+         `egui::Grid` cell lays out with TextWrapMode::Extend; `horizontal_wrapped` wraps.",
+        drawn.height(),
+        drawn.width()
+    );
 }

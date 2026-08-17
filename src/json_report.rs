@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+use crate::diagnostics::WarningKind;
 use crate::ops::loudness::LoudnessAnalysis;
 use crate::pipeline::{DsdReport, ProcessingReport, TaskFailure};
 
@@ -14,7 +15,15 @@ use crate::pipeline::{DsdReport, ProcessingReport, TaskFailure};
 /// renamed, or one whose meaning changes. Adding a field does **not** bump it — every
 /// reader already has to tolerate unknown keys. The GUI persists run history in exactly
 /// this schema, and history without a version is unreadable in two years.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// **2** (Tier 3): `warnings` went from an array of strings to an array of
+/// `{kind, message}` objects, and `failures[].kind` was added. The prose is unchanged and
+/// still in `message` — but the element *type* changed, which is exactly the "meaning
+/// changes" case, so it bumps. A `kind` alongside a parallel `warnings` array of strings
+/// would have avoided the bump and put two representations of one warning on the wire;
+/// the version field exists so that trade does not have to be made. The GUI already
+/// reports a version mismatch on an old run file rather than failing to list it.
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Serialize)]
 struct JsonReport<'a> {
@@ -69,7 +78,25 @@ struct TaskJson<'a> {
     declared_ceiling_dbtp: f64,
     source: AnalysisJson,
     delivered: AnalysisJson,
-    warnings: &'a [String],
+    warnings: Vec<WarningJson<'a>>,
+}
+
+/// A warning as both halves of what it is: the stable discriminant a machine branches on and
+/// the sentence a human reads. `message` is [`WarningKind::message`]'s, so the document
+/// cannot word a warning differently from the console that printed it.
+#[derive(Serialize)]
+struct WarningJson<'a> {
+    /// Stable snake_case kind — `heavy_limiting`, `dsd_sigma_delta_overload`, …
+    kind: &'a str,
+    /// Coarser grouping: `loudness` | `peak` | `dither` | `dsd`.
+    subject: &'a str,
+    message: String,
+}
+
+impl<'a> From<&'a WarningKind> for WarningJson<'a> {
+    fn from(w: &'a WarningKind) -> Self {
+        Self { kind: w.tag(), subject: w.subject().label(), message: w.message() }
+    }
 }
 
 #[derive(Serialize)]
@@ -147,6 +174,11 @@ struct FailureJson<'a> {
     target: &'a str,
     input: &'a str,
     error: &'a str,
+    /// What kind of failure it was, recovered from the error's own chain rather than from
+    /// its text: `cancelled` | `output_exists` | `output_is_the_input` | `delivery_blocked` |
+    /// `batch_output_collision` | `batch_writes_over_an_input` | `other`. A reader can tell a
+    /// cancelled job from a failed one without a regex.
+    kind: &'static str,
 }
 
 /// Non-finite (`-inf`/`NaN`) meter values become `None` so the JSON shows `null`
@@ -207,13 +239,18 @@ pub fn render(
             declared_ceiling_dbtp: r.declared_ceiling_dbtp,
             source: (&r.source).into(),
             delivered: (&r.delivered).into(),
-            warnings: &r.warnings,
+            warnings: r.warnings.iter().map(Into::into).collect(),
         })
         .collect();
 
     let failures = failures
         .iter()
-        .map(|f| FailureJson { target: &f.target, input: &f.input, error: &f.error })
+        .map(|f| FailureJson {
+            target: &f.target,
+            input: &f.input,
+            error: &f.error,
+            kind: f.kind.tag(),
+        })
         .collect();
 
     let doc = JsonReport { schema_version: SCHEMA_VERSION, config: config_name, tasks, failures };
@@ -223,6 +260,7 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::FailureKind;
 
     fn analysis(integrated: f64) -> LoudnessAnalysis {
         LoudnessAnalysis {
@@ -266,12 +304,18 @@ mod tests {
             bwf: true,
             format: "s16".into(),
             dsd: None,
-            warnings: vec!["heavy limiting".into()],
+            warnings: vec![WarningKind::HeavyLimiting {
+                gain_reduction_db: 4.2,
+                target_lufs: -14.0,
+                ceiling_dbtp: -1.0,
+                source_true_peak_dbtp: -0.2,
+            }],
         };
         let failure = TaskFailure {
             target: "cd".into(),
             input: "bad.wav".into(),
             error: "boom".into(),
+            kind: FailureKind::Other,
         };
 
         let json = render(Some("album"), &[report], &[failure]).unwrap();

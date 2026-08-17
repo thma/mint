@@ -3,6 +3,7 @@ use ebur128::{Channel, EbuR128, Mode};
 
 use crate::audio::buffer::AudioBuffer;
 use crate::config::OnClipPolicy;
+use crate::diagnostics::WarningKind;
 use crate::ops::limiter;
 use crate::progress::{JobControl, Stage};
 
@@ -42,7 +43,7 @@ pub struct LoudnessApplyResult {
     pub limiter_avg_gain_reduction_db: f64,
     /// Fraction (0..=1) of assessable samples the limiter attenuated.
     pub limiter_active_ratio: f64,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<WarningKind>,
 }
 
 pub fn apply(
@@ -76,8 +77,8 @@ pub fn apply_with(
     ctl: JobControl<'_>,
 ) -> Result<LoudnessApplyResult> {
     ctl.report(Stage::Loudness, 0.0);
-    let in_lufs = measure_lufs(buffer)?;
-    let tp_in = measure_true_peak_dbtp(buffer)?;
+    let in_lufs = measure_lufs_with(buffer, Stage::Loudness, ctl)?;
+    let tp_in = measure_true_peak_dbtp_with(buffer, Stage::Loudness, ctl)?;
 
     let gain_db = target_lufs - in_lufs;
     let mut warnings = Vec::new();
@@ -100,18 +101,17 @@ pub fn apply_with(
         OnClipPolicy::ReduceGain if needs_ceiling_enforcement => {
             // Cap gain so the predicted true peak does not exceed the ceiling.
             // Preserves dynamics entirely; target LUFS may not be met.
-            warnings.push(format!(
-                "clip policy reduce_gain applied; target LUFS may not be reached \
-                 (predicted {:.2} dBTP > ceiling {:.2} dBTP)",
-                predicted_tp, ceiling
-            ));
+            warnings.push(WarningKind::ReduceGainCapped {
+                predicted_dbtp: predicted_tp,
+                ceiling_dbtp: ceiling,
+            });
             gain_db.min(ceiling - tp_in)
         }
         OnClipPolicy::Warn if needs_ceiling_enforcement => {
-            warnings.push(format!(
-                "predicted true peak {:.2} dBTP exceeds ceiling {:.2} dBTP",
-                predicted_tp, ceiling
-            ));
+            warnings.push(WarningKind::PredictedPeakOverCeiling {
+                predicted_dbtp: predicted_tp,
+                ceiling_dbtp: ceiling,
+            });
             gain_db
         }
         // Limit policy: apply the full gain and let the limiter enforce the ceiling below.
@@ -143,15 +143,16 @@ pub fn apply_with(
         limiter_gain_reduction_db = predicted_tp - ceiling;
         (limiter_avg_gain_reduction_db, limiter_active_ratio) = tally.result();
         if final_tp - ceiling > TP_TOLERANCE_DB {
-            warnings.push(format!(
-                "true peak still {final_tp:.2} dBTP after {passes} limiter passes \
-                 (ceiling {ceiling:.2} dBTP)"
-            ));
+            warnings.push(WarningKind::ResidualTruePeak {
+                measured_dbtp: final_tp,
+                passes,
+                ceiling_dbtp: Some(ceiling),
+            });
         }
     }
 
-    let out_lufs = measure_lufs(buffer)?;
-    let tp_out = measure_true_peak_dbtp(buffer)?;
+    let out_lufs = measure_lufs_with(buffer, Stage::Loudness, ctl)?;
+    let tp_out = measure_true_peak_dbtp_with(buffer, Stage::Loudness, ctl)?;
 
     Ok(LoudnessApplyResult {
         in_lufs,
@@ -200,7 +201,7 @@ fn apply_maximize(
 
     let mut out_lufs = in_lufs;
     let mut limited = false;
-    let mut residual_tp_warning = None;
+    let mut residual_tp_warning: Option<WarningKind> = None;
     // Reset per makeup pass: only the last pass's limiting survives into the delivered
     // audio, so only it may be reported.
     let mut tally = limiter::GainReductionTally::new(buffer.channels_count(), buffer.frame_len());
@@ -219,15 +220,16 @@ fn apply_maximize(
             let (final_tp, passes) =
                 limit_and_verify(buffer, ceiling, limiter_options, Some(&mut tally), ctl)?;
             // Only the last pass's audio survives, so earlier residuals are irrelevant.
-            residual_tp_warning = (final_tp - ceiling > TP_TOLERANCE_DB).then(|| {
-                format!(
-                    "true peak still {final_tp:.2} dBTP after {passes} limiter passes \
-                     (ceiling {ceiling:.2} dBTP)"
-                )
-            });
+            residual_tp_warning = (final_tp - ceiling > TP_TOLERANCE_DB).then_some(
+                WarningKind::ResidualTruePeak {
+                    measured_dbtp: final_tp,
+                    passes,
+                    ceiling_dbtp: Some(ceiling),
+                },
+            );
         }
 
-        out_lufs = measure_lufs(buffer)?;
+        out_lufs = measure_lufs_with(buffer, Stage::Loudness, ctl)?;
         let shortfall = target_lufs - out_lufs;
         // The last pass must not raise the gain again: gain_db has to describe the
         // audio actually delivered.
@@ -240,18 +242,18 @@ fn apply_maximize(
     }
 
     if hit_cap && target_lufs - out_lufs > MAKEUP_TOLERANCE_LU {
-        warnings.push(format!(
-            "maximization capped: reached max_limiting_db {max_limiting_db:.1} dB before \
-             {target_lufs:.1} LUFS (delivered {out_lufs:.2} LUFS); raise max_limiting_db \
-             or lower the target"
-        ));
+        warnings.push(WarningKind::MaximizationCapped {
+            max_limiting_db,
+            target_lufs,
+            delivered_lufs: out_lufs,
+        });
     }
     warnings.extend(residual_tp_warning);
 
     let (limiter_avg_gain_reduction_db, limiter_active_ratio) =
         if limited { tally.result() } else { (0.0, 0.0) };
 
-    let tp_out = measure_true_peak_dbtp(buffer)?;
+    let tp_out = measure_true_peak_dbtp_with(buffer, Stage::Loudness, ctl)?;
     Ok(LoudnessApplyResult {
         in_lufs,
         out_lufs,
@@ -293,29 +295,110 @@ fn meter_for(buffer: &AudioBuffer, mode: Mode) -> Result<EbuR128> {
     Ok(meter)
 }
 
-fn measure_lufs(buffer: &AudioBuffer) -> Result<f64> {
-    let mut meter = meter_for(buffer, Mode::I)?;
+/// Poll interval for the momentary/short-term meters, and the hop every meter feed uses.
+/// EBU Tech 3341 refreshes the momentary meter at least every 100 ms, so we hop at that rate
+/// and track the maxima.
+const METER_HOP_MS: f64 = 100.0;
 
-    let planar: Vec<&[f64]> = buffer.channels.iter().map(Vec::as_slice).collect();
-    meter
-        .add_frames_planar_f64(&planar)
-        .context("failed to feed frames into ebur128 loudness meter")?;
+/// Frames per hop at `rate`: `floor(rate / 10)`, unchanged from the expression `analyze_with`
+/// has always used — deliberately, because changing it would move that function's
+/// momentary/short-term poll instants and with them two figures in every report.
+///
+/// It has a second job now, and the second job is *nearly* free. ebur128's own
+/// `samples_in_100ms` is `(rate + 5) / 10`, and the two agree for every rate whose value is a
+/// multiple of ten — which is every rate in the 44.1 and 48 kHz families and every rate
+/// `pcm_stage_rate` can derive. Where they agree, a hop boundary is also a `needed_frames`
+/// boundary and the chunked feed drives the internal K-filter with exactly the call
+/// segmentation the whole-buffer feed did, so bit-identity is *structural*.
+///
+/// They disagree for any rate whose last decimal digit is **five or more** — `floor` rounds
+/// down where `samples_in_100ms` rounds up. Of the rates anyone actually ships, that is
+/// **11 025 Hz** (1102 against 1103) and only 11 025 Hz; an arbitrary WAV header can of course
+/// carry 8 008 or 44 107. There, bit-identity rests on the weaker but still measured claim: libebur128 accumulates into persistent state, so any split of the
+/// input yields the same gating sequence, and the one theoretical divergence — the per-call
+/// denormal flush that is live on aarch64 macOS — does not fire on real programme material.
+/// The test asserts both: the structural equality where it holds, and bit-identity at 11 025
+/// where it does not.
+fn meter_hop(rate: u32) -> usize {
+    ((rate as f64 * METER_HOP_MS / 1000.0) as usize).max(1)
+}
+
+/// Feed the whole buffer to `meter` in [`meter_hop`] slabs, reporting `stage` and honouring
+/// cancellation between them.
+///
+/// The single feed path for all three meters. Before it existed, `analyze_with` hopped (so it
+/// could poll) while `measure_lufs` and `measure_true_peak_dbtp` handed ebur128 the entire
+/// planar buffer in one call — which on a five-minute 96 kHz master is 673 ms of integrated
+/// metering and 1.15 s of true-peak metering that no cancel could interrupt, repeated up to
+/// nine times in a `maximize` render.
+///
+/// `which` names the meter in the error context, because "the loudness meter refused these
+/// frames" and "the true-peak meter did" are different diagnoses and both call sites used to
+/// say which. `after_hop` sees the meter once per slab with the frame index just fed: that is
+/// `analyze_with`'s momentary/short-term poll, and the two single-value meters pass a no-op.
+/// Nothing is allocated per hop — `slabs` is one `Vec` of channel-count fat pointers, reused,
+/// and `&channel[pos..end]` on a planar buffer is free. "The buffer is the budget" is
+/// untouched.
+fn feed_hopped(
+    meter: &mut EbuR128,
+    buffer: &AudioBuffer,
+    which: &str,
+    stage: Stage,
+    ctl: JobControl<'_>,
+    mut after_hop: impl FnMut(&EbuR128, usize),
+) -> Result<()> {
+    let frames = buffer.frame_len();
+    let hop = meter_hop(buffer.sample_rate);
+    let mut progress = ctl.stage(stage, frames as u64);
+    let mut slabs: Vec<&[f64]> = Vec::with_capacity(buffer.channels_count());
+    let mut pos = 0;
+    while pos < frames {
+        progress.tick(pos as u64)?;
+        let end = (pos + hop).min(frames);
+        slabs.clear();
+        slabs.extend(buffer.channels.iter().map(|c| &c[pos..end]));
+        meter
+            .add_frames_planar_f64(&slabs)
+            .with_context(|| format!("failed to feed frames into ebur128 {which}"))?;
+        after_hop(meter, end);
+        pos = end;
+    }
+    progress.finish();
+    Ok(())
+}
+
+/// Integrated loudness (BS.1770), cancellable and reporting progress under `stage`.
+///
+/// There is no `ctl`-less twin, unlike every other `*_with` in the crate: this one is private
+/// and all six of its callers are inside a job that has a `JobControl` in hand, so a wrapper
+/// would only be a way to lose cancellation by accident.
+///
+/// `stage` is a parameter rather than a constant because the meter runs inside three
+/// different stages — the normalization, `maximize`'s convergence loop, and the post-SRC
+/// correction — and a bar that named the wrong one would be worse than none.
+fn measure_lufs_with(buffer: &AudioBuffer, stage: Stage, ctl: JobControl<'_>) -> Result<f64> {
+    let mut meter = meter_for(buffer, Mode::I)?;
+    feed_hopped(&mut meter, buffer, "loudness meter", stage, ctl, |_, _| {})?;
     meter
         .loudness_global()
         .context("failed to query integrated loudness")
 }
 
 pub fn measure_true_peak_dbtp(buffer: &AudioBuffer) -> Result<f64> {
+    measure_true_peak_dbtp_with(buffer, Stage::Ceiling, JobControl::default())
+}
+
+/// [`measure_true_peak_dbtp`], cancellable and reporting progress under `stage`.
+pub fn measure_true_peak_dbtp_with(
+    buffer: &AudioBuffer,
+    stage: Stage,
+    ctl: JobControl<'_>,
+) -> Result<f64> {
     let channels = buffer.channels_count() as u32;
     // Goes through `meter_for` for uniformity only: true peak is a per-channel sample
     // maximum and the channel map never enters it. Nothing here changes for mono.
     let mut meter = meter_for(buffer, Mode::TRUE_PEAK)?;
-
-    let planar: Vec<&[f64]> = buffer.channels.iter().map(Vec::as_slice).collect();
-    meter
-        .add_frames_planar_f64(&planar)
-        .context("failed to feed frames into ebur128 true-peak meter")?;
-
+    feed_hopped(&mut meter, buffer, "true-peak meter", stage, ctl, |_, _| {})?;
     max_true_peak_dbtp(&meter, channels)
 }
 
@@ -362,10 +445,6 @@ impl LoudnessAnalysis {
     }
 }
 
-/// Poll interval for the momentary/short-term meters. EBU Tech 3341 refreshes the
-/// momentary meter at least every 100 ms, so we hop at that rate and track the maxima.
-const METER_HOP_MS: f64 = 100.0;
-
 /// One-pass loudness + dynamics analysis (integrated, LRA, max momentary/short-term,
 /// true peak). Audio is fed in 100 ms hops so the sliding momentary/short-term meters can
 /// be polled for their maxima; integrated, LRA and true peak are read once at the end.
@@ -386,8 +465,6 @@ pub fn analyze_with(
     // LRA ⊇ S ⊇ M, and TRUE_PEAK adds the peak meter — one meter covers every figure.
     let mut meter = meter_for(buffer, Mode::I | Mode::LRA | Mode::TRUE_PEAK)?;
 
-    let frames = buffer.frame_len();
-    let hop = ((rate as f64 * METER_HOP_MS / 1000.0) as usize).max(1);
     // A window's value is only meaningful once that much audio has been fed.
     let momentary_ready = (rate as f64 * 0.4) as usize;
     let short_term_ready = (rate as f64 * 3.0) as usize;
@@ -395,16 +472,9 @@ pub fn analyze_with(
     let mut max_momentary = f64::NEG_INFINITY;
     let mut max_short_term = f64::NEG_INFINITY;
 
-    let mut progress = ctl.stage(stage, frames as u64);
-    let mut pos = 0;
-    while pos < frames {
-        progress.tick(pos as u64)?;
-        let end = (pos + hop).min(frames);
-        let slabs: Vec<&[f64]> = buffer.channels.iter().map(|c| &c[pos..end]).collect();
-        meter
-            .add_frames_planar_f64(&slabs)
-            .context("failed to feed frames into ebur128 meter")?;
-
+    // The polling half of the hop; the hop itself is `feed_hopped`'s, shared with the two
+    // single-value meters so there is one answer to "how is a meter fed".
+    feed_hopped(&mut meter, buffer, "meter", stage, ctl, |meter, end| {
         if end >= momentary_ready
             && let Ok(m) = meter.loudness_momentary()
             && m.is_finite()
@@ -417,9 +487,7 @@ pub fn analyze_with(
         {
             max_short_term = max_short_term.max(s);
         }
-        pos = end;
-    }
-    progress.finish();
+    })?;
 
     Ok(LoudnessAnalysis {
         integrated_lufs: meter.loudness_global().context("integrated loudness")?,
@@ -471,7 +539,10 @@ fn limit_and_verify(
                 limiter::apply_true_peak_limit_with(buffer, internal_ceiling, limiter_options, ctl)?
             }
         }
-        tp = measure_true_peak_dbtp(buffer)?;
+        // `Ceiling` rather than the stage this loop was entered from: the limiter above it
+        // hardcodes `Ceiling` too, so the verification meter and the pass it verifies stay
+        // one bar rather than alternating between two labels every pass.
+        tp = measure_true_peak_dbtp_with(buffer, Stage::Ceiling, ctl)?;
 
         let overshoot = tp - ceiling_dbtp;
         if overshoot <= TP_TOLERANCE_DB {
@@ -498,7 +569,7 @@ pub fn enforce_ceiling(
     ceiling_dbtp: f64,
     on_clip: OnClipPolicy,
     limiter_options: limiter::LimiterOptions,
-) -> Result<Vec<String>> {
+) -> Result<Vec<WarningKind>> {
     enforce_ceiling_with(buffer, ceiling_dbtp, on_clip, limiter_options, JobControl::default())
 }
 
@@ -509,8 +580,8 @@ pub fn enforce_ceiling_with(
     on_clip: OnClipPolicy,
     limiter_options: limiter::LimiterOptions,
     ctl: JobControl<'_>,
-) -> Result<Vec<String>> {
-    let tp = measure_true_peak_dbtp(buffer)?;
+) -> Result<Vec<WarningKind>> {
+    let tp = measure_true_peak_dbtp_with(buffer, Stage::Ceiling, ctl)?;
     if tp <= ceiling_dbtp {
         return Ok(Vec::new());
     }
@@ -521,13 +592,19 @@ pub fn enforce_ceiling_with(
         OnClipPolicy::Limit | OnClipPolicy::Maximize => {
             let (final_tp, passes) =
                 limit_and_verify(buffer, ceiling_dbtp, limiter_options, None, ctl)?;
-            let mut warnings = vec![format!(
-                "true peak {tp:.2} dBTP exceeded ceiling {ceiling_dbtp:.2} dBTP; limiter applied"
-            )];
+            let mut warnings = vec![WarningKind::CeilingEnforcedByLimiter {
+                measured_dbtp: tp,
+                ceiling_dbtp,
+                after_src: false,
+            }];
             if final_tp - ceiling_dbtp > TP_TOLERANCE_DB {
-                warnings.push(format!(
-                    "true peak still {final_tp:.2} dBTP after {passes} limiter passes"
-                ));
+                // `ceiling_dbtp: None`: the line above has just named it, and repeating it
+                // here would reword a shipped warning.
+                warnings.push(WarningKind::ResidualTruePeak {
+                    measured_dbtp: final_tp,
+                    passes,
+                    ceiling_dbtp: None,
+                });
             }
             Ok(warnings)
         }
@@ -539,15 +616,15 @@ pub fn enforce_ceiling_with(
                     *sample *= gain_lin;
                 }
             }
-            Ok(vec![format!(
-                "true peak {tp:.2} dBTP exceeded ceiling {ceiling_dbtp:.2} dBTP; \
-                 reduced gain by {gain_db:.2} dB"
-            )])
+            Ok(vec![WarningKind::CeilingEnforcedByGain {
+                measured_dbtp: tp,
+                ceiling_dbtp,
+                gain_db,
+            }])
         }
-        OnClipPolicy::Warn => Ok(vec![format!(
-            "true peak {tp:.2} dBTP exceeds ceiling {ceiling_dbtp:.2} dBTP; \
-             not corrected (on_clip=warn)"
-        )]),
+        OnClipPolicy::Warn => {
+            Ok(vec![WarningKind::CeilingNotEnforced { measured_dbtp: tp, ceiling_dbtp }])
+        }
     }
 }
 
@@ -559,7 +636,7 @@ pub fn enforce_ceiling_with(
 /// buffer to recover a value that was just computed is real time for nothing.
 #[derive(Debug, Clone)]
 pub struct RecheckResult {
-    pub warnings: Vec<String>,
+    pub warnings: Vec<WarningKind>,
     pub true_peak_dbtp: f64,
 }
 
@@ -591,18 +668,22 @@ pub fn recheck_and_limit_if_needed_with(
     limiter_options: limiter::LimiterOptions,
     ctl: JobControl<'_>,
 ) -> Result<RecheckResult> {
-    let tp = measure_true_peak_dbtp(buffer)?;
+    let tp = measure_true_peak_dbtp_with(buffer, Stage::PostSrcVerify, ctl)?;
     if tp <= ceiling_dbtp {
         return Ok(RecheckResult { warnings: Vec::new(), true_peak_dbtp: tp });
     }
     let (final_tp, passes) = limit_and_verify(buffer, ceiling_dbtp, limiter_options, None, ctl)?;
-    let mut warnings = vec![format!(
-        "true peak {tp:.2} dBTP exceeded ceiling {ceiling_dbtp:.2} dBTP after SRC; limiter re-applied"
-    )];
+    let mut warnings = vec![WarningKind::CeilingEnforcedByLimiter {
+        measured_dbtp: tp,
+        ceiling_dbtp,
+        after_src: true,
+    }];
     if final_tp - ceiling_dbtp > TP_TOLERANCE_DB {
-        warnings.push(format!(
-            "true peak still {final_tp:.2} dBTP after {passes} limiter passes"
-        ));
+        warnings.push(WarningKind::ResidualTruePeak {
+            measured_dbtp: final_tp,
+            passes,
+            ceiling_dbtp: None,
+        });
     }
     Ok(RecheckResult { warnings, true_peak_dbtp: final_tp })
 }
@@ -668,7 +749,7 @@ const SRC_DRIFT_TOLERANCE_LU: f64 = LUFS_TOLERANCE / 2.0;
 pub struct SrcCorrection {
     /// Static gain applied here (dB), 0.0 when the correction was a no-op.
     pub applied_db: f64,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<WarningKind>,
 }
 
 pub fn correct_loudness_after_resample(
@@ -678,7 +759,28 @@ pub fn correct_loudness_after_resample(
     true_peak_dbtp: f64,
     pre_src_lufs: f64,
 ) -> Result<SrcCorrection> {
-    let measured = measure_lufs(buffer)?;
+    correct_loudness_after_resample_with(
+        buffer,
+        target_lufs,
+        ceiling_dbtp,
+        true_peak_dbtp,
+        pre_src_lufs,
+        JobControl::default(),
+    )
+}
+
+/// [`correct_loudness_after_resample`], cancellable. The last function in this module that
+/// still ran a whole-file meter no cancel could reach.
+#[allow(clippy::too_many_arguments)]
+pub fn correct_loudness_after_resample_with(
+    buffer: &mut AudioBuffer,
+    target_lufs: f64,
+    ceiling_dbtp: f64,
+    true_peak_dbtp: f64,
+    pre_src_lufs: f64,
+    ctl: JobControl<'_>,
+) -> Result<SrcCorrection> {
+    let measured = measure_lufs_with(buffer, Stage::PostSrcVerify, ctl)?;
     // Digital silence meters as -inf: there is no gain that makes it -14 LUFS, and the
     // delivered-loudness check reports the miss.
     if !measured.is_finite() {
@@ -709,20 +811,179 @@ pub fn correct_loudness_after_resample(
     // rate will not measure the same.
     let mut warnings = Vec::new();
     if shortfall.abs() > LUFS_TOLERANCE {
-        let src_drift = if pre_src_lufs.is_finite() {
-            format!("{:+.2} LU of that across the resample", measured - pre_src_lufs)
-        } else {
-            "source loudness unmeasurable".to_string()
-        };
-        warnings.push(format!(
-            "delivered loudness was {measured:.2} LUFS against a {target_lufs:.2} target \
-             ({src_drift}); corrected by {applied_db:+.2} dB{}",
-            if applied_db < shortfall - 1e-9 {
-                format!(", capped by the {ceiling_dbtp:.2} dBTP ceiling")
-            } else {
-                String::new()
-            }
-        ));
+        warnings.push(WarningKind::SrcLoudnessCorrected {
+            measured_lufs: measured,
+            target_lufs,
+            applied_db,
+            // Both clauses of the sentence are decided here, where the numbers that decide
+            // them live, and carried as data. `message()` renders them; it does not re-derive
+            // "was this capped?" from a comparison it would have to keep in step with this one.
+            src_drift_lu: pre_src_lufs.is_finite().then_some(measured - pre_src_lufs),
+            capped_by_ceiling: (applied_db < shortfall - 1e-9).then_some(ceiling_dbtp),
+        });
     }
     Ok(SrcCorrection { applied_db, warnings })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::buffer::{OutputSampleFormat, SourceInfo};
+    use std::path::PathBuf;
+
+    /// The whole-buffer feed the hopped one replaced: hand ebur128 the entire planar buffer
+    /// in one `add_frames_planar_f64`. Kept as the definition of "right" for
+    /// `hopped_metering_is_bit_identical_to_a_single_feed`.
+    ///
+    /// It is not shippable — not because of memory (it allocates only channel-count fat
+    /// pointers) but because it is uninterruptible: on the 461 MB reference master it is
+    /// 673 ms of integrated metering and 1.15 s of true-peak metering during which a cancel
+    /// cannot be seen, repeated up to nine times in a `maximize` render.
+    fn whole_file(meter: &mut EbuR128, buffer: &AudioBuffer) {
+        let planar: Vec<&[f64]> = buffer.channels.iter().map(Vec::as_slice).collect();
+        meter.add_frames_planar_f64(&planar).expect("whole-buffer feed");
+    }
+
+    /// The mode has to be passed in rather than fixed: ebur128's integrated figure is not
+    /// identical across mode sets — `Mode::I` alone and `Mode::I | LRA | TRUE_PEAK` differ in
+    /// the last few ULPs on the same audio, because the extra meters change the arithmetic
+    /// the shared gating blocks go through. That is a property of the library and predates
+    /// this change; the point here is to hold *feeding* constant, so each reference is built
+    /// with the same mode as the path it is checking.
+    fn whole_file_lufs(buffer: &AudioBuffer, mode: Mode) -> f64 {
+        let mut meter = meter_for(buffer, mode).expect("meter");
+        whole_file(&mut meter, buffer);
+        meter.loudness_global().expect("integrated")
+    }
+
+    fn whole_file_true_peak(buffer: &AudioBuffer, mode: Mode) -> f64 {
+        let mut meter = meter_for(buffer, mode).expect("meter");
+        whole_file(&mut meter, buffer);
+        max_true_peak_dbtp(&meter, buffer.channels_count() as u32).expect("true peak")
+    }
+
+    /// Deterministic programme-like material: a tone per channel plus a reproducible noise
+    /// floor, so the K-filter, the gating and the 4× true-peak interpolator all have
+    /// something non-trivial to chew on and the result is the same on every run.
+    fn signal(rate: u32, channels: usize, frames: usize) -> AudioBuffer {
+        let mut state = 0x5DEE_CE66_D125_ABCDu64;
+        let mut rng = move || {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        };
+        let channels_data = (0..channels)
+            .map(|c| {
+                let f = 440.0 * (c as f64 + 1.0);
+                (0..frames)
+                    .map(|n| {
+                        let t = n as f64 / rate as f64;
+                        0.4 * (std::f64::consts::TAU * f * t).sin() + 0.02 * rng()
+                    })
+                    .collect()
+            })
+            .collect();
+        AudioBuffer {
+            channels: channels_data,
+            sample_rate: rate,
+            src_info: SourceInfo {
+                path: PathBuf::from("synthetic"),
+                channels,
+                sample_rate: rate,
+                codec: "test".to_string(),
+            },
+            out_format: OutputSampleFormat::F32,
+        }
+    }
+
+    /// `to_bits()`, not a tolerance — CLAUDE.md's rule for every streaming stage, and the
+    /// only assertion that would catch the one way this change could go wrong: a hop that is
+    /// not a multiple of ebur128's `samples_in_100ms` moves where its internal per-call
+    /// denormal flush fires, which is a real (if inaudible) difference in the returned f64.
+    ///
+    /// Lengths are deliberately ragged as well as aligned: an exact multiple of the hop, one
+    /// frame either side of it, a buffer shorter than a single hop, and a buffer shorter than
+    /// the 400 ms momentary window.
+    #[test]
+    fn hopped_metering_is_bit_identical_to_a_single_feed() {
+        // 11 025 is in the list on purpose: it is the one reachable rate where the hop is
+        // *not* ebur128's own 100 ms block, so it is the case the structural argument does
+        // not cover and only a measurement can settle.
+        for rate in [11_025u32, 44_100, 48_000, 96_000, 192_000] {
+            let hop = meter_hop(rate);
+            for channels in [1usize, 2] {
+                for frames in [hop * 37, hop * 37 + 1, hop * 37 - 1, hop - 1, hop / 3, hop * 2] {
+                    let buffer = signal(rate, channels, frames);
+                    let case = format!("{rate} Hz, {channels} ch, {frames} frames");
+
+                    let hopped = measure_lufs_with(&buffer, Stage::Loudness, JobControl::default())
+                        .expect("hopped lufs");
+                    assert_eq!(
+                        hopped.to_bits(),
+                        whole_file_lufs(&buffer, Mode::I).to_bits(),
+                        "integrated loudness differs when hopped ({case})"
+                    );
+
+                    let hopped = measure_true_peak_dbtp(&buffer).expect("hopped true peak");
+                    assert_eq!(
+                        hopped.to_bits(),
+                        whole_file_true_peak(&buffer, Mode::TRUE_PEAK).to_bits(),
+                        "true peak differs when hopped ({case})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `analyze_with` hopped before this change too, and now shares the feeder. The same
+    /// property, asserted through the entry point the *report* actually reads — with the
+    /// reference built on its own combined mode set, because the figures it returns are the
+    /// combined meter's and comparing them to a `Mode::I`-only meter measures the mode, not
+    /// the feed. (That mismatch is worth 4 ULPs and it is how this test first failed.)
+    #[test]
+    fn the_full_analysis_agrees_with_a_single_feed_on_integrated_and_peak() {
+        let mode = Mode::I | Mode::LRA | Mode::TRUE_PEAK;
+        for rate in [44_100u32, 96_000] {
+            for frames in [rate as usize * 4, rate as usize * 4 + 1] {
+                let buffer = signal(rate, 2, frames);
+                let analysis =
+                    analyze_with(&buffer, Stage::AnalyzeSource, JobControl::default()).expect("analyze");
+                assert_eq!(
+                    analysis.integrated_lufs.to_bits(),
+                    whole_file_lufs(&buffer, mode).to_bits(),
+                    "{rate} Hz / {frames} frames"
+                );
+                assert_eq!(
+                    analysis.true_peak_dbtp.to_bits(),
+                    whole_file_true_peak(&buffer, mode).to_bits(),
+                    "{rate} Hz / {frames} frames"
+                );
+            }
+        }
+    }
+
+    /// Where the hop equals ebur128's own `samples_in_100ms` — `(rate + 5) / 10` in its
+    /// source — the bit-identity above is structural rather than lucky. That is every rate
+    /// divisible by ten, which is every rate in the two families mint derives within.
+    ///
+    /// And where it does not: 11 025 Hz, asserted as the exception rather than left as a
+    /// silent hole in the claim. The bit-identity test covers that rate by measurement.
+    #[test]
+    fn the_hop_is_ebur128s_own_block_at_every_rate_divisible_by_ten() {
+        for rate in [8_000u32, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000] {
+            assert_eq!(rate % 10, 0, "{rate} Hz is not in the regime this test describes");
+            assert_eq!(meter_hop(rate), ((rate + 5) / 10) as usize, "{rate} Hz");
+        }
+        // The exception is not 11 025 specifically: it is every rate whose last decimal
+        // digit is five or more, because `floor` rounds down where `samples_in_100ms` rounds
+        // up. 11 025 is simply the only one anyone ships. Both halves asserted, so neither
+        // the rule nor the example in `meter_hop`'s doc can go stale unnoticed.
+        // (Below 10 Hz the `.max(1)` floor makes them agree again, which is a curiosity
+        // rather than a case — nothing decodes at 5 Hz.)
+        for rate in [11_025u32, 8_008, 44_107, 95] {
+            assert_ne!(meter_hop(rate), ((rate + 5) / 10) as usize, "{rate} Hz");
+        }
+        for rate in [11_020u32, 44_104, 100] {
+            assert_eq!(meter_hop(rate), ((rate + 5) / 10) as usize, "{rate} Hz");
+        }
+    }
 }

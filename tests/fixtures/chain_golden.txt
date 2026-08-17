@@ -1,0 +1,791 @@
+## pcm s16 / tpdf / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + tpdf dither (low)
+  - write WAV
+## pcm s16 / tpdf / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + tpdf dither (normal)
+  - write WAV
+## pcm s16 / tpdf / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + tpdf dither (high)
+  - write WAV
+## pcm s16 / none / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + none dither (low)
+  - write WAV
+## pcm s16 / none / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + none dither (normal)
+  - write WAV
+## pcm s16 / none / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + none dither (high)
+  - write WAV
+## pcm s16 / shaped / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + tpdf + noise-shaping (gentle) (low)
+  - write WAV
+## pcm s16 / shaped / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + tpdf + noise-shaping (gentle) (normal)
+  - write WAV
+## pcm s16 / shaped / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + tpdf + noise-shaping (gentle) (high)
+  - write WAV
+## pcm s16 / psychoacoustic / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + tpdf + noise-shaping (psychoacoustic) (low)
+  - write WAV
+## pcm s16 / psychoacoustic / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + tpdf + noise-shaping (psychoacoustic) (normal)
+  - write WAV
+## pcm s16 / psychoacoustic / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + tpdf + noise-shaping (psychoacoustic) (high)
+  - write WAV
+## pcm s16 / adaptive / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + adaptive low dither (psychoacoustic, per-frame) (low)
+  - write WAV
+## pcm s16 / adaptive / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + adaptive normal dither (psychoacoustic, per-frame) (normal)
+  - write WAV
+## pcm s16 / adaptive / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + adaptive high dither (psychoacoustic, per-frame) (high)
+  - write WAV
+## pcm s24 / tpdf / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (low)
+  - write WAV
+## pcm s24 / tpdf / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## pcm s24 / tpdf / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (high)
+  - write WAV
+## pcm s24 / none / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + none dither (low)
+  - write WAV
+## pcm s24 / none / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + none dither (normal)
+  - write WAV
+## pcm s24 / none / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + none dither (high)
+  - write WAV
+## pcm s24 / shaped / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (shaping skipped: s16 only) (low)
+  - write WAV
+## pcm s24 / shaped / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (shaping skipped: s16 only) (normal)
+  - write WAV
+## pcm s24 / shaped / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (shaping skipped: s16 only) (high)
+  - write WAV
+## pcm s24 / psychoacoustic / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (shaping skipped: s16 only) (low)
+  - write WAV
+## pcm s24 / psychoacoustic / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (shaping skipped: s16 only) (normal)
+  - write WAV
+## pcm s24 / psychoacoustic / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (shaping skipped: s16 only) (high)
+  - write WAV
+## pcm s24 / adaptive / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (adaptive low skipped: s16 only) (low)
+  - write WAV
+## pcm s24 / adaptive / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (adaptive normal skipped: s16 only) (normal)
+  - write WAV
+## pcm s24 / adaptive / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (adaptive high skipped: s16 only) (high)
+  - write WAV
+## pcm f32 / tpdf / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / tpdf / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / tpdf / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / none / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / none / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / none / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / shaped / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / shaped / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / shaped / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / psychoacoustic / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / psychoacoustic / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / psychoacoustic / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / adaptive / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / adaptive / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f32 / adaptive / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f32 (no quantization)
+  - write WAV
+## pcm f64 / tpdf / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / tpdf / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / tpdf / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / none / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / none / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / none / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / shaped / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / shaped / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / shaped / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / psychoacoustic / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / psychoacoustic / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / psychoacoustic / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / adaptive / low @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / adaptive / normal @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## pcm f64 / adaptive / high @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - write f64 (no quantization)
+  - write WAV
+## flac s16 @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s16 + tpdf dither (normal)
+  - write FLAC
+## flac s24 @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write FLAC
+## bwf wav @ 48000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write Broadcast WAV (bext + R128 metadata)
+## mp3 default @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - encode MP3 320 kbps (lossy; bit depth & dither not applicable)
+## mp3 320 @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - encode MP3 320 kbps (lossy; bit depth & dither not applicable)
+## resample / lq @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 44100 Hz (lq)
+  - re-check true peak against the ceiling
+  - quantize -> s16 + tpdf dither (normal)
+  - write WAV
+## resample / mq @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 44100 Hz (mq)
+  - re-check true peak against the ceiling
+  - quantize -> s16 + tpdf dither (normal)
+  - write WAV
+## resample / hq @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 44100 Hz (hq)
+  - re-check true peak against the ceiling
+  - quantize -> s16 + tpdf dither (normal)
+  - write WAV
+## resample / vhq @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 44100 Hz (vhq)
+  - re-check true peak against the ceiling
+  - quantize -> s16 + tpdf dither (normal)
+  - write WAV
+## rate kept @ 48000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## rate follows source @ 88200 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 88200 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## resample with lufs @ 96000 Hz
+  - loudness -> -14.0 LUFS (ceiling -1.0 dBTP, limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 44100 Hz (vhq)
+  - re-check true peak against the ceiling and re-verify loudness (corrected within the headroom)
+  - quantize -> s16 + tpdf dither (normal)
+  - write WAV
+## resample without lufs @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 44100 Hz (vhq)
+  - re-check true peak against the ceiling
+  - quantize -> s16 + tpdf dither (normal)
+  - write WAV
+## loudness / limit / balanced / soft=false / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, limit; balanced release; unlinked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / limit / balanced / soft=false / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / limit / balanced / soft=true / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, limit; balanced release; unlinked; soft_clip=true)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / limit / balanced / soft=true / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, limit; balanced release; linked; soft_clip=true)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / limit / transient / soft=false / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, limit; transient release; unlinked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / limit / transient / soft=false / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, limit; transient release; linked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / limit / transient / soft=true / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, limit; transient release; unlinked; soft_clip=true)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / limit / transient / soft=true / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, limit; transient release; linked; soft_clip=true)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / limit / dense / soft=false / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, limit; dense release; unlinked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / limit / dense / soft=false / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, limit; dense release; linked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / limit / dense / soft=true / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, limit; dense release; unlinked; soft_clip=true)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / limit / dense / soft=true / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, limit; dense release; linked; soft_clip=true)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / reduce_gain / balanced / soft=false / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, reduce_gain)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / reduce_gain / balanced / soft=false / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, reduce_gain)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / reduce_gain / balanced / soft=true / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, reduce_gain)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / reduce_gain / balanced / soft=true / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, reduce_gain)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / reduce_gain / transient / soft=false / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, reduce_gain)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / reduce_gain / transient / soft=false / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, reduce_gain)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / reduce_gain / transient / soft=true / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, reduce_gain)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / reduce_gain / transient / soft=true / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, reduce_gain)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / reduce_gain / dense / soft=false / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, reduce_gain)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / reduce_gain / dense / soft=false / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, reduce_gain)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / reduce_gain / dense / soft=true / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, reduce_gain)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / reduce_gain / dense / soft=true / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, reduce_gain)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / warn / balanced / soft=false / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, warn)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / warn / balanced / soft=false / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, warn)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / warn / balanced / soft=true / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, warn)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / warn / balanced / soft=true / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, warn)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / warn / transient / soft=false / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, warn)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / warn / transient / soft=false / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, warn)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / warn / transient / soft=true / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, warn)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / warn / transient / soft=true / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, warn)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / warn / dense / soft=false / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, warn)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / warn / dense / soft=false / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, warn)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / warn / dense / soft=true / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, warn)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / warn / dense / soft=true / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, warn)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / maximize / balanced / soft=false / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, maximize to target (cap 6.5 dB); balanced release; unlinked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / maximize / balanced / soft=false / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, maximize to target (cap 6.5 dB); balanced release; linked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / maximize / balanced / soft=true / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, maximize to target (cap 6.5 dB); balanced release; unlinked; soft_clip=true)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / maximize / balanced / soft=true / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, maximize to target (cap 6.5 dB); balanced release; linked; soft_clip=true)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / maximize / transient / soft=false / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, maximize to target (cap 6.5 dB); transient release; unlinked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / maximize / transient / soft=false / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, maximize to target (cap 6.5 dB); transient release; linked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / maximize / transient / soft=true / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, maximize to target (cap 6.5 dB); transient release; unlinked; soft_clip=true)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / maximize / transient / soft=true / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, maximize to target (cap 6.5 dB); transient release; linked; soft_clip=true)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / maximize / dense / soft=false / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, maximize to target (cap 6.5 dB); dense release; unlinked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / maximize / dense / soft=false / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, maximize to target (cap 6.5 dB); dense release; linked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / maximize / dense / soft=true / link=false @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, maximize to target (cap 6.5 dB); dense release; unlinked; soft_clip=true)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## loudness / maximize / dense / soft=true / link=true @ 48000 Hz
+  - loudness -> -12.5 LUFS (ceiling -0.3 dBTP, maximize to target (cap 6.5 dB); dense release; linked; soft_clip=true)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## no loudness @ 48000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 48000 Hz
+  - quantize -> s24 + tpdf dither (normal)
+  - write WAV
+## dsd dsd64 / source 44100 / derived @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - interpolate x64 -> 2822400 Hz (dsd64, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd64 / source 48000 / derived @ 48000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 48000 -> 44100 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x64 -> 2822400 Hz (dsd64, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd64 / source 96000 / derived @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x32 -> 2822400 Hz (dsd64, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd64 / source 192000 / derived @ 192000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 192000 -> 88200 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x32 -> 2822400 Hz (dsd64, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd64 / rate stated @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq)
+  - re-check true peak against the ceiling
+  - interpolate x32 -> 2822400 Hz (dsd64, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd64 / lufs @ 96000 Hz
+  - loudness -> -16.0 LUFS (ceiling -1.0 dBTP, limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq, derived)
+  - re-check true peak against the ceiling and re-verify loudness (corrected within the headroom)
+  - interpolate x32 -> 2822400 Hz (dsd64, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd128 / source 44100 / derived @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - interpolate x128 -> 5644800 Hz (dsd128, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd128 / source 48000 / derived @ 48000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 48000 -> 44100 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x128 -> 5644800 Hz (dsd128, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd128 / source 96000 / derived @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x64 -> 5644800 Hz (dsd128, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd128 / source 192000 / derived @ 192000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 192000 -> 176400 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x32 -> 5644800 Hz (dsd128, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd128 / rate stated @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq)
+  - re-check true peak against the ceiling
+  - interpolate x64 -> 5644800 Hz (dsd128, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd128 / lufs @ 96000 Hz
+  - loudness -> -16.0 LUFS (ceiling -1.0 dBTP, limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq, derived)
+  - re-check true peak against the ceiling and re-verify loudness (corrected within the headroom)
+  - interpolate x64 -> 5644800 Hz (dsd128, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd256 / source 44100 / derived @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - interpolate x256 -> 11289600 Hz (dsd256, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd256 / source 48000 / derived @ 48000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 48000 -> 44100 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x256 -> 11289600 Hz (dsd256, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd256 / source 96000 / derived @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x128 -> 11289600 Hz (dsd256, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd256 / source 192000 / derived @ 192000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 192000 -> 176400 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x64 -> 11289600 Hz (dsd256, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd256 / rate stated @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq)
+  - re-check true peak against the ceiling
+  - interpolate x128 -> 11289600 Hz (dsd256, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd256 / lufs @ 96000 Hz
+  - loudness -> -16.0 LUFS (ceiling -1.0 dBTP, limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq, derived)
+  - re-check true peak against the ceiling and re-verify loudness (corrected within the headroom)
+  - interpolate x128 -> 11289600 Hz (dsd256, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+## dsd dsd512 / source 44100 / derived @ 44100 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - keep sample rate 44100 Hz
+  - interpolate x512 -> 22579200 Hz (dsd512, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+  - note: dsd512 has limited player support
+## dsd dsd512 / source 48000 / derived @ 48000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 48000 -> 44100 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x512 -> 22579200 Hz (dsd512, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+  - note: dsd512 has limited player support
+## dsd dsd512 / source 96000 / derived @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x256 -> 22579200 Hz (dsd512, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+  - note: dsd512 has limited player support
+## dsd dsd512 / source 192000 / derived @ 192000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 192000 -> 176400 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x128 -> 22579200 Hz (dsd512, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+  - note: dsd512 has limited player support
+## dsd dsd512 / rate stated @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq)
+  - re-check true peak against the ceiling
+  - interpolate x256 -> 22579200 Hz (dsd512, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+  - note: dsd512 has limited player support
+## dsd dsd512 / lufs @ 96000 Hz
+  - loudness -> -16.0 LUFS (ceiling -1.0 dBTP, limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq, derived)
+  - re-check true peak against the ceiling and re-verify loudness (corrected within the headroom)
+  - interpolate x256 -> 22579200 Hz (dsd512, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)
+  - note: dsd512 has limited player support
+## sacd preset @ 96000 Hz
+  - transcode (no loudness normalization); ceiling -1.0 dBTP enforced (limit; balanced release; linked; soft_clip=false)
+  - resample 96000 -> 88200 Hz (vhq, derived)
+  - re-check true peak against the ceiling
+  - interpolate x32 -> 2822400 Hz (dsd64, vhq), streaming
+  - sigma-delta modulate to 1 bit (order 7; 0 dBFS -> 50 % modulation)
+  - write DSF (planar 4096-byte blocks, LSB first)

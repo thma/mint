@@ -8,6 +8,8 @@ use serde::Deserialize;
 
 use crate::audio::buffer::OutputSampleFormat;
 use crate::audio::{io_write, io_write_dsd};
+use crate::chain::{ChainContainer, ChainNote, ChainStep, LimiterPolicy};
+use crate::diagnostics::BatchCollision;
 use crate::dither::ShapingCurve;
 use crate::ops::dsd::modulator as dsd_modulator;
 use crate::ops::dsd::{self, DsdRate};
@@ -527,11 +529,20 @@ impl ResolvedTarget {
     /// job's error before touching the audio, and `--dry-run` prints it as the "this target
     /// will fail" line. `channels` is `None` when the header does not declare it — the
     /// dry-run's case, where the rate check still applies.
-    pub fn delivery_blocker(&self, source_rate: u32, channels: Option<usize>) -> Option<String> {
+    /// Returns the rule that refused, not a sentence about it. [`DeliveryBlocker`]'s
+    /// `Display` is that sentence and is still the only producer of it, so a caller that
+    /// only wants to print keeps working unchanged — but a caller that has to *branch*
+    /// (offer the right fix, count the two rules apart, attribute a job's failure) no longer
+    /// has to read the prose to find out which one fired.
+    pub fn delivery_blocker(
+        &self,
+        source_rate: u32,
+        channels: Option<usize>,
+    ) -> Option<DeliveryBlocker> {
         if self.codec == OutputCodec::Flac {
             let rate = self.pcm_stage_rate(source_rate);
             if rate > io_write::FLAC_MAX_SAMPLE_RATE {
-                return Some(flac_rate_error(rate));
+                return Some(DeliveryBlocker::FlacRate { rate });
             }
         }
         // The DSF channel-type table stops at 5.1, so a 7.1 source has no container to go
@@ -541,68 +552,62 @@ impl ResolvedTarget {
             && let Some(channels) = channels
             && channels > io_write_dsd::MAX_CHANNELS
         {
-            return Some(format!(
-                "{channels} channels exceeds the DSF limit of {}",
-                io_write_dsd::MAX_CHANNELS
-            ));
+            return Some(DeliveryBlocker::DsdChannels { channels });
         }
         None
     }
 
     /// Human-readable summary of the auto-derived pipeline for `--dry-run`.
+    ///
+    /// A formatter over [`Self::chain`] and nothing else. Every sentence it returns is
+    /// produced by [`ChainStep::line`] — see `crate::chain` for why the derivation and the
+    /// prose are separated, and for the rule that keeps them from becoming two descriptions
+    /// of one chain.
     pub fn describe(&self, source_rate: u32) -> Vec<String> {
-        let mut steps = Vec::new();
+        self.chain(source_rate).iter().map(ChainStep::line).collect()
+    }
 
-        match self.lufs {
-            Some(lufs) => steps.push(format!(
-                "loudness -> {lufs:.1} LUFS (ceiling {:.1} dBTP, {})",
-                self.ceiling_dbtp,
-                limiter_policy_tag(
-                    self.on_clip,
-                    self.limiter_character,
-                    self.limiter_soft_clip,
-                    self.limiter_link_channels,
-                    self.max_limiting_db,
-                )
-            )),
-            None => steps.push(format!(
-                "transcode (no loudness normalization); ceiling {:.1} dBTP enforced ({})",
-                self.ceiling_dbtp,
-                limiter_policy_tag(
-                    self.on_clip,
-                    self.limiter_character,
-                    self.limiter_soft_clip,
-                    self.limiter_link_channels,
-                    self.max_limiting_db,
-                )
-            )),
-        }
+    /// The derived chain as data: the steps `pipeline::process` will run on a source at
+    /// `source_rate`, in the canonical order, with the ones that are not needed *absent*
+    /// rather than flagged.
+    ///
+    /// This is the function CLAUDE.md's rule now points at: any change to the pipeline's
+    /// step order or to a skip condition must be mirrored here, because the two are
+    /// separate code paths and drift silently. `describe()` no longer holds any of that
+    /// structure, so mirroring it there would mirror it into a formatter.
+    pub fn chain(&self, source_rate: u32) -> Vec<ChainStep> {
+        let mut steps = Vec::new();
+        let limiter = LimiterPolicy {
+            on_clip: self.on_clip,
+            character: self.limiter_character,
+            soft_clip: self.limiter_soft_clip,
+            link_channels: self.limiter_link_channels,
+            max_limiting_db: self.max_limiting_db,
+        };
+
+        steps.push(match self.lufs {
+            Some(lufs) => ChainStep::Loudness { lufs, ceiling_dbtp: self.ceiling_dbtp, limiter },
+            None => ChainStep::Transcode { ceiling_dbtp: self.ceiling_dbtp, limiter },
+        });
 
         // For DSD this is the *intermediate* rate; the interpolation to the 1-bit rate is
         // a separate step below.
         let pcm_rate = self.pcm_stage_rate(source_rate);
         if pcm_rate != source_rate {
-            let why = if self.dsd.is_some() && self.rate.is_none() {
-                ", derived"
-            } else {
-                ""
-            };
-            steps.push(format!(
-                "resample {source_rate} -> {pcm_rate} Hz ({}{why})",
-                quality_tag(self.quality)
-            ));
+            steps.push(ChainStep::Resample {
+                from_hz: source_rate,
+                to_hz: pcm_rate,
+                quality: self.quality,
+                derived: self.dsd.is_some() && self.rate.is_none(),
+            });
             // The two verification passes the resample brings with it. Both are conditional
             // at run time (each is a no-op when its measurement comes back clean), but they
             // are unconditional *steps* of a resampling chain and the dry-run has to say so
             // — a static gain applied after the loudness stage is exactly the kind of thing
             // a reader of this list would otherwise not know had happened.
-            let mut recheck = "re-check true peak against the ceiling".to_string();
-            if self.lufs.is_some() {
-                recheck.push_str(" and re-verify loudness (corrected within the headroom)");
-            }
-            steps.push(recheck);
+            steps.push(ChainStep::PostSrcVerify { loudness: self.lufs.is_some() });
         } else {
-            steps.push(format!("keep sample rate {source_rate} Hz"));
+            steps.push(ChainStep::KeepRate { rate_hz: source_rate });
         }
 
         // Exhaustive on purpose: a catch-all arm here would silently describe a new codec
@@ -611,66 +616,59 @@ impl ResolvedTarget {
         match self.codec {
             // MP3 is lossy: no PCM quantization/dither — libmp3lame encodes from the
             // full-precision buffer directly.
-            OutputCodec::Mp3 => steps.push(format!(
-                "encode MP3 {} kbps (lossy; bit depth & dither not applicable)",
-                self.mp3_bitrate
-            )),
+            OutputCodec::Mp3 => steps.push(ChainStep::EncodeMp3 { kbps: self.mp3_bitrate }),
             // DSD is the second lossy-shaped branch: the sigma-delta loop is the quantizer,
             // so the bit-depth/dither stage is skipped the same way.
-            OutputCodec::Dsf => steps.extend(self.describe_dsd(pcm_rate)),
+            OutputCodec::Dsf => steps.extend(self.chain_dsd(pcm_rate)),
             OutputCodec::Wav | OutputCodec::Flac => {
                 match self.format {
                     f @ (OutputSampleFormat::F32 | OutputSampleFormat::F64) => {
-                        steps.push(format!("write {} (no quantization)", format_tag(f)))
+                        steps.push(ChainStep::WriteFloat { format: f })
                     }
-                    other => steps.push(format!(
-                        "quantize -> {} + {} ({})",
-                        format_tag(other),
-                        effective_dither_tag(self.dither, self.dither_strength, other),
-                        dither_strength_tag(self.dither_strength)
-                    )),
+                    other => steps.push(ChainStep::Quantize {
+                        format: other,
+                        dither: self.dither,
+                        strength: self.dither_strength,
+                    }),
                 }
                 let container = if self.codec == OutputCodec::Flac {
-                    "FLAC"
+                    ChainContainer::Flac
                 } else if self.bwf {
-                    "Broadcast WAV (bext + R128 metadata)"
+                    ChainContainer::BroadcastWav
                 } else {
-                    "WAV"
+                    ChainContainer::Wav
                 };
-                steps.push(format!("write {container}"));
+                steps.push(ChainStep::WriteContainer { container });
             }
         }
 
         steps
     }
 
-    /// The DSD tail of `describe`: the three steps `ops::dsd::encode_dsf` performs.
-    fn describe_dsd(&self, pcm_rate: u32) -> Vec<String> {
+    /// The DSD tail of [`Self::chain`]: the three steps `ops::dsd::encode_dsf` performs.
+    fn chain_dsd(&self, pcm_rate: u32) -> Vec<ChainStep> {
         let Some(dsd) = self.dsd else {
-            return vec!["DSD target without a dsd rate (config bug)".to_string()];
+            return vec![ChainStep::Note(ChainNote::DsdRateMissing)];
         };
-        let factor = dsd::interpolation_factor(pcm_rate, dsd);
-        let ratio = factor.map_or_else(|| "?".to_string(), |f| format!("x{f}"));
 
         let mut steps = vec![
-            format!(
-                "interpolate {ratio} -> {} Hz ({}, {}), streaming",
-                dsd.hz(),
-                dsd.tag(),
-                quality_tag(self.quality)
-            ),
-            format!(
-                "sigma-delta modulate to 1 bit (order {}; 0 dBFS -> {:.0} % modulation)",
-                dsd_modulator::ORDER,
-                dsd_modulator::INPUT_SCALE * 100.0
-            ),
-            "write DSF (planar 4096-byte blocks, LSB first)".to_string(),
+            ChainStep::Interpolate {
+                factor: dsd::interpolation_factor(pcm_rate, dsd),
+                to_hz: dsd.hz(),
+                rate: dsd,
+                quality: self.quality,
+            },
+            ChainStep::Modulate {
+                order: dsd_modulator::ORDER,
+                input_scale_percent: dsd_modulator::INPUT_SCALE * 100.0,
+            },
+            ChainStep::WriteDsf,
         ];
         // A de-facto extension: the DSF spec names only DSD64 and DSD128 (see the writer's
         // module doc), and support in the wild is thin. Worth saying once, here, rather
         // than after an hour of encoding.
         if matches!(dsd, DsdRate::Dsd512) {
-            steps.push("note: dsd512 has limited player support".to_string());
+            steps.push(ChainStep::Note(ChainNote::Dsd512PlayerSupport));
         }
         steps
     }
@@ -911,7 +909,7 @@ impl ResolvedTarget {
             && let Some(rate) = self.rate
             && rate > io_write::FLAC_MAX_SAMPLE_RATE
         {
-            bail!("target '{}': {}", self.name, flac_rate_error(rate));
+            bail!("target '{}': {}", self.name, DeliveryBlocker::FlacRate { rate });
         }
         // `bwf` is checked in `resolve_target`, against the target's own layer — see the
         // comment there. By the time it reaches this struct it is already the effective
@@ -1762,15 +1760,16 @@ pub fn check_planned_outputs(planned: &[PlannedOutput<'_>], inputs: &[PathBuf]) 
     for entry in planned {
         let output = key(&entry.output);
         if let Some(other) = seen.get(&output) {
-            bail!(
-                "inputs '{}' and '{}' both render to '{}' for target '{}' — they share a stem \
-                 and no naming placeholder carries the input's directory. Render the two \
-                 sources in separate runs (with different `dir`s), or rename one of them",
-                other.input.display(),
-                entry.input.display(),
-                entry.output.display(),
-                entry.target
-            );
+            // A typed refusal so a front end can tell this apart from a single job's
+            // overwrite conflict — the remedies differ, and this one is not what `--force`
+            // is for. `Display` is the sentence that used to be built here.
+            return Err(BatchCollision::SharedOutput {
+                first: other.input.to_path_buf(),
+                second: entry.input.to_path_buf(),
+                output: entry.output.clone(),
+                target: entry.target.to_string(),
+            }
+            .into());
         }
         // A job writing over its *own* input is the documented in-place render, and whether
         // it is allowed is `overwrite`'s question, asked by `pipeline::guard_output_path`.
@@ -1792,12 +1791,11 @@ pub fn check_planned_outputs(planned: &[PlannedOutput<'_>], inputs: &[PathBuf]) 
         // though: under `--force` it returns before comparing, which is exactly the regime
         // where one job silently overwrites another job's source.
         if output != key(entry.input) && input_set.contains(&output) {
-            bail!(
-                "target '{}' would write '{}' over a different input of this same run; the \
-                 job that reads it may or may not have got there first",
-                entry.target,
-                entry.output.display()
-            );
+            return Err(BatchCollision::WritesOverAnInput {
+                target: entry.target.to_string(),
+                output: entry.output.clone(),
+            }
+            .into());
         }
         seen.insert(output, entry);
     }
@@ -1878,16 +1876,41 @@ pub fn check_collisions(targets: &[ResolvedTarget]) -> Result<()> {
     Ok(())
 }
 
-/// The one wording for "this FLAC target asks for a rate the encoder cannot reach", shared
-/// by the load-time check (explicit `rate`) and the per-source one (derived `rate`). Names
-/// both ways out, because "not supported" without them just moves the guessing earlier.
-fn flac_rate_error(rate: u32) -> String {
-    format!(
-        "codec=flac cannot deliver {rate} Hz — mint's FLAC encoder tops out at {} Hz. \
-         Set rate = {} (or lower) on this target, or use codec = \"wav\" to keep {rate} Hz",
-        io_write::FLAC_MAX_SAMPLE_RATE,
-        io_write::FLAC_MAX_SAMPLE_RATE
-    )
+/// Why a target cannot be delivered from a particular source: the two compatibility rules
+/// that need the *input* and so cannot be checked when the config loads.
+///
+/// An error type rather than a bare enum, so `pipeline::process`'s refusal can carry it in
+/// the error chain and [`crate::diagnostics::FailureKind`] can recover which rule fired
+/// without reading the sentence. `Display` is the sentence, and remains its one producer —
+/// the FLAC arm is the old `flac_rate_error`, shared with the load-time check on an explicit
+/// `rate` exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DeliveryBlocker {
+    /// The delivered rate is past what mint's FLAC encoder accepts. Names both ways out,
+    /// because "not supported" without them just moves the guessing earlier.
+    ///
+    /// The limit is read from the writer rather than stored: it is `flacenc`'s
+    /// `verify_range!`, not a property of this refusal, and a copy here would be a second
+    /// place to update when the encoder changes.
+    #[error(
+        "codec=flac cannot deliver {rate} Hz — mint's FLAC encoder tops out at {max} Hz. \
+         Set rate = {max} (or lower) on this target, or use codec = \"wav\" to keep {rate} Hz",
+        max = io_write::FLAC_MAX_SAMPLE_RATE
+    )]
+    FlacRate { rate: u32 },
+    /// More channels than the DSF channel-type table has a code for.
+    #[error("{channels} channels exceeds the DSF limit of {max}", max = io_write_dsd::MAX_CHANNELS)]
+    DsdChannels { channels: usize },
+}
+
+impl DeliveryBlocker {
+    /// Stable snake_case discriminant, for the same job as `WarningKind::tag`.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::FlacRate { .. } => "flac_rate",
+            Self::DsdChannels { .. } => "dsd_channels",
+        }
+    }
 }
 
 pub fn format_tag(format: OutputSampleFormat) -> &'static str {
@@ -1925,7 +1948,10 @@ pub fn limiter_character_tag(character: LimiterCharacter) -> &'static str {
     }
 }
 
-fn limiter_policy_tag(
+/// `pub(crate)` rather than `pub`: it is an ingredient of two [`ChainStep`] lines and has no
+/// other reader. A front end wanting that phrase wants `ChainStep::line`, which is the whole
+/// sentence — exporting the fragment invites a second assembly of it.
+pub(crate) fn limiter_policy_tag(
     policy: OnClipPolicy,
     character: LimiterCharacter,
     soft_clip: bool,

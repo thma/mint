@@ -20,10 +20,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 
 /// The stages a job passes through, in the order `pipeline::process` runs them. Not every
-/// stage runs for every target — the chain is derived — and two of them are deliberately
-/// absent: the loudness *meters* feed the whole buffer to `ebur128` in one call, and the
-/// WAV/FLAC/MP3 writers are single blocking calls into encoder crates. Neither can report
-/// anything but "started", so neither pretends to.
+/// stage runs for every target — the chain is derived — and the WAV/FLAC/MP3 writers are
+/// still absent: they are single blocking calls into encoder crates that can report nothing
+/// but "started", so they do not pretend to.
+///
+/// **A stage is not one sweep.** Several of these are entered more than once in a job and
+/// report 0→1 each time: `Ceiling` covers every pass of the limiter's verification loop (up
+/// to six), and `Loudness` covers the four-to-nine whole-file meter passes `ops::loudness`
+/// makes — two before the gain, two after, and one per `maximize` makeup pass. A fraction
+/// therefore means *this pass*, not *this stage*, and a front end that treats it as the
+/// latter will show a bar going backwards. That is the honest shape of the work: the pass
+/// count is not knowable in advance, because the makeup and verification loops are
+/// convergent. What the fraction must never be is invented — see the proposal's §7 rule 8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Probe,

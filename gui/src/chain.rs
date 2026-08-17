@@ -1,18 +1,25 @@
 //! The live chain preview: what mint will actually do to the selected cell.
 //!
-//! Every line on this screen comes from `ResolvedTarget::describe(source_rate)`. Not one
-//! step is derived here, and that is the entire point of the module: `describe()` is a
-//! separate code path from `pipeline::process` (CLAUDE.md says so, and says the two drift
-//! silently), so a surface that renders `describe()` verbatim next to the plan is the place
-//! a divergence between them becomes visible. If a step shown here is not the step the
-//! pipeline runs, that is a library bug, and this screen is the bug report. The only
-//! honest reaction to a wrong line here is to go and fix `describe()` or the pipeline —
+//! Every line on this screen comes from `ResolvedTarget::chain(source_rate)`, rendered by
+//! `ChainStep::line`. Not one step is derived here, and that is the entire point of the
+//! module: the derivation is a separate code path from `pipeline::process` (CLAUDE.md says
+//! so, and says the two drift silently), so a surface that renders it verbatim next to the
+//! plan is the place a divergence between them becomes visible. If a step shown here is not
+//! the step the pipeline runs, that is a library bug, and this screen is the bug report. The
+//! only honest reaction to a wrong line here is to go and fix `chain()` or the pipeline —
 //! never to correct it on the way out.
 //!
-//! It re-renders every frame rather than caching. `describe()` is microseconds of string
-//! building over an already-resolved target, the status bar prints what a frame costs, and
-//! a cache keyed on a selection is a staleness bug waiting for the one frame the key does
-//! not change but the document does.
+//! It reads `chain()` rather than `describe()` for the two things a `Vec<String>` cannot
+//! answer: which category a step belongs to (`ChainStepKind`, for the column that lets the
+//! eye find the quantizer without reading five sentences) and whether a line is a *step* at
+//! all — `note: dsd512 has limited player support` sits in the same list and used to take a
+//! step number. Both answers are the library's; deciding either from the sentence would be
+//! the substring-matching this whole facility exists to delete.
+//!
+//! It re-renders every frame rather than caching. `chain()` is microseconds of work over an
+//! already-resolved target, the status bar prints what a frame costs, and a cache keyed on a
+//! selection is a staleness bug waiting for the one frame the key does not change but the
+//! document does.
 //!
 //! Under the steps, when present: the `delivery_blocker` line and the `output_conflict`
 //! line rendered by `Conflict::message` — mint's own prose in both cases, because they are
@@ -120,12 +127,26 @@ pub fn ui(ui: &mut Ui, state: &AppState) {
 
     ui.add_space(6.0);
     egui::ScrollArea::both().id_salt("chain-steps").show(ui, |ui| {
-        egui::Grid::new("chain-steps-grid").num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
+        egui::Grid::new("chain-steps-grid").num_columns(3).spacing([10.0, 3.0]).show(ui, |ui| {
             // Numbered, because the order is the contract: CLAUDE.md's "canonical order is
-            // fixed and steps are skipped, not configured".
-            for (n, step) in target.describe(probe.sample_rate).into_iter().enumerate() {
-                ui.weak(format!("{:>2}", n + 1));
-                ui.label(RichText::new(step).monospace());
+            // fixed and steps are skipped, not configured". A note is not a step and so
+            // takes no number — `is_note` is the library's answer to which is which.
+            let mut step_number = 0;
+            for step in target.chain(probe.sample_rate) {
+                let note = step.is_note();
+                if note {
+                    ui.label("");
+                } else {
+                    step_number += 1;
+                    ui.weak(format!("{step_number:>2}"));
+                }
+                ui.weak(RichText::new(step.kind().label()).small());
+                let text = RichText::new(step.line()).monospace();
+                if note {
+                    ui.colored_label(colors::WARN, text);
+                } else {
+                    ui.label(text);
+                }
                 ui.end_row();
             }
         });
