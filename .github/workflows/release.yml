@@ -7,15 +7,26 @@
 # auto-generated notes. `workflow_dispatch` builds the same artifacts for
 # testing (downloadable from the run page) but skips the release step.
 #
-# Unlike CI — which links the system libsoxr — release binaries link soxr
-# *statically*, so downloads run without any package-manager install:
-#   - Linux/macOS: soxr 0.1.3 built from source (Debian's orig tarball; a
-#     stable URL, unlike SourceForge redirects) as a static lib. soxr's cmake
-#     generates soxr.pc on non-Windows, which libsoxr-sys probes via pkg-config.
-#   - Windows: vcpkg's x64-windows-static-md triplet (static soxr, dynamic CRT
-#     — matching Rust's MSVC default, so no /MT vs /MD symbol clashes). Same
-#     hand-written soxr.pc trick as ci.yml, since upstream only generates the
-#     .pc on non-Windows.
+# libsoxr is linked **dynamically**, exactly as CI links it, and that is a licence
+# decision rather than a build convenience. soxr is LGPL-2.1: statically linking it
+# makes the binary a combined work and drags in §6's requirement to hand users the
+# means to relink against their own build. A shared library is §6(b) — the clause
+# written for precisely this — so:
+#   - Linux/macOS: link the system libsoxr (apt/brew). Nothing of the library is
+#     distributed by mint at all, so §6 is never triggered for those archives. The
+#     cost is that a download needs `apt install libsoxr0` / `brew install libsoxr`;
+#     that is the price of not shipping copyleft object code, and it is worth it.
+#   - Windows: no system package exists, so vcpkg's dynamic x64-windows triplet is
+#     used and `soxr.dll` ships beside mint.exe. The library *is* distributed there,
+#     but it is replaceable — drop in your own interface-compatible build and mint
+#     uses it — which is what §6(b) asks for. vcpkg's own copyright notice ships
+#     with it, and the upstream source is attached to the release.
+# Upstream skips soxr.pc generation on WIN32 and libsoxr-sys probes exclusively via
+# pkg-config, so the Windows step writes the .pc by hand (same trick as ci.yml).
+#
+# THIRD-PARTY-LICENSES.md travels in every archive. Two guards below keep the MP3
+# feature out of released artefacts: a dependency-graph check, and an assertion on
+# what the built binary itself says.
 
 name: Release
 
@@ -83,46 +94,32 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install pkg-config (Linux)
+      - name: Install libsoxr (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libsoxr-dev pkg-config
 
-      - name: Install pkg-config (macOS)
+      - name: Install libsoxr (macOS)
         if: runner.os == 'macOS'
-        run: brew install pkg-config
+        run: brew install libsoxr pkg-config
 
-      - name: Build static libsoxr (Linux/macOS)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          curl -fsSL -o soxr.tar.xz "https://deb.debian.org/debian/pool/main/libs/libsoxr/libsoxr_0.1.3.orig.tar.xz"
-          mkdir soxr-src && tar xf soxr.tar.xz -C soxr-src --strip-components=1
-          # POLICY_VERSION_MINIMUM: soxr 0.1.3 declares cmake_minimum_required
-          # < 3.5, which cmake 4.x (on current runners) refuses without this.
-          # OPENMP off: mint parallelizes via rayon; and Apple clang has no
-          # bundled libomp anyway.
-          cmake -S soxr-src -B soxr-build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DWITH_OPENMP=OFF \
-            -DBUILD_TESTS=OFF \
-            -DBUILD_EXAMPLES=OFF \
-            -DCMAKE_INSTALL_PREFIX="$PWD/soxr-prefix" \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-          cmake --build soxr-build
-          cmake --install soxr-build
-          echo "PKG_CONFIG_PATH=$PWD/soxr-prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+      # Reserve Mach-O header room *at link time* for the rpath rewrite below. Without it
+      # `install_name_tool -add_rpath` manages the first two and then fails with "larger
+      # updated load commands do not fit" — measured on a stock build, not guessed: two of
+      # five rpaths were dropped, and the step still went green because that tool's failure
+      # does not abort the shell.
+      - name: Reserve Mach-O header padding (macOS)
+        if: runner.os == 'macOS'
+        run: echo "RUSTFLAGS=-C link-arg=-Wl,-headerpad_max_install_names" >> "$GITHUB_ENV"
 
-      - name: Build static libsoxr (Windows)
+      - name: Install libsoxr (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          vcpkg install soxr:x64-windows-static-md
+          vcpkg install soxr:x64-windows
           choco install pkgconfiglite -y
-          # Upstream soxr skips .pc generation on WIN32 and libsoxr-sys probes
-          # exclusively via pkg-config, so write the .pc by hand (same trick as
-          # ci.yml, but pointing at the static triplet — no DLL to ship).
-          $prefix = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md" -replace '\\', '/'
+          # The dynamic triplet: `soxr.dll` ships beside the exe and the user can
+          # replace it. Upstream skips .pc generation on WIN32, so write it by hand.
+          $prefix = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" -replace '\\', '/'
           $pcDir = "$prefix/lib/pkgconfig"
           New-Item -ItemType Directory -Force $pcDir | Out-Null
           @"
@@ -137,16 +134,71 @@ jobs:
           Cflags: -I$prefix/include
           "@ | Out-File "$pcDir/soxr.pc" -Encoding ascii
           "PKG_CONFIG_PATH=$pcDir" | Out-File $env:GITHUB_ENV -Append
+          # Needed twice over: to run the built binary in the guard below, and because
+          # this is the directory soxr.dll is copied out of when packaging.
+          "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin" | Out-File $env:GITHUB_PATH -Append
+
+      # First of the two MP3 guards, and the one that fails before spending a build:
+      # released binaries must not link libmp3lame (LGPL-3.0). Asked of the resolved
+      # dependency graph for this exact target and feature set, so adding `--features mp3`
+      # to the build step below without meaning to is caught here rather than at a lawyer's.
+      - name: Guard — no LGPL-3.0 MP3 encoder in the graph
+        shell: bash
+        run: |
+          if cargo tree -e normal --target ${{ matrix.target }} --prefix none \
+               | grep -qi 'mp3lame'; then
+            echo "::error::libmp3lame is in the release dependency graph. Released"
+            echo "::error::artefacts must not link it — see THIRD-PARTY-LICENSES.md."
+            exit 1
+          fi
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+
+      # Homebrew bakes an absolute install_name into its dylibs, and the prefix differs
+      # between Apple Silicon (/opt/homebrew) and Intel (/usr/local). Without this, a
+      # binary built on one prefix cannot find libsoxr on the other. Rewriting to @rpath
+      # and listing both prefixes makes one archive work for either — and re-signing is
+      # not optional: install_name_tool invalidates the ad-hoc signature arm64 requires.
+      - name: Point libsoxr at an rpath (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/mint"
+          OLD=$(otool -L "$BIN" | awk '/libsoxr/ {print $1; exit}')
+          echo "linked as: $OLD"
+          install_name_tool -change "$OLD" "@rpath/libsoxr.0.dylib" "$BIN"
+          # Homebrew at either prefix, plus MacPorts.
+          for p in /opt/homebrew/opt/libsoxr/lib /usr/local/opt/libsoxr/lib \
+                   /opt/homebrew/lib /usr/local/lib /opt/local/lib; do
+            install_name_tool -add_rpath "$p" "$BIN"
+          done
+          # install_name_tool invalidates the ad-hoc signature arm64 needs to run at all.
+          codesign -s - -f "$BIN"
+          otool -L "$BIN" | grep -i soxr
+          # A *partial* rewrite is the failure mode that still looks fine, so count them.
+          test "$(otool -l "$BIN" | grep -c 'path /')" -ge 5
+
+      # Second MP3 guard, and the one that inspects what actually ships rather than the
+      # recipe that produced it. Every target in the matrix is a native build, so the
+      # binary can simply be asked. It also proves the notice `--version` is required to
+      # carry is really in the artefact.
+      - name: Guard — the built binary reports no MP3 and carries its notices
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/mint"
+          [ "${{ runner.os }}" = "Windows" ] && BIN="$BIN.exe"
+          "$BIN" --version
+          "$BIN" --version | grep -q 'MP3 encoding: unavailable'
+          "$BIN" --version | grep -q 'THIRD-PARTY-LICENSES.md'
 
       - name: Package (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir pkg
-          cp "target/${{ matrix.target }}/release/mint" README.md LICENSE pkg/
+          cp "target/${{ matrix.target }}/release/mint" \
+             README.md LICENSE THIRD-PARTY-LICENSES.md pkg/
           tar czf "mint-$VERSION-${{ matrix.target }}.tar.gz" -C pkg .
 
       - name: Package (Windows)
@@ -154,7 +206,13 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory pkg | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/mint.exe", README.md, LICENSE pkg/
+          Copy-Item "target/${{ matrix.target }}/release/mint.exe", `
+                    README.md, LICENSE, THIRD-PARTY-LICENSES.md pkg/
+          # The one platform where mint distributes libsoxr itself. It ships next to the
+          # exe so it can be replaced, with vcpkg's own copyright notice beside it.
+          $vcpkg = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows"
+          Copy-Item "$vcpkg/bin/soxr.dll" pkg/
+          Copy-Item "$vcpkg/share/soxr/copyright" pkg/soxr-COPYRIGHT.txt
           Compress-Archive -Path pkg/* -DestinationPath "mint-$env:VERSION-${{ matrix.target }}.zip"
 
       - name: Upload artifact
@@ -181,6 +239,19 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # The corresponding source for libsoxr, attached to the release itself. Only the
+      # Windows archive actually distributes the library (as soxr.dll), but publishing the
+      # source from the same place the binaries come from is LGPL-2.1 §6(d) and costs one
+      # download. The hash is pinned: "the source we shipped" has to be a specific archive,
+      # and an unverified curl is a supply-chain hole as well as a licence one.
+      - name: Attach the corresponding libsoxr source
+        run: |
+          cd dist
+          curl -fsSL -o libsoxr_0.1.3.orig.tar.xz \
+            "https://deb.debian.org/debian/pool/main/libs/libsoxr/libsoxr_0.1.3.orig.tar.xz"
+          echo "b111c15fdc8c029989330ff559184198c161100a59312f5dc19ddeb9b5a15889  libsoxr_0.1.3.orig.tar.xz" \
+            | sha256sum -c -
 
       - name: Generate checksums
         run: cd dist && sha256sum * > SHA256SUMS

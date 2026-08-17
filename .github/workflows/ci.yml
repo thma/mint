@@ -67,3 +67,81 @@ jobs:
 
       - name: Test
         run: cargo test --verbose
+
+  # The MP3 encoder is never built by the release workflow — deliberately, because
+  # mp3lame-sys/mp3lame-encoder are LGPL-3.0 and mint does not distribute them. The cost
+  # of that is a feature nothing compiles, which rots. So it is compiled and tested here:
+  # building is not distributing, and this is the only place the `--features mp3` path is
+  # exercised at all.
+  #
+  # Unix only. mp3lame-sys drives an autotools build under `#[cfg(unix)]` and a different
+  # path on Windows; the release matrix does not need it on any platform, so the two
+  # runners that are cheap to keep green are the two it runs on.
+  mp3:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libsoxr (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsoxr-dev pkg-config
+
+      - name: Install libsoxr (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libsoxr pkg-config
+
+      - name: Build and test with MP3
+        run: cargo test --features mp3 --verbose
+
+      # The other half of the pair: a build that *does* link LAME must say so. If this ever
+      # prints "unavailable" the feature has silently stopped being wired up, and the
+      # release guard that asserts the opposite would then be proving nothing.
+      - name: The binary reports MP3 as available
+        run: |
+          cargo run --features mp3 -- --version | grep -q 'MP3 encoding: available'
+
+  # Licence policy, and the guard that actually has teeth: `about.toml`'s `accepted` list
+  # is an allow-list, so cargo-about fails when a dependency arrives under a licence nobody
+  # decided to ship. It is also how `--features mp3` is kept out of releases — LGPL-3.0 is
+  # not on the list, so generating with the feature on is an error rather than a surprise.
+  #
+  # The regenerate-and-diff is the second half: adding a dependency without refreshing
+  # THIRD-PARTY-LICENSES.md would ship an archive whose notices are missing a crate.
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli
+
+      - name: Licence policy — every dependency is on the accepted list
+        run: cargo about generate about.hbs -o /dev/null
+
+      - name: The MP3 feature is refused by the policy
+        run: |
+          if cargo about generate --features mp3 about.hbs -o /dev/null 2>/dev/null; then
+            echo "::error::about.toml accepted LGPL-3.0. The MP3 guard is not guarding."
+            exit 1
+          fi
+
+      - name: THIRD-PARTY-LICENSES.md is up to date
+        run: |
+          cargo about generate about.hbs -o /tmp/regenerated.md
+          if ! diff -u THIRD-PARTY-LICENSES.md /tmp/regenerated.md; then
+            echo "::error::THIRD-PARTY-LICENSES.md is stale. Regenerate it with:"
+            echo "::error::  cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md"
+            exit 1
+          fi

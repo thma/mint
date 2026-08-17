@@ -1,0 +1,102 @@
+# Third-party notices for mint
+
+**Generated file — do not edit.** Regenerate with:
+
+```
+cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
+```
+
+The preamble below lives in `about.hbs`; the per-crate sections come from the dependency
+graph. This file ships inside every release archive, beside the binary.
+
+mint itself is licensed under **Apache-2.0** — see `LICENSE`.
+
+---
+
+## The SoX Resampler Library (libsoxr) — LGPL-2.1-or-later
+
+mint's only sample-rate conversion backend is libsoxr, a C library:
+
+- **Copyright** (c) 2007–18 Rob Sykes &lt;robs@users.sourceforge.net&gt;
+- **Licence** GNU Lesser General Public License, version 2.1 or later
+- **Version used for releases** 0.1.3
+- **Corresponding source** `https://deb.debian.org/debian/pool/main/libs/libsoxr/libsoxr_0.1.3.orig.tar.xz`
+  SHA-256 `b111c15fdc8c029989330ff559184198c161100a59312f5dc19ddeb9b5a15889`
+  This exact archive is attached to every GitHub release of mint.
+
+**How it is linked, and why that matters.** libsoxr is linked **dynamically** on every
+platform. On macOS and Linux the released binaries link the copy already installed on your
+system (`brew install libsoxr`, `apt install libsoxr0`) and mint distributes no part of the
+library at all. On Windows there is no system package, so `soxr.dll` is shipped inside the
+archive next to `mint.exe`; you may replace that DLL with any interface-compatible build of
+your own and mint will use it. Either way you can modify libsoxr and use your modified
+version with mint without rebuilding mint — which is the freedom LGPL-2.1 §6 exists to
+preserve, and the reason mint stopped linking it statically.
+
+The Windows `soxr.dll` is produced by vcpkg's `soxr:x64-windows` port; vcpkg's own copyright
+notice for it is shipped alongside as `soxr-COPYRIGHT.txt`, and the port (including any
+patches vcpkg applies on top of upstream 0.1.3) is at
+`https://github.com/microsoft/vcpkg/tree/master/ports/soxr`.
+
+## The libsoxr Rust bindings — LGPL-2.0-or-later
+
+The `libsoxr` and `libsoxr-sys` crates are **statically linked** into the mint binary and are
+copyleft in their own right, independently of the C library above:
+
+- **Copyright** (C) 2016 Reinier Balt &lt;lrbalt@gmail.com&gt;
+- **Licence** GNU Lesser General Public License, version 2 or later — distributed here under
+  version 2.1, as that licence's "or, at your option, any later version" permits
+- **Source** `https://github.com/lrbalt/libsoxr-rs` and `https://github.com/lrbalt/libsoxr-sys`,
+  published at the exact pinned versions on `https://crates.io`
+
+Because these are statically linked, LGPL §6 applies to the mint binary. The corresponding
+source for them is the two crates above at the versions listed in the table below, and mint's
+own source and its complete, pinned build workflow are public at the tagged commit each
+release is built from — so a modified version of the bindings can be substituted by
+rebuilding. If you would prefer object code to relink against instead, open an issue and ask.
+
+## Symphonia — MPL-2.0
+
+The audio demuxers and decoders are Symphonia, under the Mozilla Public License 2.0. MPL-2.0
+is file-level copyleft: mint has not modified any Symphonia file, and the Source Code Form of
+every MPL-covered file is available at `https://github.com/pdeljanov/Symphonia` and on
+crates.io at the versions listed below.
+
+## MP3
+
+Released binaries **do not** contain MP3 support and do not link libmp3lame. MP3 output is an
+opt-in build feature (`cargo build --features mp3`) precisely so that released artefacts carry
+no LAME code; `mint --version` states which kind of build you have.
+
+---
+
+## Licences in the dependency graph
+
+Where a crate offers a choice — `MIT OR Apache-2.0` is the common one — mint takes
+Apache-2.0, which is why that count is large. The crate remains available to *you* under
+either; the choice recorded here is only the one mint's distribution makes.
+
+{{#each overview}}
+- **{{name}}** — {{count}} crate(s)
+{{/each}}
+
+Every distinct licence text found in the graph is reproduced below. Several crates ship
+their own copy of the same licence — MIT copies in particular differ, because each carries
+its own copyright line — so a licence may appear more than once under one heading. That is
+deliberate: the copyright notices are the part MIT actually requires be preserved.
+
+{{#each licenses}}
+{{#if first_of_kind}}
+### {{name}}
+{{/if}}
+
+Used by:
+{{#each used_by}}
+- [{{crate.name}} {{crate.version}}]({{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}})
+{{/each}}
+
+```
+{{text}}
+```
+
+{{/each}}

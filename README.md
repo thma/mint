@@ -321,14 +321,46 @@ The `quality = lq|mq|hq|vhq` setting maps onto libsoxr's recipes. See
 
 ### MP3 output (opt-in)
 
-MP3 is behind the `mp3` feature because `mp3lame-sys` compiles libmp3lame from vendored C
-source — no system library is needed at runtime, but the build wants a C toolchain
-(`cc`, plus `make` on Unix):
+MP3 is behind the `mp3` feature for two reasons. The build one: `mp3lame-sys` compiles
+libmp3lame from vendored C source, so it wants a C toolchain (`cc`, plus `make` on Unix).
+The licensing one, which is why it stays off by default: those bindings are **LGPL-3.0**,
+and released mint binaries deliberately link no LGPL-3.0 code at all.
 
     cargo build --features mp3
 
+`mint --version` tells you which kind of build you have. Two CI guards keep the two apart —
+the release workflow refuses to build if libmp3lame appears in the dependency graph or if
+the finished binary reports MP3 as available, and the licence policy in `about.toml` does
+not accept LGPL-3.0, so generating the third-party notices with the feature on is an error.
+
 WAV (incl. Broadcast WAV) and FLAC need no extra feature. AAC is intentionally not
 supported (libfdk-aac licensing).
+
+### Licensing and third-party code
+
+mint is **Apache-2.0** (`LICENSE`). Two dependencies are copyleft and are handled
+deliberately; `THIRD-PARTY-LICENSES.md` ships in every release archive with the full
+notices, licence texts and source locations, and `mint --version` summarises them.
+
+- **libsoxr** (the C library) is LGPL-2.1-or-later and is linked **dynamically**. On macOS
+  and Linux, released binaries link the copy on your system — so you need
+  `brew install libsoxr` / `apt install libsoxr0` to run one, and mint distributes no part
+  of the library. On Windows, where there is no system package, `soxr.dll` ships beside
+  `mint.exe` and can be replaced with your own build. Static linking would make the binary
+  a combined work under LGPL-2.1 §6 and oblige mint to hand out the means to relink; a
+  shared library is §6(b), which is the clause written for exactly this.
+- **libsoxr / libsoxr-sys** (the Rust bindings) are LGPL-2.0-or-later and *are* statically
+  linked, so §6 does apply to them. Their source is on crates.io at the pinned versions and
+  mint's own build workflow is public and reproducible from each release tag.
+- **Symphonia** (demuxing and decoding) is MPL-2.0 — file-level copyleft, unmodified here.
+
+The exact libsoxr source used for releases is attached to each GitHub release as
+`libsoxr_0.1.3.orig.tar.xz`, pinned by SHA-256.
+
+`THIRD-PARTY-LICENSES.md` is generated, and CI fails if it is stale or if a dependency
+arrives under a licence nobody accepted:
+
+    cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
 
 ## Run
 

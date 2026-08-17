@@ -11,8 +11,52 @@ use crate::json_report;
 use crate::pipeline::{self, ProcessingReport, TaskFailure};
 use crate::util::{duration_seconds, fmt_bytes, fmt_db, is_supported_input};
 
+/// Whether this build links libmp3lame, as a sentence rather than a bool.
+///
+/// A `cfg!` rather than a runtime read of [`crate::MP3_AVAILABLE`] only because the two
+/// spellings have to be `&'static str` for `concat!` to reach them; they are the same fact.
+#[cfg(feature = "mp3")]
+const MP3_STATUS: &str = "MP3 encoding: available — this build links libmp3lame through \
+     mp3lame-sys / mp3lame-encoder, which are LGPL-3.0. Released mint binaries do not.";
+#[cfg(not(feature = "mp3"))]
+const MP3_STATUS: &str =
+    "MP3 encoding: unavailable — this build does not link libmp3lame. Rebuild with \
+     `--features mp3` if you need it; released binaries deliberately do not.";
+
+/// The `--version` text.
+///
+/// Longer than a version string because LGPL-2.1 §6 and MPL-2.0 §3.2 both ask for the notice
+/// to be *prominent*, and a line in a README that ships next to the binary is easy to argue
+/// about where `--version` is not. It names what is linked, under what, and where the full
+/// texts are; `THIRD-PARTY-LICENSES.md` travels in the same archive.
+///
+/// The MP3 line is also the release workflow's artifact-level guard: it asserts this binary
+/// says "unavailable", which checks the thing that shipped rather than the recipe that built
+/// it.
+fn long_version() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        format!(
+        "{}\n\nmint is licensed under Apache-2.0.\n\n\
+         This binary uses the SoX Resampler Library (libsoxr), Copyright (c) 2007-18 \
+         Rob Sykes <robs@users.sourceforge.net>, through the Rust bindings libsoxr and \
+         libsoxr-sys, Copyright (C) 2016 Reinier Balt. Those bindings are statically linked \
+         and are covered by the GNU Lesser General Public License, version 2 or later; the C \
+         library itself is LGPL-2.1-or-later and is linked dynamically, so you may replace it \
+         with your own build.\n\n\
+         This binary also contains Mozilla Public License 2.0 code (Symphonia).\n\n\
+         Full notices, licence texts and source locations: THIRD-PARTY-LICENSES.md, shipped \
+         in the same archive as this binary.\n\n{MP3_STATUS}",
+            env!("CARGO_PKG_VERSION")
+        )
+    })
+    .as_str()
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "mint")]
+#[command(version)]
+#[command(long_version = long_version())]
 #[command(about = "Audio processing CLI: render masters into distribution targets.")]
 pub struct Args {
     /// Path to the TOML configuration. Defaults to ./mint.toml (bootstrapped if missing).

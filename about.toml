@@ -1,0 +1,50 @@
+# Configuration for `cargo about`, which generates THIRD-PARTY-LICENSES.md.
+#
+# Regenerate with:
+#     cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
+#
+# This file is also half of the licence *guard*. `accepted` is an allow-list, not a
+# description: cargo-about fails when a crate's licence is not on it, so a new dependency
+# under an unexpected licence stops a release rather than entering one quietly. That is the
+# check `--features mp3` is meant to trip — libmp3lame's bindings are not on this list, so
+# generating with the feature on fails, which is exactly what should happen to a build that
+# is about to ship LGPL code mint does not distribute today.
+
+# Most-permissive first, then the two weak-copyleft licences we knowingly ship. Every entry
+# below is a deliberate decision; do not add one to make an error go away without also adding
+# the crate to the notice preamble in about.hbs if it carries an obligation.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "Unicode-3.0",
+    "CC0-1.0",
+    # File-level copyleft: Symphonia. Obligation is to make the source of the MPL-covered
+    # files available and say so — discharged in the preamble, which links the upstream repo.
+    "MPL-2.0",
+    # The libsoxr Rust bindings (`libsoxr`, `libsoxr-sys`), which are statically linked.
+    # The C library they bind is LGPL-2.1 and is linked *dynamically* — see the preamble.
+    "LGPL-2.0",
+    "LGPL-2.1",
+]
+
+# All five release targets, not just the host. Without this the file generated on macOS
+# would omit a Windows-only transitive dependency, and the archive shipped to Windows users
+# would be missing exactly the notice they are owed.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Build-time-only crates still ship no code in the binary, but cargo-about cannot tell;
+# keeping them in costs a few lines of notice and is the safe direction to be wrong in.
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
