@@ -39,6 +39,15 @@ pub struct ProcessingReport {
     /// Full loudness/dynamics metering of the delivered signal (measured before
     /// quantization). The authoritative QC numbers for what was shipped.
     pub delivered: LoudnessAnalysis,
+    /// The target's `lufs`, as declared; `None` when it asked for no loudness at all.
+    /// Carried rather than left in the config because a report is read long after the
+    /// render — often from a persisted `--json` document, with no config in reach — and
+    /// without the figure it was judged against, `delivered.integrated_lufs` is a number
+    /// with no verdict attached. See [`Self::lufs_verdict`].
+    pub declared_lufs: Option<f64>,
+    /// The target's `ceiling_dbtp`, as declared. Same reason as `declared_lufs`: it is what
+    /// makes `delivered.true_peak_dbtp` a pass or a fail rather than a measurement.
+    pub declared_ceiling_dbtp: f64,
     /// Peak gain reduction applied by the loudness limiter (None when no loudness
     /// step ran or no limiting was needed). Surfaces dynamics lost to hit the target.
     pub limiter_gain_reduction_db: Option<f64>,
@@ -89,6 +98,33 @@ pub struct ProcessingReport {
     /// DSD-specific figures; `None` for every PCM and MP3 target.
     pub dsd: Option<DsdReport>,
     pub warnings: Vec<String>,
+}
+
+impl ProcessingReport {
+    /// Did the delivery hit the loudness it was asked for? `None` when the target declared
+    /// no `lufs`, which is not the same answer as `false` — nothing was promised, so there
+    /// is nothing to pass or fail.
+    ///
+    /// The judgement is [`loudness::meets_target`]'s, the same one the render's own
+    /// "loudness target not met" warning is made with. A reader that re-implemented the
+    /// ±0.1 LU rule could disagree with the warning sitting in `warnings` on the same row.
+    pub fn lufs_verdict(&self) -> Option<bool> {
+        self.declared_lufs
+            .map(|declared| loudness::meets_target(self.delivered.integrated_lufs, declared))
+    }
+
+    /// Did the delivered true peak stay under the declared ceiling? Unconditional: every
+    /// target has a `ceiling_dbtp`, so this is always a verdict.
+    ///
+    /// Strict, unlike the loudness one — the ceiling is a limit, not a target, and a
+    /// tolerance around it would be permission to exceed it. Worth knowing that the render
+    /// itself is *not* strict here: `loudness`'s `TP_TOLERANCE_DB` lets a limited delivery
+    /// sit up to 0.05 dB over before it re-limits (the slack between the limiter's
+    /// oversampled detector and the BS.1770 meter), so a peak parked exactly on the ceiling
+    /// can read as a fail here with no warning beside it.
+    pub fn ceiling_verdict(&self) -> bool {
+        self.delivered.true_peak_dbtp <= self.declared_ceiling_dbtp
+    }
 }
 
 /// What the DSD stage did, for the console summary and `--json`.
@@ -415,9 +451,12 @@ pub fn process_with(
     // by accident: a silent source normalizes with an infinite gain, so the buffer is NaN
     // and every comparison against it is already false. Being explicit means the reporting
     // of that case (report.md defect 11) can be changed without tripping over this line.
+    // The comparison itself lives in `loudness::meets_target` and only there: this warning
+    // and `ProcessingReport::lufs_verdict` are the same judgement made at two different
+    // times, and a second copy of `±LUFS_TOLERANCE` is how they would come to differ.
     if let Some(lufs) = target.lufs
         && delivered.integrated_lufs.is_finite()
-        && (delivered.integrated_lufs - lufs).abs() > LUFS_TOLERANCE
+        && !loudness::meets_target(delivered.integrated_lufs, lufs)
     {
         warnings.push(format!(
             "loudness target not met within +/-{LUFS_TOLERANCE:.1} LU \
@@ -584,6 +623,8 @@ pub fn process_with(
         elapsed_ms: started.elapsed().as_millis() as u64,
         source,
         delivered,
+        declared_lufs: target.lufs,
+        declared_ceiling_dbtp: ceiling,
         limiter_gain_reduction_db: limiter_gain_reduction,
         limiter_avg_gain_reduction_db: limiter_avg_gain_reduction,
         limiter_active_percent,

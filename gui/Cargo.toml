@@ -31,6 +31,38 @@ egui_table = "0.10"
 # duplicate the tree unless mint bumps to toml 1.x, which is a real bump (integer
 # handling changed in 0.9), not a patch.
 toml_edit = "0.22"
+# Read-only, and only for run history: a persisted run file's header (`schema_version`,
+# task and failure counts) is pulled back out as a `serde_json::Value` so the list can say
+# what a file is without owning a second DTO for the `--json` schema. The GUI never
+# *writes* JSON — `json_report::render` does, byte for byte. Already in Cargo.lock via
+# mint, so zero new crates.
+serde_json = "1.0"
+# Local civil time for run-history filenames and labels. Already in Cargo.lock via
+# env_logger → mint, so zero new crates — and hand-rolling civil-from-days plus a timezone
+# lookup would be exactly the "second implementation" this codebase refuses everywhere
+# else.
+jiff = "0.2"
+# Native file dialogs — the one genuinely new dependency family. The proposal's own
+# `gui/Cargo.toml` sketch (§5.1) names it and its capability checklist scores native file
+# pickers M: a Sources pane reachable only by drag-and-drop fails that, and so does an
+# Export JSON button with nowhere to put the file. Pinned to the current release rather
+# than the proposal's 0.15 — the API this uses (`FileDialog::pick_files`/`save_file`) is
+# unchanged, and 0.15 is two breaking releases behind. Default features are the Linux
+# portal/Wayland backends; harmless here (macOS goes through AppKit) and left on so the
+# crate still builds if this is ever opened on a Linux box.
+rfd = "0.17"
+# The batch runner's fan-out, so it is `cli.rs`'s fan-out and not a second one. Same
+# version mint asks for and already in Cargo.lock, so zero new crates. What is wanted is
+# `ThreadPoolBuilder` — a **private** pool, never the global one, whose whole job is the
+# bound on how many whole-file f64 renders are resident at once.
+rayon = "1.10"
+# File-watch on the config (proposal §5.2, and named in its own `gui/Cargo.toml` sketch).
+# `mint.toml` is the project file and mixed CLI/GUI is the expected mode, so an external edit
+# is the normal case rather than an incident — and a workbench that only notices on restart is
+# showing a plan for a document that no longer exists. Polling an mtime would carry no crate
+# but would need a timer waking a deliberately on-demand renderer several times a second
+# forever; on macOS this is the FSEvents binding and costs nothing while nothing happens.
+notify = "8.0"
 
 [dev-dependencies]
 # Headless egui harness: runs frames without a window, so the form's behaviour is testable

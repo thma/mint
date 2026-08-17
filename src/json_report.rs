@@ -60,6 +60,13 @@ struct TaskJson<'a> {
     limiter_avg_gain_reduction_db: Option<f64>,
     /// Percent (0–100) of samples the limiter attenuated; `null` when none was needed.
     limiter_active_percent: Option<f64>,
+    /// The target's declared `lufs`; `null` when it asked for none. Emitted so a reader of
+    /// this document alone can judge `delivered.integrated_lufs` — the config that stated
+    /// the number is not part of the run history.
+    declared_lufs: Option<f64>,
+    /// The target's declared `ceiling_dbtp`, for the same reason: it is what turns
+    /// `delivered.true_peak_dbtp` into a pass or a fail.
+    declared_ceiling_dbtp: f64,
     source: AnalysisJson,
     delivered: AnalysisJson,
     warnings: &'a [String],
@@ -196,6 +203,8 @@ pub fn render(
             limiter_gain_reduction_db: r.limiter_gain_reduction_db,
             limiter_avg_gain_reduction_db: r.limiter_avg_gain_reduction_db,
             limiter_active_percent: r.limiter_active_percent,
+            declared_lufs: r.declared_lufs,
+            declared_ceiling_dbtp: r.declared_ceiling_dbtp,
             source: (&r.source).into(),
             delivered: (&r.delivered).into(),
             warnings: &r.warnings,
@@ -239,6 +248,8 @@ mod tests {
             elapsed_ms: 1_234,
             source: analysis(f64::NEG_INFINITY), // silence -> null
             delivered: analysis(-14.0),
+            declared_lufs: Some(-14.0),
+            declared_ceiling_dbtp: -1.0,
             limiter_gain_reduction_db: Some(2.5),
             limiter_avg_gain_reduction_db: Some(0.8),
             limiter_active_percent: Some(42.0),
@@ -287,6 +298,10 @@ mod tests {
         assert_eq!(v["tasks"][0]["limiter_gain_reduction_db"].as_f64(), Some(2.5));
         assert_eq!(v["tasks"][0]["limiter_avg_gain_reduction_db"].as_f64(), Some(0.8));
         assert_eq!(v["tasks"][0]["limiter_active_percent"].as_f64(), Some(42.0));
+        // The declared figures travel with the task: a persisted document is read with no
+        // config beside it, and without them the delivered numbers carry no verdict.
+        assert_eq!(v["tasks"][0]["declared_lufs"].as_f64(), Some(-14.0));
+        assert_eq!(v["tasks"][0]["declared_ceiling_dbtp"].as_f64(), Some(-1.0));
         // Non-finite source loudness must serialize as JSON null.
         assert!(v["tasks"][0]["source"]["integrated_lufs"].is_null());
         assert_eq!(v["tasks"][0]["delivered"]["integrated_lufs"].as_f64(), Some(-14.0));
@@ -312,6 +327,10 @@ mod tests {
             elapsed_ms: 9_000,
             source: analysis(-18.0),
             delivered: analysis(-16.0),
+            // A target that declared no loudness: the verdict has to read as "nothing was
+            // promised" rather than as a miss.
+            declared_lufs: None,
+            declared_ceiling_dbtp: -1.0,
             limiter_gain_reduction_db: None,
             limiter_avg_gain_reduction_db: None,
             limiter_active_percent: None,
@@ -361,6 +380,10 @@ mod tests {
         assert!(v["tasks"][0]["dither"]["strength"].is_null());
         // ...but the seed still applies: it drives the modulator's comparator dither.
         assert!(v["tasks"][0]["seed"].is_null());
+        // No loudness was asked for, so there is nothing to pass or fail — null, not a
+        // number a reader could mistake for a target that was missed.
+        assert!(v["tasks"][0]["declared_lufs"].is_null());
+        assert_eq!(v["tasks"][0]["declared_ceiling_dbtp"].as_f64(), Some(-1.0));
         assert_eq!(v["tasks"][0]["src_quality"].as_str(), Some("vhq"));
     }
 }

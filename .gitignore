@@ -26,3 +26,6 @@ target
 /target
 CLAUDE.md
 .DS_Store
+# mint-gui writes its run history and its project sidecar beside the config it opened.
+# Neither is a mint config and neither can change a sample; they are per-machine state.
+.mint-gui/

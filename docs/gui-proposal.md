@@ -356,9 +356,123 @@ Deliberately **not** in the spike: theming, signing, provenance. Those are known
 
 ### Phase 1 — read-only plan-and-evidence workbench (2 weeks)
 
+> **Status 2026-08-14: shipped.** All of it: Sources, Targets, the Plan matrix, the live
+> Chain preview, the Problems panel, the batch Run view with job-boundary cancel, the Report
+> view with the verdict column, `.mint-gui` run persistence and "Copy as CLI". Twelve modules
+> in `gui/src`, ten headless test files (32 tests), no DSP touched. Eight deltas from the
+> paragraph below, in descending order of how much they matter.
+>
+> 1. **Progress is Tier B, not Tier A.** The phase asked for the staging-file `stat()` trick;
+>    T2-2 (`JobControl` / `process_with`) had already landed in Tier 2, so the fraction comes
+>    from inside the pipeline's own loops instead of from the size of a file on disk. Tier A
+>    was never written. Phase 3's "real progress and cancellation" is therefore already done
+>    — what is left of that phase is T1-1/T1-2, which are also done.
+> 2. **Four library additions beyond "Tier 0 only",** all additive and none in `ops/`:
+>    `Config::parse_toml_str` (parse without validating — the Problems panel needs a `Config`
+>    precisely when `from_toml_str` refuses to hand one over); `ops::loudness::meets_target`,
+>    so the ±0.1 LU line has one producer shared by the pipeline's warning and the report's
+>    verdict; `declared_lufs` / `declared_ceiling_dbtp` on `ProcessingReport` plus
+>    `lufs_verdict()` / `ceiling_verdict()`, without which a persisted run is unjudgeable on
+>    its own and the GUI would need a second copy of the rule; and
+>    `util::SUPPORTED_INPUT_EXTENSIONS`, because a native file dialog wants the extensions up
+>    front and cannot be driven by `is_supported_input`'s predicate — without the const, the
+>    Sources pane's `+` button either offers no filter or writes `wav|wave|aif|aiff` out a
+>    second time. `is_supported_input` now reads it, so there is still one list.
+>    The two report keys are *additions*, so `json_report::SCHEMA_VERSION` did **not** move.
+> 3. **The runner does `cli.rs`'s whole-batch pre-flight,** which this paragraph does not
+>    mention and which the first cut of the phase left out. `RunView::start` asks
+>    `config::check_planned_outputs` about the same plan the Problems panel walks, before a
+>    thread exists, and refuses with mint's own message. Without it the GUI executed — with
+>    zero failures reported — batches mint structurally refuses, and in the
+>    `naming = "{stem}_master.{ext}"` case rendered over another input master while the job
+>    reading it was still reading it. Two tests in `gui/tests/batch_run.rs` pin both halves.
+> 4. **One genuinely new dependency: `rfd`.** `serde_json` and `jiff` were already in the
+>    lockfile (via `mint` and via `env_logger`), so they cost zero new crates. `notify` was
+>    not added — file-watch stays Phase 2.
+> 5. **The free-RAM worker cap (§5.2 rule 5) is deferred, not done.** Reading how much memory
+>    a machine has left needs a dependency this build declines to carry, so the arithmetic is
+>    *surfaced* beside the jobs control (`× ~0.5–0.7 GB/job`, the measured figures) and the
+>    engineer does the multiplication. Nothing is enforced.
+> 6. **S4's 696 µs was measured on an empty matrix.** The spike's rows came from a debug
+>    control that repeated one source, and the harness never fed the app one at all, so
+>    `plan::ui` took its "no sources" early return. With twenty real sources the same 20×8 is
+>    **~6400 µs/frame in a debug build** against a 16 600 µs budget — still comfortable, and
+>    now the number means what it says. The debug control is deleted. *(Superseded in Phase 2:
+>    ~6400 µs was still a partial matrix, because the harness window was 800×600 and
+>    `egui_table` does not build cells that are off screen. The figure is ~14 900 µs — see
+>    Phase 2's note 7.)*
+> 7. **The Problems panel's own cost is worth recording:** 0.9 ms for the 11-target
+>    `examples/mint.toml` with no sources, 2.3 ms at 220 cells, and **125 ms** while the
+>    batch has an unfixed output collision (step 8's accept-list walk over
+>    `check_planned_outputs`, which only runs when the one-shot call says there is something
+>    to enumerate). Paid per keystroke in the TOML drawer, so it is on the status bar beside
+>    `validate NNN µs`. Two ways out are written down in `problems.rs`; neither was taken.
+> 8. **`.mint-gui/<config stem>/`, not `.mint-gui/` flat.** Two configs in one project folder
+>    would otherwise share one `project.toml` and one `runs/` — whichever was opened last
+>    restoring the other's masters and ticked targets.
+>
+> Deliberately not built, as scoped: file-watch/hot-reload, the full Target Inspector, the
+> preset picker as a resolved-value diff, A/B history diff, theming.
+
 Sources pane (`probe_source` per file, cached by path+mtime), Targets pane, Plan matrix, live Chain preview from `describe()`, Problems panel (the compiler-style list that fixes the `bail!`-on-first-error ergonomics — the single best value-per-effort item in the design), Run view with Tier-A progress and job-boundary cancel, Report view with the verdict column mint already computes (`LUFS_TOLERANCE`, pipeline.rs:316) and buries in a warning string. Persist runs to `.mint-gui/runs/*.json`. "Copy as CLI command". **Core changes: Tier 0 only.** Ships useful without a single line of DSP touched.
 
 ### Phase 2 — provenance + editing (2 weeks)
+
+> **Status 2026-08-17: shipped.** T2-1 had already landed in Tier 2, so this phase is the four
+> surfaces built on it: the **Target Inspector** (`gui/src/inspector.rs`, replacing the
+> five-field `form.rs` spike, which is deleted rather than extended), the **"why" panel**, the
+> **preset picker as a resolved-value diff** (`gui/src/presets.rs`), and **file-watch with
+> conflict handling** (`gui/src/watch.rs`). Three new headless test files, nineteen tests, no
+> DSP touched. Eight deltas, in descending order of how much they matter.
+>
+> 1. **Six more library additions, and all six are about having one producer for prose.**
+>    `--explain` and the inspector are two renderings of one explanation, so the sentences
+>    could not stay in `cli.rs`: `FieldExplanation::notes()` (returning `Note { glyph, text }`)
+>    is now what both print, and `cli.rs::print_explanation` was rewritten to read it. With it
+>    came `Dropped::GLYPH` / `FieldOrigin::ILLEGAL_GLYPH` (three print sites for `/` and `!`
+>    now, so a table that disagrees with its own legend is one edit away otherwise),
+>    `config::ORIGIN_LEGEND` / `FATE_LEGEND` for that legend, `FieldOrigin::stated_by`, and
+>    **`TargetExplanation::layers`** — the ordered stack, which the "why" panel needs because
+>    half of what it has to show is the layers that stated *nothing* (`E this target — not
+>    set`), and reconstructing `builtin < defaults < preset? < explicit` in a front end is the
+>    second copy of the precedence rule this whole facility exists to avoid.
+> 2. **Read first, edit on expand — the inspector is not a form.** The table is the §3 mockup's
+>    (name · value · origin · fate) and the control that edits a field lives in that field's
+>    "why" panel, beside the four layers that argued over it, not above them. The panel is a
+>    pane of its own inside the drawer rather than a block under the last row: 22 rows scroll,
+>    and a details panel that scrolls away from the row that opened it is one you hunt for.
+> 3. **The widget is seeded from the document; only the provenance comes from the library.**
+>    `FieldOrigin::stated` renders values for a *reader* — `lufs` as `{:.1}`, `format` as
+>    `— (1-bit, no bit depth)` — so a control seeded from it would show −14.3 for a document
+>    that says −14.35 and write the rounding back on the first drag. `ConfigDocument::get`
+>    (new) returns the bytes this target actually states.
+> 4. **Strike-through generalized.** §7 item 12 asks for `[defaults] preset` struck through;
+>    every `Dropped` value gets it, in the table's short note and in the layer stack, because
+>    "written down and not read" is what strike-through means and `Dropped` is exactly that set.
+> 5. **The preset diff is a second resolve of a copied document**, written through the same
+>    `ConfigDocument::set` the commit uses — so a preview cannot promise a change the commit
+>    does not make. Its `Refused` arm turned out to be the *common* case rather than the
+>    exception: removing a preset that was the only thing supplying `format`, and any PCM preset
+>    on a target that states `codec = "dsf"` itself, are both load-time errors, and the picker
+>    shows mint's own refusal with **Apply** greyed instead of finding out after the click.
+> 6. **The watcher watches the directory, not the file** (and filters by name). Every careful
+>    writer — a text editor, `git checkout`, mint's own `atomic_write` — replaces a file by
+>    renaming a sibling onto it, which unhooks a per-inode watch on the first save.
+>    `gui/tests/reload.rs` does its edit exactly that way for exactly that reason. A self-write
+>    is invisible because the buffer and the bytes are compared, not the mtime.
+> 7. **S4's figure was still wrong, in the same way as before.** Phase 1's note 6 corrected
+>    "696 µs on an empty matrix" to "~6400 µs with twenty real sources" — but the harness was
+>    still 800×600 and `egui_table` virtualizes, so most of the 160 cells were never built. In
+>    a window that holds twenty rows it is **~14 900 µs in a debug build**, of which the new
+>    Targets-pane provenance tally is ~300 µs. Release is roughly ten times faster, so S4's
+>    actual question is answered with ~1.5 ms against 16 600. The assertion moved to two debug
+>    frames, because one frame now has 10 % of headroom and that is a flake rather than a gate.
+> 8. **One number on the screen is not mint's**: `−14.0`, where ticking "set here" on a `lufs`
+>    no layer supplies has to start somewhere. It is written to the document immediately, where
+>    it is visible and editable, rather than living as a GUI-side opinion. `notify` is the
+>    second genuinely new dependency, after `rfd`.
+>
+> Deliberately not built, as scoped: A/B history diff and theming.
 
 T2-1 (`resolve_target_explained`) plus the Target Inspector with origin badges (`B`/`D`/`P`/`E`) and fate glyphs (`·` applies / `~` inert / `/` dropped / `!` would error), the expandable "why is `rate = 88200 Hz`?" panel, the preset picker as a resolved-value diff, and `toml_edit` write-back with the round-trip property test. Add file-watch + hot-reload. **This is the phase that makes the GUI something a TOML-fluent engineer opens daily.**
 

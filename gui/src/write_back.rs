@@ -56,6 +56,36 @@ impl ConfigDocument {
             .unwrap_or_default()
     }
 
+    /// What this target's own table says about `field`, exactly as it is written.
+    ///
+    /// The inspector's controls are seeded from here rather than from
+    /// `FieldOrigin::stated`, and the difference is not pedantry: `stated` renders a float
+    /// for a *reader* (`lufs` comes back as `{:.1}`), so a control seeded from it would show
+    /// −14.3 for a document that says −14.35 and quietly write the rounded value the first
+    /// time the user dragged it. Provenance comes from the library; the number a widget is
+    /// holding comes from the bytes on disk.
+    ///
+    /// Only the target's own layer, which is what a control on this target may edit — what
+    /// the value *resolves* to through the four layers is [`mint::config::Config`]'s answer
+    /// and is never guessed at here.
+    pub fn get(&self, target: &str, field: &str) -> Option<&Value> {
+        self.doc
+            .get("target")?
+            .get(target)?
+            .get(field)
+            .and_then(Item::as_value)
+    }
+
+    /// Byte range of a top-level table, for the TOML drawer to scroll to.
+    ///
+    /// `toml_edit` only keeps spans for a document it parsed and has not been asked to
+    /// change, which is exactly the case here: `AppState` re-parses from the buffer on every
+    /// edit, so the span is always of the text currently on screen. `None` for a table that
+    /// is not in the document — a `[defaults]` nobody wrote has nowhere to jump to.
+    pub fn table_span(&self, table: &str) -> Option<std::ops::Range<usize>> {
+        self.doc.get(table)?.span()
+    }
+
     /// Set one field on one target, creating the key (or the whole `[target.NAME]` table)
     /// if it is not there yet.
     ///

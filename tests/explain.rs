@@ -12,7 +12,7 @@
 //! explanation read — and a test asserting it would be asserting that an array equals
 //! itself. What is worth pinning is the exceptions, which are hand-written per field.
 
-use mint::config::{Config, Fate, Group, Layer};
+use mint::config::{Config, Dropped, Fate, FieldOrigin, Group, Layer};
 
 /// The proposal's demo config: one DSD target under a PCM-shaped `[defaults]`, which is the
 /// realistic way a heterogeneous config goes wrong.
@@ -244,6 +244,92 @@ fn a_plain_target_has_nothing_surprising_to_report() {
     let codec = explanation.field("rate").expect("rate row");
     assert_eq!(codec.origin.layer, Some(Layer::Preset("cd".to_string())));
     assert_eq!(codec.value, "44100 Hz");
+}
+
+#[test]
+fn the_layer_stack_is_reported_whole_not_only_where_it_spoke() {
+    // A "why" panel lists all four layers, `not set` included — and the layers that stated
+    // nothing are precisely the ones `FieldOrigin::stated` cannot name. Reconstructing the
+    // stack in a front end would be a second copy of the precedence rule, so the explanation
+    // carries it, lowest first, exactly as the merge folds it.
+    let explanation = explain(DEMO, "sacd");
+    assert_eq!(
+        explanation.layers,
+        vec![
+            Layer::Builtin,
+            Layer::Defaults,
+            Layer::Preset("sacd".to_string()),
+            Layer::Explicit,
+        ],
+        "the stack is the merge's own order, with the preset named"
+    );
+
+    // Absent, not empty-stringed, when the target names no preset: a panel that printed a
+    // preset row for a target without one would invite setting a field on nothing.
+    let bare = explain("[target.t]\nformat = \"s24\"\n", "t");
+    assert_eq!(bare.layers, vec![Layer::Builtin, Layer::Defaults, Layer::Explicit]);
+
+    // And every layer a field *does* name is one of them, which is what lets a panel walk
+    // the stack and look each layer's value up rather than the other way round.
+    for field in &explanation.fields {
+        for (layer, value) in &field.origin.stated {
+            assert!(
+                explanation.layers.contains(layer),
+                "{} is stated by {layer}, which is not in the stack",
+                field.field
+            );
+            assert_eq!(field.origin.stated_by(layer), Some(value.as_str()));
+        }
+        // A layer that said nothing says nothing through the lookup either.
+        for layer in &explanation.layers {
+            if !field.origin.stated.iter().any(|(l, _)| l == layer) {
+                assert_eq!(field.origin.stated_by(layer), None, "{}", field.field);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_notes_are_one_producer_for_both_front_ends() {
+    // `--explain`'s "why" section and the GUI inspector's row notes are the same sentences.
+    // They are built here so the two cannot drift into wording one explanation differently —
+    // the same rule that keeps every error string mint's own.
+    let explanation = explain(DEMO, "sacd");
+
+    // `format` is the field that carries all three at once, which is the whole reason `Fate`
+    // is not a four-way enum.
+    let notes = explanation.field("format").expect("format row").notes();
+    let glyphs: Vec<char> = notes.iter().map(|n| n.glyph).collect();
+    assert_eq!(glyphs, ['~', FieldOrigin::ILLEGAL_GLYPH], "inert first, then the counterfactual");
+    assert!(notes[0].text.starts_with("inert — "), "{}", notes[0].text);
+    assert!(notes[1].text.contains("load-time error"), "{}", notes[1].text);
+
+    let rate = explanation.field("rate").expect("rate row").notes();
+    assert_eq!(rate.len(), 1, "a derived rate is not inert, only dropped-into");
+    assert_eq!(rate[0].glyph, Dropped::GLYPH);
+    assert!(rate[0].text.starts_with("[defaults] says rate = 48000"), "{}", rate[0].text);
+
+    // The negative control. A plain PCM target still has inert rows — `mp3_bitrate` off MP3,
+    // the limiter knobs with no `lufs` — and that is honest rather than noisy. What it must
+    // not have is a *dropped* note: nothing in this document was passed over by the
+    // own-layer stack, and a `/` here would be the badge crying wolf.
+    let plain = explain("[target.cd]\npreset = \"cd\"\n", "cd");
+    let passed_over: Vec<&str> = plain
+        .fields
+        .iter()
+        .filter(|f| f.notes().iter().any(|n| n.glyph == Dropped::GLYPH))
+        .map(|f| f.field)
+        .collect();
+    assert!(passed_over.is_empty(), "nothing is dropped here: {passed_over:?}");
+
+    // Every note that exists is reachable from the three flags a badge column paints, so a
+    // row can never carry prose its glyphs do not account for.
+    for field in &explanation.fields {
+        let expected = usize::from(field.origin.fate.reason().is_some())
+            + usize::from(field.origin.dropped.is_some())
+            + usize::from(field.origin.illegal_here);
+        assert_eq!(field.notes().len(), expected, "{}", field.field);
+    }
 }
 
 #[test]

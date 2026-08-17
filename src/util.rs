@@ -10,13 +10,21 @@ use std::path::Path;
 
 /// Extensions `read_audio` can decode — the symphonia feature set in `Cargo.toml`
 /// (`wav`, `aiff`, `pcm`) expressed as the filter the input globs are sieved through.
+///
+/// Public as a *list* and not only as [`is_supported_input`]'s predicate because a native
+/// file dialog cannot be driven by a predicate: it wants the extensions up front. Given
+/// only the predicate, a front end writing an `add_filter` call would write this list a
+/// second time, which is the drift the module doc above is about.
+pub const SUPPORTED_INPUT_EXTENSIONS: &[&str] = &["wav", "wave", "aif", "aiff"];
+
+/// Whether mint can decode the file at `path`, judged by its extension.
 pub fn is_supported_input(path: &Path) -> bool {
     let ext = match path.extension().and_then(|x| x.to_str()) {
         Some(ext) => ext.to_ascii_lowercase(),
         None => return false,
     };
 
-    matches!(ext.as_str(), "wav" | "wave" | "aif" | "aiff")
+    SUPPORTED_INPUT_EXTENSIONS.contains(&ext.as_str())
 }
 
 /// Byte count for humans. `MB` is 10^6, matching how storage and DSD data rates are

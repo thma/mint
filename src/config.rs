@@ -688,14 +688,27 @@ impl Config {
 
     /// Parse and validate config text that is not (yet) a file — an editor buffer being
     /// typed into, say. Same two steps as `from_path` minus the read, so a front end
-    /// validating an unsaved document does not have to stage a temp file to do it. The
-    /// two are kept as separate three-liners rather than one wrapping the other because
+    /// validating an unsaved document does not have to stage a temp file to do it. It and
+    /// `from_path` stay separate three-liners rather than one wrapping the other because
     /// `from_path`'s context string names the file and its validation errors deliberately
     /// carry no context at all — several tests read those messages verbatim.
     pub fn from_toml_str(text: &str) -> Result<Self> {
-        let parsed: Self = toml::from_str(text).context("invalid TOML config")?;
+        let parsed = Self::parse_toml_str(text)?;
         parsed.validate()?;
         Ok(parsed)
+    }
+
+    /// Parse without validating: the half of [`Self::from_toml_str`] a front end needs when
+    /// it wants *every* problem rather than the first.
+    ///
+    /// [`Self::validate`] stops at the first target that will not resolve and
+    /// [`check_collisions`] at the first colliding pair — right for a CLI that is about to
+    /// bail, wrong for a problem list that has to show all of them at once. Asking the
+    /// narrow questions instead ([`Self::resolve_target`] per name, [`check_collisions`]
+    /// per pair) needs a `Config` in hand, and `from_toml_str` refuses to hand one over
+    /// precisely when there is something to list.
+    pub fn parse_toml_str(text: &str) -> Result<Self> {
+        toml::from_str(text).context("invalid TOML config")
     }
 
     /// Sorted list of all target names defined in the config.
@@ -1031,6 +1044,17 @@ pub enum Layer {
     Explicit,
 }
 
+/// The two legends every provenance surface has to print, in one place.
+///
+/// `--explain` heads its table with them and the GUI inspector heads its own; a legend that
+/// disagrees with the glyphs beside it is worse than no legend, and two hand-written copies
+/// disagree the first time a glyph moves. They sit next to [`Layer::glyph`] and
+/// [`Fate::glyph`], which are the things they explain.
+pub const ORIGIN_LEGEND: &str =
+    "B builtin   D [defaults]   P preset   E this target   — nothing set it";
+pub const FATE_LEGEND: &str =
+    "· applies   ~ inert   / inherited value dropped   ! error if stated here";
+
 impl Layer {
     /// Single-character badge for a dense table: `B` `D` `P` `E`.
     pub fn glyph(&self) -> char {
@@ -1095,6 +1119,26 @@ pub struct Dropped {
     pub why: &'static str,
 }
 
+impl Dropped {
+    /// Table mark for a dropped value. A `const` rather than a literal at each print site
+    /// because there are three of them now — `--explain`'s mark column, its "why" section
+    /// and the GUI inspector's badges — and a table whose glyph disagrees with its own
+    /// legend is worse than one with no glyph at all.
+    pub const GLYPH: char = '/';
+}
+
+/// One remark about what became of a field, with the glyph that marks it in a dense table.
+///
+/// Single producer for prose that two front ends show: `mint --explain` prints `glyph text`
+/// under a "why" heading, and the GUI's inspector puts the glyph in its badge column and the
+/// text beside the row. Neither writes its own wording, for the same reason neither rewords
+/// an error — a paraphrase is a second diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    pub glyph: char,
+    pub text: String,
+}
+
 /// Provenance of one resolved field: which layer won, what became of it, what was thrown
 /// away on the way, and whether stating it here at all would be a load-time error.
 #[derive(Debug, Clone)]
@@ -1110,6 +1154,18 @@ pub struct FieldOrigin {
     pub illegal_here: bool,
     /// Every layer that stated the field, lowest precedence first — the "why" panel.
     pub stated: Vec<(Layer, String)>,
+}
+
+impl FieldOrigin {
+    /// Table mark for a field that is legal to inherit and fatal to state here. See
+    /// [`Dropped::GLYPH`] for why these are constants.
+    pub const ILLEGAL_GLYPH: char = '!';
+
+    /// The value the given layer stated, if it stated one. A layer may appear in
+    /// [`Self::stated`] at most once, so this is the whole of what it had to say.
+    pub fn stated_by(&self, layer: &Layer) -> Option<&str> {
+        self.stated.iter().find(|(l, _)| l == layer).map(|(_, value)| value.as_str())
+    }
 }
 
 /// Which part of the inspector a field belongs under.
@@ -1150,6 +1206,15 @@ pub struct TargetExplanation {
     pub target: String,
     /// The preset this target named, if any.
     pub preset: Option<String>,
+    /// The precedence stack this target was merged from, **lowest first** — the very array
+    /// the merge folds, with the preset present only when the target names one.
+    ///
+    /// [`FieldOrigin::stated`] lists the layers that said something about a field; a surface
+    /// that wants to show the ones that said *nothing* ("`E` this target — not set", which is
+    /// half the point of a "why" panel) needs the full stack. Reconstructing
+    /// `builtin < defaults < preset? < explicit` in a front end would be exactly the second
+    /// copy of the precedence rule this facility exists to make unnecessary.
+    pub layers: Vec<Layer>,
     /// Rows in inspector order, grouped.
     pub fields: Vec<FieldExplanation>,
 }
@@ -1172,6 +1237,36 @@ impl FieldExplanation {
             value,
             origin: FieldOrigin { layer, fate: Fate::Applies, dropped: None, illegal_here: false, stated },
         }
+    }
+
+    /// Everything surprising about this field, in the order a reader should meet it: what is
+    /// carried but unread, what an inherited layer said and did not get to say, and what
+    /// stating it here would cost. Empty for the ordinary case, which is most fields on most
+    /// targets — and an empty "why" section is itself the useful answer.
+    pub fn notes(&self) -> Vec<Note> {
+        let mut notes = Vec::new();
+        if let Some(reason) = self.origin.fate.reason() {
+            notes.push(Note {
+                glyph: self.origin.fate.glyph(),
+                text: format!("inert — {reason}"),
+            });
+        }
+        if let Some(dropped) = &self.origin.dropped {
+            notes.push(Note {
+                glyph: Dropped::GLYPH,
+                text: format!(
+                    "{} says {} = {}, and it is not read here — {}",
+                    dropped.layer, self.field, dropped.value, dropped.why
+                ),
+            });
+        }
+        if self.origin.illegal_here {
+            notes.push(Note {
+                glyph: FieldOrigin::ILLEGAL_GLYPH,
+                text: "legal to inherit, a load-time error if stated on this target".to_string(),
+            });
+        }
+        notes
     }
 
     fn inert_if(mut self, condition: bool, why: &'static str) -> Self {
@@ -1495,7 +1590,12 @@ fn explain(t: &ResolvedTarget, layers: &Layers) -> TargetExplanation {
         ),
     ];
 
-    TargetExplanation { target: t.name.clone(), preset: preset_name, fields }
+    TargetExplanation {
+        target: t.name.clone(),
+        preset: preset_name,
+        layers: layers.ordered.iter().map(|(layer, _)| layer.clone()).collect(),
+        fields,
+    }
 }
 
 /// Overlay `top` onto `base`: any field set in `top` wins.

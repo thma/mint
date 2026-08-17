@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::audio::io_read;
-use crate::config::{self, Config, PlannedOutput, ResolvedTarget};
+use crate::config::{self, Config, Dropped, FieldOrigin, PlannedOutput, ResolvedTarget};
 use crate::json_report;
 use crate::pipeline::{self, ProcessingReport, TaskFailure};
 use crate::util::{duration_seconds, fmt_bytes, fmt_db, is_supported_input};
@@ -393,8 +393,8 @@ fn print_explanation(config: &Config, name: &str) -> Result<()> {
         None => println!("target '{}'", explanation.target),
     }
     println!();
-    println!("  origin  B builtin   D [defaults]   P preset   E this target   — nothing set it");
-    println!("  fate    · applies   ~ inert   / inherited value dropped   ! error if stated here");
+    println!("  origin  {}", config::ORIGIN_LEGEND);
+    println!("  fate    {}", config::FATE_LEGEND);
 
     let mut group = None;
     for field in &explanation.fields {
@@ -404,35 +404,27 @@ fn print_explanation(config: &Config, name: &str) -> Result<()> {
             group = Some(field.group);
         }
         let origin = field.origin.layer.as_ref().map_or('—', |layer| layer.glyph());
+        // The fate glyph always, the other two only when they apply — and all three from the
+        // library's own constants, so this column cannot disagree with the legend two lines
+        // above it or with the badges the GUI paints from the same three marks.
         let mut marks = String::from(field.origin.fate.glyph());
         if field.origin.dropped.is_some() {
-            marks.push('/');
+            marks.push(Dropped::GLYPH);
         }
         if field.origin.illegal_here {
-            marks.push('!');
+            marks.push(FieldOrigin::ILLEGAL_GLYPH);
         }
         println!("    {:<22} {:<34} {origin}  {marks}", field.field, field.value);
     }
 
-    // The prose the columns cannot carry. Only fields with something surprising about them
-    // appear — on a plain PCM target this section is usually empty, which is itself useful.
+    // The prose the columns cannot carry, from `FieldExplanation::notes` rather than
+    // assembled here: the GUI inspector shows the same remarks, and two front ends wording
+    // one explanation differently is the same failure as two wordings of one error. Only
+    // fields with something surprising about them appear — on a plain PCM target this section
+    // is empty, which is itself useful.
     let mut printed_header = false;
     for field in &explanation.fields {
-        let mut notes: Vec<String> = Vec::new();
-        if let Some(reason) = field.origin.fate.reason() {
-            notes.push(format!("~ inert — {reason}"));
-        }
-        if let Some(dropped) = &field.origin.dropped {
-            notes.push(format!(
-                "/ {} says {} = {}, and it is not read here — {}",
-                dropped.layer, field.field, dropped.value, dropped.why
-            ));
-        }
-        if field.origin.illegal_here {
-            notes.push(
-                "! legal to inherit, a load-time error if stated on this target".to_string(),
-            );
-        }
+        let notes = field.notes();
         if notes.is_empty() {
             continue;
         }
@@ -442,7 +434,8 @@ fn print_explanation(config: &Config, name: &str) -> Result<()> {
             printed_header = true;
         }
         for note in notes {
-            print_wrapped(&format!("    {}: ", field.field), &note);
+            let line = format!("{} {}", note.glyph, note.text);
+            print_wrapped(&format!("    {}: ", field.field), &line);
         }
     }
     Ok(())

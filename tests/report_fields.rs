@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
 use mint::audio::io_write;
 use mint::config::{Config, ResolvedTarget, SizeEstimate};
+use mint::json_report;
+use mint::ops::loudness;
 use mint::pipeline::{self, Conflict};
 
 const RATE: u32 = 48_000;
@@ -219,6 +221,180 @@ fn a_dsd_render_reports_the_delivered_1_bit_length_and_no_dither_settings() {
     let on_disk = std::fs::metadata(&report.output).expect("stat").len();
     assert_eq!(report.file_bytes, on_disk);
     assert_eq!(dsd.file_bytes, on_disk, "the writer's own accounting must match the file");
+}
+
+/// The declared figures, and the verdict they make possible.
+///
+/// A report is read after the fact — from the console, from `--json`, from a persisted run
+/// — and by then the config that stated `lufs` and `ceiling_dbtp` is out of reach. Without
+/// them travelling with the report, `delivered.integrated_lufs` is a number nobody can grade
+/// and every front end has to keep its own copy of the ±0.1 LU rule. So the verdict is
+/// pinned here *against the warning the same render emitted*: those two are one judgement
+/// asked at two moments, and the only thing keeping them together is that both go through
+/// `loudness::meets_target`.
+#[test]
+fn a_report_carries_what_it_was_judged_against_and_agrees_with_its_own_warning() {
+    let dir = tmp("verdict");
+    let input = write_master(&dir.join("master.wav"), METERED);
+
+    // Quiet source, generous target: reachable, so the verdict is a pass and the render is
+    // silent about loudness.
+    let met = target_in(&dir, "met", "format = \"s24\"\nlufs = -20.0\n");
+    let report = pipeline::process(&input, &met, Some(1)).expect("process");
+    assert_eq!(report.declared_lufs, Some(-20.0), "the target's own figure, verbatim");
+    assert_eq!(report.declared_ceiling_dbtp, -1.0, "the built-in default ceiling");
+    assert_eq!(report.lufs_verdict(), Some(true));
+    assert!(report.ceiling_verdict(), "delivered {:.2} dBTP", report.delivered.true_peak_dbtp);
+    assert!(
+        !report.warnings.iter().any(|w| w.contains("loudness target not met")),
+        "a passing verdict must not sit next to the warning that says otherwise: {:?}",
+        report.warnings
+    );
+
+    // A target louder than its own ceiling allows: the limiter holds the ceiling and the
+    // loudness lands short. Verdict and warning must fail together.
+    let missed = target_in(&dir, "missed", "format = \"s24\"\nlufs = -3.0\nceiling_dbtp = -9.0\n");
+    let report = pipeline::process(&input, &missed, Some(1)).expect("process");
+    assert_eq!(report.declared_lufs, Some(-3.0));
+    assert_eq!(report.declared_ceiling_dbtp, -9.0, "the target's ceiling, not the default");
+    assert_eq!(
+        report.lufs_verdict(),
+        Some(false),
+        "delivered {:.2} LUFS against a -3.0 target",
+        report.delivered.integrated_lufs
+    );
+    assert!(
+        report.warnings.iter().any(|w| w.contains("loudness target not met")),
+        "the verdict and the warning are the same judgement: {:?}",
+        report.warnings
+    );
+    // No ceiling assertion on this one: the limiter parks the peak *on* the ceiling and is
+    // allowed 0.05 dB of slack there (`TP_TOLERANCE_DB`, the disagreement between its own
+    // oversampled detector and the BS.1770 meter), while `ceiling_verdict` is a strict
+    // `<=`. Landing at -8.99 against a -9.00 ceiling is a pass to the pipeline and a fail
+    // to the verdict, so a test that pinned either answer would be pinning the tolerance.
+
+    // A ceiling genuinely blown: `on_clip = "warn"` reports the overshoot instead of
+    // correcting it, which is the one delivery mint ships knowingly over the ceiling.
+    let over = target_in(&dir, "over", "format = \"s24\"\nceiling_dbtp = -20.0\non_clip = \"warn\"\n");
+    let report = pipeline::process(&input, &over, Some(1)).expect("process");
+    assert_eq!(report.declared_ceiling_dbtp, -20.0);
+    assert!(
+        !report.ceiling_verdict(),
+        "delivered {:.2} dBTP is above the declared -20.0 ceiling",
+        report.delivered.true_peak_dbtp
+    );
+
+    // No loudness asked for: `None`, which is not `Some(false)`. Nothing was promised, so
+    // there is nothing to fail — a Report view that showed a red cross here would be
+    // inventing a requirement.
+    let silent = target_in(&dir, "silent", "format = \"s16\"\n");
+    let report = pipeline::process(&input, &silent, Some(1)).expect("process");
+    assert_eq!(report.declared_lufs, None);
+    assert_eq!(report.lufs_verdict(), None);
+    assert_eq!(report.declared_ceiling_dbtp, -1.0);
+}
+
+/// One line, drawn once: the warning and the verdict are the same judgement.
+///
+/// The render decides "loudness target not met" while the buffer is still in RAM; a Report
+/// view decides whether to print a cross months later, off a persisted document. Both go
+/// through `loudness::meets_target`, and nothing but that shared call keeps a render that
+/// shipped clean from being graded as a failure by the screen that displays it. So this
+/// asserts the *equivalence* over a spread of targets — reachable, unreachable, and none at
+/// all — rather than a hand-written expectation per case, which would be a third opinion
+/// about where the line is.
+#[test]
+fn the_loudness_warning_fires_exactly_when_the_verdict_fails() {
+    let dir = tmp("verdict-agree");
+    let input = write_master(&dir.join("master.wav"), METERED);
+    let mut warnings_fired = Vec::new();
+
+    for (name, body) in [
+        // Comfortably reachable: quiet source, quiet target, nothing in the way.
+        ("reachable", "format = \"s24\"\nlufs = -20.0\n"),
+        // Reachable downwards, which is a different code path (a negative gain).
+        ("quiet", "format = \"s24\"\nlufs = -30.0\n"),
+        // Unreachable: the ceiling holds the delivery well below what was asked for.
+        ("blocked", "format = \"s24\"\nlufs = -3.0\nceiling_dbtp = -9.0\n"),
+        // Nothing promised, so nothing can be missed.
+        ("silent", "format = \"s24\"\n"),
+    ] {
+        let target = target_in(&dir, name, body);
+        let report = pipeline::process(&input, &target, Some(1)).expect("process");
+        let warned = report.warnings.iter().any(|w| w.contains("loudness target not met"));
+
+        let expected = match report.declared_lufs {
+            Some(declared) => !loudness::meets_target(report.delivered.integrated_lufs, declared),
+            None => false,
+        };
+        assert_eq!(
+            warned, expected,
+            "target '{name}': delivered {:.3} LUFS against {:?}, warnings {:?}",
+            report.delivered.integrated_lufs, report.declared_lufs, report.warnings
+        );
+        // ...and the column a front end renders is the same answer, with `None` reading as
+        // "no requirement" rather than as a quiet pass.
+        assert_eq!(
+            matches!(report.lufs_verdict(), Some(false)),
+            warned,
+            "target '{name}': verdict {:?} beside warnings {:?}",
+            report.lufs_verdict(),
+            report.warnings
+        );
+        warnings_fired.push(warned);
+    }
+
+    // An equivalence over four silent renders would hold trivially. These four are chosen so
+    // both sides of the line are actually crossed; if the spread ever stops crossing it, the
+    // test above has quietly stopped testing anything.
+    assert!(warnings_fired.contains(&true), "no target missed its loudness — the miss side is untested");
+    assert!(warnings_fired.contains(&false), "every target warned — the pass side is untested");
+}
+
+/// The declared figures survive the trip through `--json`, and the schema version does not
+/// move for having gained them.
+///
+/// Adding a key is the one change that must *not* bump `SCHEMA_VERSION`: every reader has to
+/// tolerate unknown keys, and a bump would strand the run history the GUI persists in this
+/// exact schema. The version is therefore asserted as a literal rather than read from the
+/// constant — comparing the constant against itself would agree with any future value of it,
+/// and this line is where a removal or a rename has to be thought about on purpose.
+#[test]
+fn the_json_task_carries_the_declared_figures_at_an_unchanged_schema_version() {
+    let dir = tmp("json-declared");
+    let input = write_master(&dir.join("master.wav"), METERED);
+
+    let judged = target_in(&dir, "judged", "format = \"s24\"\nlufs = -20.0\nceiling_dbtp = -2.0\n");
+    let ungraded = target_in(&dir, "ungraded", "format = \"s16\"\n");
+    let reports = vec![
+        pipeline::process(&input, &judged, Some(1)).expect("process"),
+        pipeline::process(&input, &ungraded, Some(1)).expect("process"),
+    ];
+
+    let text = json_report::render(Some("mint.toml"), &reports, &[]).expect("render --json");
+    let doc: serde_json::Value = serde_json::from_str(&text).expect("--json must be JSON");
+
+    assert_eq!(
+        doc["schema_version"].as_u64(),
+        Some(1),
+        "two added keys are not a breaking change; anything that removes or renames one is"
+    );
+
+    // Tasks are emitted in the order they were rendered, so these indices are the two
+    // targets above.
+    assert_eq!(doc["tasks"][0]["declared_lufs"].as_f64(), Some(-20.0));
+    assert_eq!(doc["tasks"][0]["declared_ceiling_dbtp"].as_f64(), Some(-2.0));
+    assert!(
+        doc["tasks"][1]["declared_lufs"].is_null(),
+        "a target that asked for no loudness must serialize as null, not as a number a \
+         reader could grade the delivery against"
+    );
+    assert_eq!(
+        doc["tasks"][1]["declared_ceiling_dbtp"].as_f64(),
+        Some(-1.0),
+        "the built-in ceiling is still a declared figure — every target has one"
+    );
 }
 
 #[test]

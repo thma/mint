@@ -613,6 +613,16 @@ pub fn recheck_and_limit_if_needed_with(
 /// silence" and "reported" cannot end up meaning different sizes of miss.
 pub const LUFS_TOLERANCE: f64 = 0.1;
 
+/// Whether a delivered integrated loudness counts as having hit `target_lufs`
+/// (±[`LUFS_TOLERANCE`]).
+///
+/// One producer, so the warning the pipeline emits and the verdict a report renders cannot
+/// disagree about where the line is. A persisted report is judged long after the render, by
+/// a reader that must not own a second copy of the rule.
+pub fn meets_target(delivered_lufs: f64, target_lufs: f64) -> bool {
+    (delivered_lufs - target_lufs).abs() <= LUFS_TOLERANCE
+}
+
 /// Smallest post-SRC loudness drift worth correcting: half the reporting threshold, for the
 /// same reason `MAKEUP_TOLERANCE_LU` is half it — a correction that lands inside this can
 /// never leave the delivery outside the figure that gets reported. Ordinary band-limited

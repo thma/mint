@@ -17,7 +17,7 @@ use egui_kittest::Harness;
 use mint::audio::buffer::{AudioBuffer, OutputSampleFormat, SourceInfo};
 use mint::audio::io_write;
 use mint::progress::Stage;
-use mint_gui::app::{MintApp, Tab};
+use mint_gui::app::{MintApp, Mode};
 use mint_gui::state::AppState;
 
 const RATE: u32 = 48_000;
@@ -66,10 +66,10 @@ fn a_dsd_render_runs_on_a_worker_while_the_ui_keeps_drawing() {
 
     let mut state = AppState::load(&config);
     state.selected = Some("sacd".to_string());
-    state.inputs.push(master);
+    state.add_inputs([master]);
     let mut harness = Harness::new_ui_state(|ui, app: &mut MintApp| app.frame(ui), MintApp::new(state));
 
-    harness.state_mut().select_tab(Tab::Run);
+    harness.state_mut().select_mode(Mode::Run);
     harness.run();
     let ctx = harness.ctx.clone();
     harness.state_mut().start_render(ctx);

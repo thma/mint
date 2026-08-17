@@ -228,6 +228,69 @@ fn colliding_output_paths_are_rejected() {
     assert!(format!("{err:#}").contains("same output path"));
 }
 
+/// The one case `parse_toml_str` exists for: a document `validate` refuses.
+///
+/// Every check in `config.rs` bails on its first error, which is right for a CLI that is
+/// about to stop and wrong for a front end that has to list everything at once. The way out
+/// is to ask the narrow questions instead — `resolve_target` once per name — and that needs
+/// a `Config`, which `from_toml_str` withholds *precisely* when there is something to list.
+/// So the two faults below have to be reachable one at a time, each in mint's own wording.
+#[test]
+fn parse_toml_str_hands_over_a_config_that_validate_refuses() {
+    let toml = r#"
+        [target.ok]
+        format = "s16"
+
+        [target.bad]
+        codec = "flac"
+        format = "f32"
+
+        [target.worse]
+        preset = "nope"
+    "#;
+
+    assert!(
+        Config::from_toml_str(toml).is_err(),
+        "the validating door must still be shut, or this test proves nothing"
+    );
+
+    let parsed = Config::parse_toml_str(toml).expect("parsing must not depend on validity");
+    assert_eq!(parsed.target_names().len(), 3, "every target survives, sound or not");
+
+    // Three independent questions, three independent answers. `validate` can only ever
+    // produce the first of them.
+    assert!(parsed.resolve_target("ok").is_ok(), "a sound target next to a broken one resolves");
+    let bad = format!("{:#}", parsed.resolve_target("bad").expect_err("flac + f32 is illegal"));
+    assert!(bad.contains("codec=flac requires an integer format"), "err: {bad}");
+    let worse = format!("{:#}", parsed.resolve_target("worse").expect_err("no such preset"));
+    assert!(worse.contains("unknown preset"), "err: {worse}");
+
+    assert!(parsed.validate().is_err(), "the whole-config verdict is unchanged by any of this");
+}
+
+/// Skipping `validate` must not have skipped the parser's own refusals.
+///
+/// `parse_toml_str` is the lenient half of `from_toml_str`, not a lenient parser: a document
+/// that is not TOML, or that misspells a key, has no meaning to hand back. `deny_unknown_fields`
+/// in particular is the only thing standing between a typo'd key and a silently ignored
+/// setting, and a front end that displayed the typo'd document as merely "not yet valid"
+/// would be a place for that guarantee to leak away.
+#[test]
+fn parse_toml_str_still_refuses_what_is_not_a_config() {
+    let syntax = format!(
+        "{:#}",
+        Config::parse_toml_str("[target.x\nformat = \"s16\"\n").expect_err("unclosed table header")
+    );
+    assert!(syntax.contains("invalid TOML config"), "err: {syntax}");
+
+    let typo = format!(
+        "{:#}",
+        Config::parse_toml_str("[target.x]\nformat = \"s16\"\nlufz = -14.0\n")
+            .expect_err("deny_unknown_fields must reject a misspelled key")
+    );
+    assert!(typo.contains("unknown field") && typo.contains("lufz"), "err: {typo}");
+}
+
 #[test]
 fn derived_chain_skips_resample_when_rate_matches() {
     let config = config_from_str(

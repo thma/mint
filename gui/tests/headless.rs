@@ -16,7 +16,7 @@
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use mint_gui::app::MintApp;
+use mint_gui::app::{Drawer, MintApp};
 use mint_gui::state::AppState;
 
 /// The proposal's demo config: a DSD target under a PCM-shaped `[defaults]`, so every fate
@@ -72,7 +72,10 @@ fn harness(name: &str, config: &str, target: &str) -> Harness<'static, MintApp> 
 
     let mut state = AppState::load(&path);
     state.selected = Some(target.to_string());
-    Harness::new_ui_state(|ui, app: &mut MintApp| app.frame(ui), MintApp::new(state))
+    let mut app = MintApp::new(state);
+    // The form is the drawer's "Target" tab now, and Problems is the drawer's default.
+    app.select_drawer(Drawer::Target);
+    Harness::new_ui_state(|ui, app: &mut MintApp| app.frame(ui), app)
 }
 
 #[test]
@@ -87,7 +90,12 @@ fn the_target_form_builds_a_frame_for_a_dsd_target_under_pcm_defaults() {
     // ...and the resolved values next to them come from the library, including the two
     // that no plain merge would produce.
     harness.get_by_label_contains("1-bit");
-    harness.get_by_label_contains("dsf");
+    // `query_all`, not `get`: the Targets pane's own summary line for this target ends in
+    // `dsf` too, and two screens agreeing is not an ambiguity worth failing over.
+    assert!(
+        harness.query_all_by_label_contains("dsf").next().is_some(),
+        "the resolved codec must reach the form"
+    );
 }
 
 #[test]
@@ -111,27 +119,29 @@ fn the_provenance_badges_reach_the_screen() {
 #[test]
 fn a_plain_pcm_target_is_not_covered_in_warnings() {
     // The negative control. If every target showed badges, the badges would say nothing.
+    //
+    // Only `/` is asserted absent. `!` is not: since Phase 2 the drawer holds the whole
+    // 22-row inspector rather than five fields, and `dsd` is legitimately illegal to state
+    // on a PCM target — `tests/explain.rs` pins that it is the only such field, and
+    // `gui/tests/inspector.rs` pins that the inspector shows exactly one of them.
     let mut harness = harness("plain", PLAIN, "cd");
     harness.run();
     assert!(
         harness.query_all_by_label("/").next().is_none(),
         "a plain target should have nothing dropped"
     );
-    assert!(
-        harness.query_all_by_label("!").next().is_none(),
-        "...and nothing that would be illegal to state"
-    );
 }
 
 #[test]
-fn every_tab_builds_a_frame() {
-    // Each tab is a separate widget tree, and three of them are never entered by the tests
-    // above. A tab that panics on first paint is a bad way to find out at a listening
-    // session, and this is a two-line guard against it.
+fn every_mode_and_drawer_tab_builds_a_frame() {
+    // Each mode and each drawer tab is a separate widget tree, and most of them are never
+    // entered by the tests above. A screen that panics on first paint is a bad way to find
+    // out at a listening session, and this is a two-line guard against it.
     let mut harness = harness("tabs", DEMO, "sacd");
-    for tab in ["Target", "Config", "Plan", "Run"] {
+    for tab in ["Plan", "Run", "Report", "Problems", "mint.toml", "Target"] {
         harness.run();
-        harness.get_by_label(tab).click();
+        // `contains`, because the Problems tab carries its count in the label.
+        harness.get_by_label_contains(tab).click();
         harness.run();
     }
 }

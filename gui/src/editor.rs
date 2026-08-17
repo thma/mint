@@ -10,8 +10,14 @@
 //! no second TOML implementation enters the build for the sake of an underline. Semantic
 //! errors (mint's own: an unresolvable target, a colliding output path) have no span by
 //! nature and are shown as text under the editor, which is the honest placement.
+//!
+//! Phase 2 adds one more span source: `AppState::reveal`, which another screen sets to say
+//! "show them this". The inspector's `[ open [defaults] ]` is the caller — a "why" panel that
+//! names the block a value came from and then leaves you to find it is half an answer.
 
 use egui::text::{LayoutJob, TextFormat};
+use egui::text::CCursor;
+use egui::text_selection::CCursorRange;
 use egui::{Color32, FontId, TextStyle, Ui};
 
 use crate::state::AppState;
@@ -37,21 +43,27 @@ pub fn ui(ui: &mut Ui, state: &mut AppState) {
         ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
 
+    // Taken, not read: acting on it twice would fight the user's scrolling on every frame
+    // after the one they asked on.
+    let reveal = state.reveal.take();
+
     let mut text = std::mem::take(&mut state.text);
-    let response = egui::ScrollArea::vertical()
+    let output = egui::ScrollArea::vertical()
         .id_salt("config-editor")
         .show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut text)
-                    .code_editor()
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(24)
-                    .font(TextStyle::Monospace)
-                    .layouter(&mut layouter),
-            )
+            egui::TextEdit::multiline(&mut text)
+                .code_editor()
+                .desired_width(f32::INFINITY)
+                .desired_rows(24)
+                .font(TextStyle::Monospace)
+                .layouter(&mut layouter)
+                .show(ui)
         })
         .inner;
-    let changed = response.changed();
+    let changed = output.response.response.changed();
+    if let Some(span) = reveal {
+        scroll_to(ui, &output, &text, span);
+    }
     state.text = text;
     if changed {
         // Per keystroke. `Config::from_toml_str` exists so this does not need a temp file,
@@ -59,6 +71,33 @@ pub fn ui(ui: &mut Ui, state: &mut AppState) {
         state.dirty = true;
         state.revalidate();
     }
+}
+
+/// Select a byte range and bring it into view.
+///
+/// egui scrolls to the cursor by itself only when the *widget* moved it (a keypress, a
+/// click); a range stored from outside looks unchanged to it, so the scroll is done here from
+/// the galley the widget just laid out. The conversion is the fiddly part and the reason it
+/// is one function: `toml_edit` spans are byte offsets and egui cursors are **character**
+/// indices, which differ the moment a config has a comment with an em dash in it.
+fn scroll_to(
+    ui: &mut Ui,
+    output: &egui::text_edit::TextEditOutput,
+    text: &str,
+    span: std::ops::Range<usize>,
+) {
+    let chars = |byte: usize| text.get(..byte).map_or(0, |head| head.chars().count());
+    let (start, end) = (chars(span.start), chars(span.end));
+
+    let mut state = output.state.clone();
+    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(start), CCursor::new(end))));
+    state.store(ui.ctx(), output.response.response.id);
+
+    let rect = output
+        .galley
+        .pos_from_cursor(CCursor::new(start))
+        .translate(output.galley_pos.to_vec2());
+    ui.scroll_to_rect(rect, Some(egui::Align::Center));
 }
 
 /// Colour a TOML document, underlining the byte range the parser rejected.

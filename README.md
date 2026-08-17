@@ -427,6 +427,7 @@ a run reproducible and auditable after the fact:
 | `src_quality` | resampler tier that ran, or `null` when no conversion was needed |
 | `loudness_gain_db` | static gain the normalization applied; `null` without a `lufs` target |
 | `post_resample_gain_db` | further gain from the post-resample correction; `null` if that pass never ran, `0.0` if it ran and found nothing |
+| `declared_lufs`, `declared_ceiling_dbtp` | what the target asked for; `declared_lufs` is `null` when it asked for no loudness. They travel with the task so `delivered` can be graded without the config that stated them |
 | `dither.mode`, `dither.strength` | what was **asked for**; `null` on MP3 and DSD, which have no bit-depth stage |
 | `dither.applied`, `dither.noise_shaping` | what actually **happened** |
 

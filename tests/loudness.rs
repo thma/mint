@@ -613,3 +613,41 @@ fn recheck_leaves_buffer_unchanged_when_within_ceiling() {
         "buffer must be untouched when already within ceiling"
     );
 }
+
+/// Where the loudness verdict's line is drawn, pinned once.
+///
+/// `meets_target` is the single producer of that judgement — the pipeline's "loudness target
+/// not met" warning and `ProcessingReport::lufs_verdict` both ask it — so the tolerance is
+/// inclusive at both ends by design: a delivery sitting exactly ±0.1 LU out is a pass, not a
+/// warning. An implementation that quietly turned `<=` into `<` would move every borderline
+/// render from clean to flagged with nothing else changing.
+#[test]
+fn the_loudness_tolerance_is_inclusive_at_both_ends() {
+    let target = -14.0;
+
+    assert!(loudness::meets_target(target, target), "dead on target");
+    assert!(loudness::meets_target(target - 0.05, target), "comfortably inside");
+    assert!(loudness::meets_target(target + 0.05, target));
+
+    // The boundary itself. Written as literals rather than as `target ± LUFS_TOLERANCE`:
+    // that expression is not the same double for every target (at -20.0 it lands one ULP
+    // outside), and a test that spelled it arithmetically would be pinning the rounding of
+    // its own operand rather than the rule.
+    assert!(loudness::meets_target(-13.9, target), "exactly +0.1 LU still counts as met");
+    assert!(loudness::meets_target(-14.1, target), "exactly -0.1 LU still counts as met");
+
+    // One hundredth past it, either way — the smallest miss the reported figures can even
+    // show, since both the warning and the Report view print two decimals. Bracketing the
+    // line this tightly is what makes the pass side above a statement about the boundary
+    // rather than about the neighbourhood.
+    assert!(!loudness::meets_target(-13.89, target), "+0.11 LU is already a miss");
+    assert!(!loudness::meets_target(-14.11, target), "-0.11 LU is already a miss");
+
+    assert!(!loudness::meets_target(-13.8, target), "0.2 LU hot is a miss");
+    assert!(!loudness::meets_target(-14.2, target), "0.2 LU quiet is a miss");
+
+    // Silence meters as -inf against any target; the pipeline keeps that case out of the
+    // warning explicitly, so the verdict must not claim it as a pass.
+    assert!(!loudness::meets_target(f64::NEG_INFINITY, target));
+    assert_eq!(loudness::LUFS_TOLERANCE, 0.1, "the tolerance every reference tool promises");
+}
