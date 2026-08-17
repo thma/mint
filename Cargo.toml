@@ -20,10 +20,6 @@ hound = "3.5"
 log = "0.4"
 rand = "0.8"
 rayon = "1.10"
-# Reference-grade SRC via FFI to the system libsoxr (pkg-config). The only SRC backend;
-# the C lib must be present at build time
-# (brew install libsoxr / apt install libsoxr-dev / vcpkg install soxr).
-libsoxr = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Pure-Rust FLAC encoder (no system dependency). Default features off: we batch targets
@@ -38,6 +34,13 @@ toml = "0.8"
 # Pure-Rust FFT for Phase 4.1 psychoacoustic analysis (runtime) and Phase 3 NTF
 # validation tests (dev). Single crate covers both roles.
 rustfft = "6.2"
+
+# libsoxr is bound by hand in `src/ops/soxr.rs` rather than through the `libsoxr` /
+# `libsoxr-sys` crates: those are LGPL-2.0 *Rust* code, statically linked into every binary,
+# and unmaintained since 2023. `build.rs` does the pkg-config probe they used to do. The C
+# library itself is still required at build and run time and is linked dynamically.
+[build-dependencies]
+pkg-config = "0.3"
 
 [features]
 # MP3 output. Opt-in because mp3lame-sys compiles libmp3lame from vendored C source

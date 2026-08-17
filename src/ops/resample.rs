@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use libsoxr::{Datatype, IOSpec, QualityFlags, QualityRecipe, QualitySpec, Soxr};
+use crate::ops::soxr::{HI_PREC_CLOCK, ROLLOFF_SMALL, Recipe, Soxr};
 
 use crate::audio::buffer::AudioBuffer;
 use crate::config::ResampleQuality;
@@ -130,32 +130,71 @@ pub(crate) fn create_soxr(
     static INIT_LOCK: Mutex<()> = Mutex::new(());
 
     let (recipe, flags) = soxr_quality(quality);
-    let io = IOSpec::new(Datatype::Float64I, Datatype::Float64I);
-    let q = QualitySpec::new(&recipe, flags);
 
     let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    Soxr::create(in_rate, out_rate, channels as u32, Some(&io), Some(&q), None)
-        .map_err(|e| anyhow!("failed to create libsoxr resampler: {e}"))
+    Soxr::create(in_rate, out_rate, channels, recipe, flags)
 }
 
 /// Map our quality tiers onto libsoxr recipes. `ROLLOFF_SMALL` keeps passband ripple
 /// <= 0.01 dB at every tier (flattest response); the top tier adds `HI_PREC_CLOCK` to
 /// maximize ratio accuracy for irrational conversions (e.g. the 44.1 <-> 48 kHz family).
-fn soxr_quality(quality: Option<ResampleQuality>) -> (QualityRecipe, QualityFlags) {
+pub(crate) fn soxr_quality(quality: Option<ResampleQuality>) -> (Recipe, std::os::raw::c_ulong) {
     match quality.unwrap_or(ResampleQuality::Hq) {
-        ResampleQuality::Lq => (QualityRecipe::Low, QualityFlags::ROLLOFF_SMALL),
-        ResampleQuality::Mq => (QualityRecipe::Medium, QualityFlags::ROLLOFF_SMALL),
-        ResampleQuality::Hq => (QualityRecipe::High, QualityFlags::ROLLOFF_SMALL),
-        ResampleQuality::Vhq => (
-            QualityRecipe::VeryHigh,
-            QualityFlags::ROLLOFF_SMALL | QualityFlags::HI_PREC_CLOCK,
-        ),
+        ResampleQuality::Lq => (Recipe::Low, ROLLOFF_SMALL),
+        ResampleQuality::Mq => (Recipe::Medium, ROLLOFF_SMALL),
+        ResampleQuality::Hq => (Recipe::High, ROLLOFF_SMALL),
+        ResampleQuality::Vhq => (Recipe::VeryHigh, ROLLOFF_SMALL | HI_PREC_CLOCK),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which libsoxr engine each quality tier actually selects.
+    ///
+    /// `docs/gui-proposal.md` §10 recommends exactly this and §11 Q6 turns on it: `vhq` is
+    /// *already* not bit-reproducible across platforms (`cr64` on macOS arm64, `cr64s` on
+    /// Debian amd64), and vendoring LiveKit's `soxr-sys` would silently downgrade every tier
+    /// to the single-precision `cr32` — a change worth −127 dBFS of deviation that no other
+    /// test in this repo would notice. It is one FFI call, and it only became possible when
+    /// mint started binding the C API itself.
+    ///
+    /// Measured here (96 -> 44.1 kHz, macOS arm64, system libsoxr 0.1.3):
+    ///
+    /// | tier | engine |
+    /// |---|---|
+    /// | `lq`  | `cr32` |
+    /// | `mq`  | `cr32` |
+    /// | `hq`  | `cr32` |
+    /// | `vhq` | `cr64` |
+    ///
+    /// **Only `vhq` runs in double precision**, which is worth knowing on its own: it is the
+    /// tier `README.md`'s reproducibility claim is about, and the other three are single
+    /// precision *by design* (`hq` is `SOXR_20_BITQ` — 20 bits does not need an f64 engine).
+    /// So the assertion is about the precision class of `vhq` and not the exact name, which
+    /// legitimately varies with platform and CPU: `cr64` here, `cr64s` on an AVX x86-64 box.
+    /// What must never happen silently is `vhq` dropping to `cr32`. Run with `--nocapture`
+    /// for the table.
+    #[test]
+    fn every_quality_tier_selects_the_engine_it_is_supposed_to() {
+        use crate::config::quality_tag;
+        for quality in ResampleQuality::ALL {
+            let soxr = create_soxr(96_000.0, 44_100.0, 2, Some(quality)).expect("create");
+            let engine = soxr.engine();
+            println!("  {:<4} -> {engine}", quality_tag(quality));
+            assert!(!engine.is_empty(), "libsoxr named no engine for {quality:?}");
+            if matches!(quality, ResampleQuality::Vhq) {
+                assert!(
+                    engine.starts_with("cr64"),
+                    "vhq fell back to the {engine} engine. Single precision at the top tier \
+                     is a ~127 dBFS change nothing else here would notice — this is what a \
+                     vendored soxr built without WITH_CR64 does."
+                );
+            }
+        }
+    }
+
     use crate::audio::buffer::{OutputSampleFormat, SourceInfo};
     use std::path::PathBuf;
 
@@ -204,7 +243,7 @@ mod tests {
                 output.resize(output.len() + margin * channels, 0.0);
             }
             let (_i, odone) = soxr
-                .process::<f64, f64>(None, &mut output[produced * channels..])
+                .process(None, &mut output[produced * channels..])
                 .map_err(|e| anyhow!("libsoxr drain failed: {e}"))?;
             produced += odone;
             if odone == 0 {

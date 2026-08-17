@@ -4,6 +4,29 @@ Cross-platform audio CLI in Rust. Render high-resolution masters into one or mor
 distribution targets defined declaratively in TOML — you describe the *deliverable*
 (rate, bit depth, loudness, ceiling) and `mint` derives the required DSP steps.
 
+> ### ⚠ mint needs libsoxr installed to run
+>
+> **This applies to downloaded release binaries, not just to building from source.** mint
+> links libsoxr — its sample-rate conversion backend — **dynamically**, so it is not a
+> self-contained download on macOS or Linux:
+>
+> ```
+> brew install libsoxr                  # macOS
+> sudo apt-get install libsoxr0         # Debian/Ubuntu
+> sudo dnf install soxr                 # Fedora/RHEL
+> sudo pacman -S soxr                   # Arch
+> ```
+>
+> Without it the binary will not start — macOS reports a missing
+> `libsoxr.0.dylib`, Linux a missing `libsoxr.so.0`. Windows needs nothing: `soxr.dll`
+> ships inside the archive.
+>
+> This is deliberate and it is a licensing decision, not an oversight. libsoxr is LGPL-2.1;
+> linking it statically would make every mint binary a combined work under §6 and oblige
+> mint to hand out the means to relink it. A shared library is §6(b), the clause written for
+> exactly that — and the version you can replace is the point. See
+> [Licensing](#licensing-and-third-party-code).
+
 What it does:
 - Decode input audio (WAV and AIFF; 16/24/32-bit int and 32/64-bit float) into an
   internal f64 buffer with no precision loss at the input boundary.
@@ -342,17 +365,23 @@ mint is **Apache-2.0** (`LICENSE`). Two dependencies are copyleft and are handle
 deliberately; `THIRD-PARTY-LICENSES.md` ships in every release archive with the full
 notices, licence texts and source locations, and `mint --version` summarises them.
 
-- **libsoxr** (the C library) is LGPL-2.1-or-later and is linked **dynamically**. On macOS
-  and Linux, released binaries link the copy on your system — so you need
-  `brew install libsoxr` / `apt install libsoxr0` to run one, and mint distributes no part
-  of the library. On Windows, where there is no system package, `soxr.dll` ships beside
-  `mint.exe` and can be replaced with your own build. Static linking would make the binary
-  a combined work under LGPL-2.1 §6 and oblige mint to hand out the means to relink; a
-  shared library is §6(b), which is the clause written for exactly this.
-- **libsoxr / libsoxr-sys** (the Rust bindings) are LGPL-2.0-or-later and *are* statically
-  linked, so §6 does apply to them. Their source is on crates.io at the pinned versions and
-  mint's own build workflow is public and reproducible from each release tag.
+**mint binaries contain no LGPL code.** The one LGPL dependency is a C library, and it is
+kept outside the binary:
+
+- **libsoxr** (the C library) is LGPL-2.1-or-later and is linked **dynamically** — see the
+  note at the top of this file for what that means when you run one. On macOS and Linux mint
+  distributes no part of the library; on Windows, where there is no system package,
+  `soxr.dll` ships beside `mint.exe` and can be replaced with your own build.
+- mint binds libsoxr's **C API by hand** (`src/ops/soxr.rs`) rather than through the
+  `libsoxr` / `libsoxr-sys` crates. Those were LGPL-2.0 *Rust* code, statically linked, and
+  carried into the binary exactly the obligation that linking the C library dynamically
+  avoids — so the shim removes the second, avoidable copy of the problem. It also drops a
+  dependency unmaintained since 2023 from the one place a subtle error would be inaudible.
+  The binding is proven byte-identical to the crates it replaced across every quality tier
+  and rate pair mint converts between.
 - **Symphonia** (demuxing and decoding) is MPL-2.0 — file-level copyleft, unmodified here.
+  It is the only copyleft left in the dependency graph, and `about.toml` no longer accepts
+  any LGPL licence, so a crate that would reintroduce one fails CI.
 
 The exact libsoxr source used for releases is attached to each GitHub release as
 `libsoxr_0.1.3.orig.tar.xz`, pinned by SHA-256.

@@ -37,14 +37,13 @@ fn long_version() -> &'static str {
     static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TEXT.get_or_init(|| {
         format!(
-        "{}\n\nmint is licensed under Apache-2.0.\n\n\
-         This binary uses the SoX Resampler Library (libsoxr), Copyright (c) 2007-18 \
-         Rob Sykes <robs@users.sourceforge.net>, through the Rust bindings libsoxr and \
-         libsoxr-sys, Copyright (C) 2016 Reinier Balt. Those bindings are statically linked \
-         and are covered by the GNU Lesser General Public License, version 2 or later; the C \
-         library itself is LGPL-2.1-or-later and is linked dynamically, so you may replace it \
-         with your own build.\n\n\
-         This binary also contains Mozilla Public License 2.0 code (Symphonia).\n\n\
+        "{}\n\nmint is licensed under Apache-2.0. This binary contains no LGPL code.\n\n\
+         It uses the SoX Resampler Library (libsoxr), Copyright (c) 2007-18 Rob Sykes \
+         <robs@users.sourceforge.net>, which is LGPL-2.1-or-later. mint binds its C API \
+         directly and links it *dynamically*, so you may replace the library with your own \
+         build: on macOS and Linux mint distributes no part of it and needs the copy on your \
+         system, and on Windows soxr.dll ships beside this binary and can be swapped.\n\n\
+         This binary does contain Mozilla Public License 2.0 code (Symphonia), unmodified.\n\n\
          Full notices, licence texts and source locations: THIRD-PARTY-LICENSES.md, shipped \
          in the same archive as this binary.\n\n{MP3_STATUS}",
             env!("CARGO_PKG_VERSION")

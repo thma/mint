@@ -2222,27 +2222,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libsoxr"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a095d9d0be72aec1995f8b157c963ffea4efa6e9deba0bc9930288cd8cd60b15"
-dependencies = [
- "bitflags 2.13.0",
- "libc",
- "libsoxr-sys",
- "pkg-config",
-]
-
-[[package]]
-name = "libsoxr-sys"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cffdc8b3b64759d2e95e3236fa6bf85fef226bf57023fa9273ec60edea8fbce"
-dependencies = [
- "pkg-config",
-]
-
-[[package]]
 name = "linebender_resource_handle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2362,9 +2341,9 @@ dependencies = [
  "flacenc",
  "glob",
  "hound",
- "libsoxr",
  "log",
  "mp3lame-encoder",
+ "pkg-config",
  "rand",
  "rayon",
  "rustfft",

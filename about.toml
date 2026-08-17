@@ -24,14 +24,18 @@ accepted = [
     "Unlicense",
     "Unicode-3.0",
     "CC0-1.0",
-    # File-level copyleft: Symphonia. Obligation is to make the source of the MPL-covered
-    # files available and say so — discharged in the preamble, which links the upstream repo.
+    # The only copyleft left in the graph: Symphonia, file-level. The obligation is to make
+    # the source of the MPL-covered files available and say so — discharged in the preamble,
+    # which links unmodified upstream.
     "MPL-2.0",
-    # The libsoxr Rust bindings (`libsoxr`, `libsoxr-sys`), which are statically linked.
-    # The C library they bind is LGPL-2.1 and is linked *dynamically* — see the preamble.
-    "LGPL-2.0",
-    "LGPL-2.1",
 ]
+
+# **No LGPL entry, deliberately.** mint binds libsoxr's C API by hand (`src/ops/soxr.rs`),
+# so the binary contains no LGPL *Rust* code at all — the `libsoxr` / `libsoxr-sys` crates
+# that used to supply it were LGPL-2.0 and statically linked. Re-adding either, or any other
+# LGPL crate, now fails here rather than quietly restoring the obligation the shim removed.
+# The C library itself is LGPL-2.1 and is *linked dynamically*; it is not a cargo dependency
+# and cargo-about cannot see it, which is why its notice is hand-written in about.hbs.
 
 # All five release targets, not just the host. Without this the file generated on macOS
 # would omit a Windows-only transitive dependency, and the archive shipped to Windows users

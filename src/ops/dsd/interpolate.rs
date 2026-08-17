@@ -23,7 +23,7 @@
 //!   mixing PCM and DSD targets stays safe.
 
 use anyhow::{Result, anyhow, bail};
-use libsoxr::Soxr;
+use crate::ops::soxr::Soxr;
 
 use crate::config::ResampleQuality;
 use crate::ops::resample;
@@ -140,7 +140,7 @@ impl SoxrStream {
         loop {
             let (_, odone) = self
                 .soxr
-                .process::<f64, f64>(None, &mut self.out_scratch)
+                .process(None, &mut self.out_scratch)
                 .map_err(|e| anyhow!("libsoxr drain failed: {e}"))?;
             if odone == 0 {
                 break;
